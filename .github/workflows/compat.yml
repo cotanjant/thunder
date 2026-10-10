@@ -32,7 +32,7 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update -qq
-          apt-get install -y -qq curl git build-essential pkg-config ca-certificates \
+          apt-get install -y -qq curl git build-essential pkg-config ca-certificates file \
             libasound2-dev libx11-dev libxcb1-dev libxext-dev libxrandr-dev \
             libxi-dev libxcursor-dev libxinerama-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libwayland-dev libegl-dev libgl-dev libdbus-1-dev
