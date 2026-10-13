@@ -285,6 +285,9 @@ pub struct EngineRt {
     metro_acc: Vec<f32>,
     metro_reg: Vec<f32>,
     sample_pos: u64,
+    /// Fired-by absolute sample index. Survives block boundaries so a swung
+    /// note lands late in the next block instead of early in this one.
+    pending: Vec<(u64, SongEvent)>,
     pub tick_pos: f64,
     pub cur_pat: usize,
     pub cur_tick: u32,
@@ -333,6 +336,7 @@ impl EngineRt {
             metro_acc: render_click(sr, 2600.0),
             metro_reg: render_click(sr, 2000.0),
             sample_pos: 0,
+            pending: Vec::new(),
             tick_pos: 0.0,
             cur_pat: 0,
             cur_tick: 0,
@@ -505,13 +509,15 @@ impl EngineRt {
         let spt = (self.sr * 60.0 / song.bpm.max(30.0) / 16.0).max(1.0) as f64;
 
         // Collect this block's events on the integer sample clock (no float drift).
-        let mut events: Vec<(usize, SongEvent)> = Vec::new();
+        if !self.playing {
+            // Stopping drops notes that never started; ringing voices decay.
+            self.pending.clear();
+        }
         if self.playing {
             let k_start = (self.sample_pos as f64 / spt).ceil() as u64;
             let k_end = ((self.sample_pos + n as u64) as f64 / spt).ceil() as u64;
             for k in k_start..k_end {
-                let fire = (k as f64 * spt - self.sample_pos as f64).round() as usize;
-                let fire = fire.min(n.saturating_sub(1));
+                let tick_at = (k as f64 * spt).round() as u64;
                 let in_pat = (k % TICKS_PATTERN as u64) as u32;
                 if let Some(pat) = self.pattern_at_tick(song, k) {
                     self.cur_pat = pat;
@@ -519,7 +525,7 @@ impl EngineRt {
                     let Some(pdata) = song.patterns.get(pat) else {
                         continue;
                     };
-                    for (ci, _ch) in song.channels.iter().enumerate() {
+                    for ci in 0..song.channels.len() {
                         if let Some(pts) = pdata.auto_vol.get(ci)
                             && let Some(v) = eval_auto(pts, in_pat)
                             && ci < self.auto_vol.len()
@@ -537,14 +543,12 @@ impl EngineRt {
                         }
                         if let Some(notes) = pdata.notes.get(ci) {
                             for note in notes.iter().filter(|nn| nn.tick == in_pat) {
-                                let mut off = fire;
+                                let mut at = tick_at;
                                 if in_pat % 8 == 4 {
-                                    off = (off as f64
-                                        + song.swing.clamp(0.0, 0.75) as f64 * 2.0 * spt)
-                                        as usize;
+                                    at += (song.swing.clamp(0.0, 0.75) as f64 * 2.0 * spt) as u64;
                                 }
-                                events.push((
-                                    off.min(n.saturating_sub(1)),
+                                self.pending.push((
+                                    at,
                                     SongEvent::NoteOn {
                                         ch: ci,
                                         midi: note.midi,
@@ -556,8 +560,8 @@ impl EngineRt {
                         }
                     }
                     if song.metronome && in_pat.is_multiple_of(16) {
-                        events.push((
-                            fire,
+                        self.pending.push((
+                            tick_at,
                             SongEvent::Click {
                                 accent: in_pat == 0,
                             },
@@ -565,13 +569,14 @@ impl EngineRt {
                     }
                 }
             }
-            events.sort_by_key(|(o, _)| *o);
+            self.pending.sort_by_key(|(at, _)| *at);
         }
 
         let mut ei = 0;
         for i in 0..n {
-            while ei < events.len() && events[ei].0 <= i {
-                match events[ei].1 {
+            let now = self.sample_pos + i as u64;
+            while ei < self.pending.len() && self.pending[ei].0 <= now {
+                match self.pending[ei].1 {
                     SongEvent::NoteOn {
                         ch,
                         midi,
@@ -598,6 +603,7 @@ impl EngineRt {
             out_l[i] = l;
             out_r[i] = r;
         }
+        self.pending.drain(..ei.min(self.pending.len()));
         if self.playing {
             self.sample_pos += n as u64;
             self.tick_pos = self.sample_pos as f64 / spt;
@@ -606,7 +612,9 @@ impl EngineRt {
                 let end_sample = (total as f64 * spt) as u64;
                 if self.sample_pos >= end_sample {
                     if song.loop_song && !self.ignore_loop {
+                        // New pass re-collects its own events; drop the old ones.
                         self.sample_pos = 0;
+                        self.pending.clear();
                     } else {
                         self.playing = false;
                     }
@@ -796,6 +804,7 @@ impl EngineRt {
         self.live_off = 0;
         self.playheads.clear();
         self.metro_heads.clear();
+        self.pending.clear();
         for p in self.ch_peaks.iter_mut() {
             *p = 0.0;
         }

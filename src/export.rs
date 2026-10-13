@@ -117,3 +117,47 @@ pub fn export_midi(song: &Song, pattern_fallback: usize, path: &str) -> Result<S
     std::fs::write(path, file).map_err(|e| e.to_string())?;
     Ok(format!("exported {} bars to {path}", bars.len()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::song::demo_song;
+
+    fn tmp(name: &str) -> String {
+        std::env::temp_dir()
+            .join(name)
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn midi_file_has_valid_header() {
+        let path = tmp("thunder-midi-test.mid");
+        let msg = export_midi(&demo_song(), 0, &path).unwrap();
+        assert!(msg.contains("bars"));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], b"MThd");
+        assert_eq!(&bytes[8..10], [0x00, 0x00]); // format 0
+        let mtrk = bytes
+            .windows(4)
+            .position(|w| w == b"MTrk")
+            .expect("MTrk chunk");
+        let track_len = u32::from_be_bytes(bytes[mtrk + 4..mtrk + 8].try_into().unwrap()) as usize;
+        assert_eq!(mtrk + 8 + track_len, bytes.len());
+        assert!(bytes.contains(&0x90)); // at least one note-on
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn midi_falls_back_to_single_pattern() {
+        let mut song = crate::song::new_empty();
+        song.patterns[0].notes[0].push(crate::song::Note::new(0, 4, 60, 0.9));
+        let path = tmp("thunder-midi-fallback.mid");
+        let msg = export_midi(&song, 0, &path).unwrap();
+        assert!(msg.starts_with("exported 1 bars"));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], b"MThd");
+        std::fs::remove_file(&path).ok();
+    }
+}

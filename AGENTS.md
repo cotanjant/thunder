@@ -33,7 +33,7 @@ cargo run -- --offline-test
 ```
 
 Check each gate on its own. Do not pipe through `tail` in a way that hides
-a nonzero exit. A push with a red gate is a broken push.
+a nonzero exit. Do not push while any gate fails.
 
 ## Code rules
 
@@ -66,7 +66,7 @@ Researched AI tells and banned from all copy:
 - No banned verbs/nouns: delve, leverage, harness, foster, showcase, embark,
   tapestry, landscape (figurative), realm, testament.
 - No emoji headers. No "in conclusion" wrappers. Just end.
-- One "robust" is a warning sign. Rewrite the sentence.
+- If one of these words shows up, rewrite the sentence.
 
 Site copy targets musicians, not developers. No architecture tables, no CI
 talk, no module lists on the website. Repo docs can carry the technical detail.
@@ -82,7 +82,8 @@ talk, no module lists on the website. Repo docs can carry the technical detail.
 - Retagging a failed release is allowed only when nothing was published.
   Delete the remote tag first, then recreate it.
 - Old-glibc Linux builds ship via `compat.yml` (Ubuntu 20.04 container).
-  Fully static musl builds do not work for GUI audio apps, build old instead.
+  Fully static musl builds do not work for GUI audio apps, so the release
+  ships binaries built against old glibc instead.
 - `dist generate` output (`release.yml`, `wix/main.wxs`) is committed.
   Hand edits to `main.wxs` are protected by `allow-dirty = ["msi"]`.
 - After release: confirm artifacts exist, test what can be tested here

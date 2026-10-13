@@ -587,8 +587,19 @@ fn place_note(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, tick: u32
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn piano_roll(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
+    piano_toolbar(ui, s, u);
+    // Target switch above may have changed the channel: re-resolve.
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let pat = ui.sel_pat;
+    piano_options(ui, u);
+    piano_canvas(ui, s, ch, pat, u);
+    velocity_lane(s, ch, pat, u);
+    automation_lane(ui, s, ch, pat, u);
+    note_dialog(ui, s, ch, pat, u);
+}
+
+fn piano_toolbar(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
     let pat = ui.sel_pat;
     u.horizontal(|u| {
@@ -702,6 +713,9 @@ pub fn piano_roll(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
         }
     });
+}
+
+fn piano_options(ui: &mut AppUi, u: &mut egui::Ui) {
     u.horizontal(|u| {
         u.label("Snap:");
         egui::ComboBox::from_id_salt("snap")
@@ -748,7 +762,9 @@ pub fn piano_roll(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         u.add(egui::Slider::new(&mut bot, 21..=72).text("Octave"));
         ui.piano_bot = bot;
     });
+}
 
+fn piano_canvas(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
     let (midi_lo, midi_hi) = piano_midi_range(ui.piano_bot);
     let rows = (midi_hi - midi_lo + 1) as usize;
     let avail_w = u.available_width().max(300.0);
@@ -1030,10 +1046,9 @@ pub fn piano_roll(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     {
         notes.remove(idx);
     }
+}
 
-    velocity_lane(s, ch, pat, u);
-    automation_lane(ui, s, ch, pat, u);
-
+fn note_dialog(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
     // Note properties dialog (FL opens one on double-click).
     if let Some(idx) = ui.prop_note {
         let count = s.song.patterns[pat]

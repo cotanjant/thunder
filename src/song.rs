@@ -291,7 +291,7 @@ pub fn eval_auto(points: &[AutoPoint], tick: u32) -> Option<f32> {
             return Some(w[0].value + (w[1].value - w[0].value) * t);
         }
     }
-    Some(pts.last().unwrap().value)
+    pts.last().map(|p| p.value)
 }
 
 // ---------------------------------------------------------------------------
@@ -653,5 +653,43 @@ mod tests {
         tool_arpeggiate(&mut notes);
         assert_eq!(notes.len(), STEPS);
         assert!(notes.windows(2).all(|w| w[0].tick <= w[1].tick));
+    }
+
+    #[test]
+    fn strum_spreads_chord_cluster() {
+        let mut notes = vec![
+            Note::new(8, 4, 60, 0.9),
+            Note::new(8, 4, 64, 0.9),
+            Note::new(8, 4, 67, 0.9),
+            Note::new(24, 4, 69, 0.9),
+        ];
+        tool_strum(&mut notes, 2);
+        let starts: Vec<u32> = notes.iter().map(|n| n.tick).collect();
+        assert_eq!(starts, vec![8, 10, 12, 24]);
+    }
+
+    #[test]
+    fn chord_builds_triad() {
+        let maj = tool_chord(0, 60, false);
+        assert_eq!(
+            maj.iter().map(|n| n.midi).collect::<Vec<_>>(),
+            vec![60, 64, 67]
+        );
+        let min = tool_chord(0, 60, true);
+        assert_eq!(
+            min.iter().map(|n| n.midi).collect::<Vec<_>>(),
+            vec![60, 63, 67]
+        );
+    }
+
+    #[test]
+    fn humanize_keeps_shape() {
+        let mut notes = vec![Note::new(16, 4, 60, 0.9), Note::new(32, 4, 64, 0.9)];
+        tool_humanize(&mut notes, 12345);
+        assert_eq!(notes.len(), 2);
+        for n in &notes {
+            assert!(n.tick < TICKS_PATTERN);
+            assert!((0.05..=1.0).contains(&n.vel));
+        }
     }
 }

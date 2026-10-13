@@ -86,16 +86,11 @@ Initial release.
 
 - 6-channel × 16-step sequencer (Kick / Snare / Hat / Bass / Lead / Pad)
 - Per-channel fundsp voices: `var(pitch) >> osc >> lowpass * adsr_live >> pan`
-- Channel editor: waveform, base note (MIDI 21–108), cutoff, Q, ADSR with live graph rebuilds
+- Channel editor: waveform, base note (MIDI 21-108), cutoff, Q, ADSR with live graph rebuilds
 - Mixer: per-track volume + equal-power pan, master bus with tanh soft clip
 - Live 2-octave piano on a dedicated saw voice
 - Master scope + peak meter
 - Headless self-test: `cargo run -- --offline-test`
-- CI (fmt, clippy `-D warnings`, check, offline-test), Dependabot, GitHub Pages site
-
-### Fixed
-
-- n/a (first release)
 
 ### Known limits
 
