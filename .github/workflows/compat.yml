@@ -46,37 +46,37 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Check out the tag
         run: |
-          git clone --depth 1 --branch "$TAG" https://github.com/canureal/thunder-daw.git src
+          git clone --depth 1 --branch "$TAG" https://github.com/cotanjant/thunder.git src
           cd src && git rev-parse HEAD
       - name: Build against old glibc
         working-directory: src
         run: |
           cargo build --profile dist --locked
-          objdump -T target/dist/thunder-daw \
+          objdump -T target/dist/thunder \
             | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -2
       - name: Smoke-test the old-glibc binary
         working-directory: src
-        run: ./target/dist/thunder-daw --offline-test
+        run: ./target/dist/thunder --offline-test
       - name: Pack compat tarball and AppImage
         working-directory: src
         run: |
           VERSION="${TAG#v}"
           mkdir -p dist-out/AppDir/usr/bin
-          cp target/dist/thunder-daw dist-out/AppDir/usr/bin/
-          cp assets/thunder-daw.desktop dist-out/AppDir/
-          cp assets/icon-256.png dist-out/AppDir/thunder-daw.png
-          printf '#!/bin/sh\nexec "$APPDIR/usr/bin/thunder-daw" "$@"\n' > dist-out/AppDir/AppRun
-          chmod +x dist-out/AppDir/AppRun dist-out/AppDir/usr/bin/thunder-daw
-          tar -C dist-out/AppDir -cJf "dist-out/thunder-daw-x86_64-oldlinux.tar.xz" \
-            --transform 's,^,thunder-daw-x86_64-oldlinux/,' usr thunder-daw.desktop thunder-daw.png
+          cp target/dist/thunder dist-out/AppDir/usr/bin/
+          cp assets/thunder.desktop dist-out/AppDir/
+          cp assets/icon-256.png dist-out/AppDir/thunder.png
+          printf '#!/bin/sh\nexec "$APPDIR/usr/bin/thunder" "$@"\n' > dist-out/AppDir/AppRun
+          chmod +x dist-out/AppDir/AppRun dist-out/AppDir/usr/bin/thunder
+          tar -C dist-out/AppDir -cJf "dist-out/thunder-x86_64-oldlinux.tar.xz" \
+            --transform 's,^,thunder-x86_64-oldlinux/,' usr thunder.desktop thunder.png
           curl -LsSf -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
           ./appimagetool --appimage-extract-and-run dist-out/AppDir \
-            "dist-out/thunder-daw-$VERSION-x86_64-oldlinux.AppImage"
+            "dist-out/thunder-$VERSION-x86_64-oldlinux.AppImage"
       - name: Upload compat artifacts
         run: |
           VERSION="${TAG#v}"
-          gh release upload "$TAG" src/dist-out/thunder-daw-x86_64-oldlinux.tar.xz \
-            "src/dist-out/thunder-daw-$VERSION-x86_64-oldlinux.AppImage" \
-            --repo canureal/thunder-daw --clobber
+          gh release upload "$TAG" src/dist-out/thunder-x86_64-oldlinux.tar.xz \
+            "src/dist-out/thunder-$VERSION-x86_64-oldlinux.AppImage" \
+            --repo cotanjant/thunder --clobber

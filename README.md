@@ -1,4 +1,4 @@
-# thunder-daw
+# thunder
 
 A small FL Studio-style DAW in Rust: step sequencer, piano roll, playlist, mixer.
 
@@ -9,9 +9,9 @@ A small FL Studio-style DAW in Rust: step sequencer, piano roll, playlist, mixer
 ## Install
 
 Prebuilt binaries for Windows, macOS and Linux are attached to every
-[release](https://github.com/canureal/thunder-daw/releases).
+[release](https://github.com/cotanjant/thunder/releases).
 Pick the one for your system on the
-[download page](https://canureal.github.io/thunder-daw/releases.html):
+[download page](https://cotanjant.github.io/thunder/releases.html):
 Windows gets an MSI wizard, Mac a drag-to-Applications disk image,
 Linux an AppImage. No terminal required.
 
@@ -32,8 +32,8 @@ Linux an AppImage. No terminal required.
 You need a Rust toolchain (1.88 or newer):
 
 ```bash
-git clone https://github.com/canureal/thunder-daw.git
-cd thunder-daw
+git clone https://github.com/cotanjant/thunder.git
+cd thunder
 cargo run --release
 ```
 
@@ -57,5 +57,5 @@ cargo run -- --offline-test
 ## Website and docs
 
 The site in [`website/`](website/) deploys to GitHub Pages on every push to `main`.
-Releases live under [GitHub Releases](https://github.com/canureal/thunder-daw/releases)
+Releases live under [GitHub Releases](https://github.com/cotanjant/thunder/releases)
 with the [changelog](CHANGELOG.md) in the repo.

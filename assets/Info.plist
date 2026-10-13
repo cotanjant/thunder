@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key>
-  <string>thunder-daw</string>
+  <string>thunder</string>
   <key>CFBundleIconFile</key>
-  <string>ThunderDAW</string>
+  <string>Thunder</string>
   <key>CFBundleIdentifier</key>
-  <string>com.canureal.thunderdaw</string>
+  <string>com.cotanjant.thunder</string>
   <key>CFBundleName</key>
-  <string>ThunderDAW</string>
+  <string>Thunder</string>
   <key>CFBundleDisplayName</key>
-  <string>ThunderDAW</string>
+  <string>Thunder</string>
   <key>CFBundleShortVersionString</key>
   <string>@VERSION@</string>
   <key>CFBundleVersion</key>

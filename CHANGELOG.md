@@ -10,6 +10,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Master-bus recording: the Rec button captures what plays, shows the take
   length, and saves it as a WAV file. Takes cap at five minutes.
 
+## [v0.3.0] - 2026-10-13
+
+### Changed
+
+- Full rebrand to Thunder: new name in the app, installers, site and docs.
+  The binary is now `thunder`, the macOS app is Thunder.app, the repo lives
+  at `cotanjant/thunder`. Old release files keep their names.
+
 ## [v0.2.6] - 2026-10-13
 
 ### Fixed
@@ -118,11 +126,12 @@ Initial release.
 - Audio thread drops to silence on lock contention (`Mutex::try_lock`)
 - Linux build needs ALSA/X11/Wayland dev packages (see README)
 
-[v0.2.6]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.6
-[v0.2.5]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.5
-[v0.2.4]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.4
-[v0.2.3]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.3
-[v0.2.2]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.2
-[v0.2.1]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.1
-[v0.2.0]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.0
-[v0.1.0]: https://github.com/canureal/thunder-daw/releases/tag/v0.1.0
+[v0.3.0]: https://github.com/cotanjant/thunder/releases/tag/v0.3.0
+[v0.2.6]: https://github.com/cotanjant/thunder/releases/tag/v0.2.6
+[v0.2.5]: https://github.com/cotanjant/thunder/releases/tag/v0.2.5
+[v0.2.4]: https://github.com/cotanjant/thunder/releases/tag/v0.2.4
+[v0.2.3]: https://github.com/cotanjant/thunder/releases/tag/v0.2.3
+[v0.2.2]: https://github.com/cotanjant/thunder/releases/tag/v0.2.2
+[v0.2.1]: https://github.com/cotanjant/thunder/releases/tag/v0.2.1
+[v0.2.0]: https://github.com/cotanjant/thunder/releases/tag/v0.2.0
+[v0.1.0]: https://github.com/cotanjant/thunder/releases/tag/v0.1.0

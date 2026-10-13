@@ -133,7 +133,7 @@ pub struct AppUi {
 
 /// Marker file: first run shows the tutorial, afterwards it stays hidden.
 fn tutorial_marker() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|p| p.join("thunder-daw").join("tutorial_seen"))
+    dirs::config_dir().map(|p| p.join("thunder").join("tutorial_seen"))
 }
 
 fn tutorial_seen() -> bool {
@@ -176,7 +176,7 @@ impl Default for AppUi {
             press_cell: None,
             auto_sel: AutoSel::Vol,
             auto_drag: None,
-            save_path: "thunder-daw.json".into(),
+            save_path: "thunder.json".into(),
             wav_path: "mixdown.wav".into(),
             mid_path: "song.mid".into(),
             take_path: "take.wav".into(),
@@ -1408,7 +1408,7 @@ pub fn tutorial(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         return;
     }
     let mut close = false;
-    egui::Window::new("Welcome to thunder-daw")
+    egui::Window::new("Welcome to Thunder")
         .collapsible(false)
         .show(u.ctx(), |w| {
             w.label("Make your first beat in two minutes:");

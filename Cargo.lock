@@ -3666,8 +3666,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "thunder-daw"
-version = "0.2.6"
+name = "thunder"
+version = "0.3.0"
 dependencies = [
  "cpal",
  "dirs",

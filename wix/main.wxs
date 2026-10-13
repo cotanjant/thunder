@@ -60,9 +60,9 @@
 
     <Product
         Id='*'
-        Name='thunder-daw'
+        Name='Thunder'
         UpgradeCode='9B538FC9-5CB1-4E8A-84BD-695D60CEB5E7'
-        Manufacturer='thunder-daw contributors'
+        Manufacturer='Thunder contributors'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -70,7 +70,7 @@
         <Package Id='*'
             Keywords='Installer'
             Description='A small FL Studio-style DAW in Rust'
-            Manufacturer='thunder-daw contributors'
+            Manufacturer='Thunder contributors'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'
@@ -83,15 +83,15 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='thunder-daw Installation'/>
+        <Property Id='DiskPrompt' Value='Thunder Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='ProgramMenuFolder'>
-                <Directory Id='ApplicationProgramsFolder' Name='thunder-daw'/>
+                <Directory Id='ApplicationProgramsFolder' Name='Thunder'/>
             </Directory>
             <Directory Id='DesktopFolder'/>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='thunder-daw'>
+                <Directory Id='APPLICATIONFOLDER' Name='Thunder'>
                     
                     <!--
                       Enabling the license sidecar file in the installer is a four step process:
@@ -127,22 +127,22 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='thunder-daw.exe'
+                                Name='thunder.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\thunder-daw.exe'
+                                Source='$(var.CargoTargetBinDir)\thunder.exe'
                                 KeyPath='yes'/>
                         </Component>
                         <Component Id='StartMenuShortcutComp' Guid='*'>
                             <Shortcut
                                 Id='StartMenuThunder'
-                                Name='thunder-daw'
+                                Name='Thunder'
                                 Description='Small FL-style DAW'
-                                Target='[Bin]thunder-daw.exe'
+                                Target='[Bin]thunder.exe'
                                 WorkingDirectory='APPLICATIONFOLDER'/>
                             <RemoveFolder Id='RemoveAppProgramsFolder' Directory='ApplicationProgramsFolder' On='uninstall'/>
                             <RegistryValue
                                 Root='HKCU'
-                                Key='Software\thunder-daw'
+                                Key='Software\Thunder'
                                 Name='startmenu'
                                 Type='integer'
                                 Value='1'
@@ -151,13 +151,13 @@
                         <Component Id='DesktopShortcutComp' Guid='*'>
                             <Shortcut
                                 Id='DesktopThunder'
-                                Name='thunder-daw'
+                                Name='Thunder'
                                 Description='Small FL-style DAW'
-                                Target='[Bin]thunder-daw.exe'
+                                Target='[Bin]thunder.exe'
                                 WorkingDirectory='APPLICATIONFOLDER'/>
                             <RegistryValue
                                 Root='HKCU'
-                                Key='Software\thunder-daw'
+                                Key='Software\Thunder'
                                 Name='desktop'
                                 Type='integer'
                                 Value='1'
@@ -189,7 +189,7 @@
             <Feature
                 Id='StartMenu'
                 Title='Start Menu shortcut'
-                Description='Adds thunder-daw to the Start Menu.'
+                Description='Adds Thunder to the Start Menu.'
                 Level='1'
                 Absent='allow'>
                 <ComponentRef Id='StartMenuShortcutComp'/>
@@ -198,7 +198,7 @@
             <Feature
                 Id='DesktopShortcut'
                 Title='Desktop shortcut'
-                Description='Puts a thunder-daw icon on the desktop for double-click launching.'
+                Description='Puts a Thunder icon on the desktop for double-click launching.'
                 Level='1'
                 Absent='allow'>
                 <ComponentRef Id='DesktopShortcutComp'/>
@@ -226,7 +226,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://canureal.github.io/thunder-daw/'/>
+        <Property Id='ARPHELPLINK' Value='https://cotanjant.github.io/thunder/'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>

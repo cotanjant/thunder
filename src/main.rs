@@ -148,7 +148,7 @@ fn main() {
     let options = eframe::NativeOptions::default();
     let _ = _stream;
     if let Err(e) = eframe::run_native(
-        "thunder-daw",
+        "Thunder",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(fl_visuals());

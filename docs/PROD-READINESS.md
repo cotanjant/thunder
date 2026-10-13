@@ -1,4 +1,4 @@
-# Prod-readiness audit — thunder-daw
+# Prod-readiness audit — thunder
 
 Status: v0.2.5 (cpal 0.18, eframe/egui 0.36, fundsp 0.23, edition 2024).
 

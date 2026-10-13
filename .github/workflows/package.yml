@@ -28,23 +28,23 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     steps:
       - name: Check the release exists
-        run: gh release view "$TAG" --repo canureal/thunder-daw --json tagName
+        run: gh release view "$TAG" --repo cotanjant/thunder --json tagName
       - name: Get version from tag
         run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
       - name: Download macOS archives
         run: |
-          mkdir -p pkgs app/ThunderDAW.app/Contents/MacOS app/ThunderDAW.app/Contents/Resources
-          gh release download "$TAG" --repo canureal/thunder-daw \
-            --pattern 'thunder-daw-*-apple-darwin.tar.xz' --dir pkgs
+          mkdir -p pkgs app/Thunder.app/Contents/MacOS app/Thunder.app/Contents/Resources
+          gh release download "$TAG" --repo cotanjant/thunder \
+            --pattern 'thunder-*-apple-darwin.tar.xz' --dir pkgs
       - name: Assemble universal .app
         run: |
           mkdir -p x64 arm
-          tar -xf pkgs/thunder-daw-x86_64-apple-darwin.tar.xz -C x64 --strip-components=1
-          tar -xf pkgs/thunder-daw-aarch64-apple-darwin.tar.xz -C arm --strip-components=1
-          lipo -create x64/thunder-daw arm/thunder-daw \
-            -output app/ThunderDAW.app/Contents/MacOS/thunder-daw
-          chmod +x app/ThunderDAW.app/Contents/MacOS/thunder-daw
-          echo -n "APPLTDaw" > app/ThunderDAW.app/Contents/PkgInfo
+          tar -xf pkgs/thunder-x86_64-apple-darwin.tar.xz -C x64 --strip-components=1
+          tar -xf pkgs/thunder-aarch64-apple-darwin.tar.xz -C arm --strip-components=1
+          lipo -create x64/thunder arm/thunder \
+            -output app/Thunder.app/Contents/MacOS/thunder
+          chmod +x app/Thunder.app/Contents/MacOS/thunder
+          echo -n "APPLTDaw" > app/Thunder.app/Contents/PkgInfo
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
@@ -57,18 +57,18 @@ jobs:
           done
           cp iconset.iconset/icon_512x512.png iconset.iconset/icon_256x256@2x.png
           sips -z 1024 1024 src/assets/icon-1024.png --out iconset.iconset/icon_1024x1024.png >/dev/null
-          iconutil -c icns iconset.iconset -o app/ThunderDAW.app/Contents/Resources/ThunderDAW.icns
+          iconutil -c icns iconset.iconset -o app/Thunder.app/Contents/Resources/Thunder.icns
           sed "s/@VERSION@/$VERSION/" src/assets/Info.plist \
-            > app/ThunderDAW.app/Contents/Info.plist
+            > app/Thunder.app/Contents/Info.plist
           mkdir -p dmg
-          cp -R app/ThunderDAW.app dmg/
+          cp -R app/Thunder.app dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname ThunderDAW -srcfolder dmg -ov -format UDZO \
-            ThunderDAW-$VERSION-macos.dmg
+          hdiutil create -volname Thunder -srcfolder dmg -ov -format UDZO \
+            Thunder-$VERSION-macos.dmg
       - name: Upload DMG
         run: |
-          gh release upload "$TAG" "ThunderDAW-$VERSION-macos.dmg" \
-            --repo canureal/thunder-daw --clobber
+          gh release upload "$TAG" "Thunder-$VERSION-macos.dmg" \
+            --repo cotanjant/thunder --clobber
 
   linux-appimage:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v')) }}
@@ -78,34 +78,34 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     steps:
       - name: Check the release exists
-        run: gh release view "$TAG" --repo canureal/thunder-daw --json tagName
+        run: gh release view "$TAG" --repo cotanjant/thunder --json tagName
       - name: Get version from tag
         run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
       - name: Download Linux archive
         run: |
           mkdir -p pkg AppDir/usr/bin
-          gh release download "$TAG" --repo canureal/thunder-daw \
-            --pattern 'thunder-daw-x86_64-unknown-linux-gnu.tar.xz' --dir pkg
-          tar -xf pkg/thunder-daw-x86_64-unknown-linux-gnu.tar.xz -C pkg --strip-components=1
+          gh release download "$TAG" --repo cotanjant/thunder \
+            --pattern 'thunder-x86_64-unknown-linux-gnu.tar.xz' --dir pkg
+          tar -xf pkg/thunder-x86_64-unknown-linux-gnu.tar.xz -C pkg --strip-components=1
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
           path: src
       - name: Assemble AppDir
         run: |
-          cp pkg/thunder-daw AppDir/usr/bin/
-          cp src/assets/thunder-daw.desktop AppDir/
-          cp src/assets/icon-256.png AppDir/thunder-daw.png
-          printf '#!/bin/sh\nexec "$APPDIR/usr/bin/thunder-daw" "$@"\n' > AppDir/AppRun
-          chmod +x AppDir/AppRun AppDir/usr/bin/thunder-daw
+          cp pkg/thunder AppDir/usr/bin/
+          cp src/assets/thunder.desktop AppDir/
+          cp src/assets/icon-256.png AppDir/thunder.png
+          printf '#!/bin/sh\nexec "$APPDIR/usr/bin/thunder" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun AppDir/usr/bin/thunder
       - name: Build AppImage
         run: |
           curl -LsSf -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
           ./appimagetool --appimage-extract-and-run AppDir \
-            "thunder-daw-$VERSION-x86_64.AppImage"
+            "thunder-$VERSION-x86_64.AppImage"
       - name: Upload AppImage
         run: |
-          gh release upload "$TAG" "thunder-daw-$VERSION-x86_64.AppImage" \
-            --repo canureal/thunder-daw --clobber
+          gh release upload "$TAG" "thunder-$VERSION-x86_64.AppImage" \
+            --repo cotanjant/thunder --clobber
