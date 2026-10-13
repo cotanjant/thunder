@@ -122,6 +122,7 @@ pub struct AppUi {
     save_path: String,
     wav_path: String,
     mid_path: String,
+    take_path: String,
     sample_path: String,
     browser_dir: String,
     browser_cache: Vec<String>,
@@ -178,6 +179,7 @@ impl Default for AppUi {
             save_path: "thunder-daw.json".into(),
             wav_path: "mixdown.wav".into(),
             mid_path: "song.mid".into(),
+            take_path: "take.wav".into(),
             sample_path: String::new(),
             browser_dir: "samples".into(),
             browser_cache: Vec::new(),
@@ -289,6 +291,35 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         if u.button("⏮ Reset").clicked() {
             s.rt.reset_transport();
         }
+        // Record the master bus. Starts playback too; pressing again keeps
+        // the take and stops recording. A new take discards the old one.
+        let mut rec = s.rt.recording;
+        let rec_btn = u.toggle_value(&mut rec, "● Rec");
+        if rec_btn
+            .on_hover_text("Record what plays, save it below")
+            .changed()
+        {
+            if rec {
+                s.rt.take_l.clear();
+                s.rt.take_r.clear();
+                s.rt.take_full = false;
+                s.rt.playing = true;
+            }
+            s.rt.recording = rec;
+            ui.status = if rec {
+                "recording…".into()
+            } else {
+                "take kept".into()
+            };
+        }
+        let take_secs = s.rt.take_l.len() / s.rt.sr.max(1.0) as usize;
+        u.label(format!(
+            "{}take {}:{:02}{}",
+            if s.rt.recording { "● " } else { "" },
+            take_secs / 60,
+            take_secs % 60,
+            if s.rt.take_full { " (full)" } else { "" }
+        ));
         // Song / pattern mode.
         let mut song_mode = s.rt.song_mode;
         if u.selectable_label(song_mode, "Song")
@@ -422,6 +453,23 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             match crate::export::export_midi(&s.song, ui.sel_pat, &ui.mid_path.clone()) {
                 Ok(m) => ui.status = m,
                 Err(e) => ui.status = format!("midi export failed: {e}"),
+            }
+        }
+        u.label("Take:");
+        u.add(egui::TextEdit::singleline(&mut ui.take_path).desired_width(100.0));
+        if u.button("Save").clicked() {
+            if s.rt.take_l.is_empty() {
+                ui.status = "nothing recorded yet".into();
+            } else {
+                match crate::export::write_wav_file(
+                    &ui.take_path.clone(),
+                    &s.rt.take_l.clone(),
+                    &s.rt.take_r.clone(),
+                    s.rt.sr,
+                ) {
+                    Ok(n) => ui.status = format!("saved take ({n} samples)"),
+                    Err(e) => ui.status = format!("take save failed: {e}"),
+                }
             }
         }
     });
@@ -1906,6 +1954,30 @@ mod ui_tests {
         let pts = &h.state().app.song.patterns[0].auto_vol[4];
         assert_eq!(pts.len(), 1);
         assert_eq!(pts[0].tick, 32, "drag must move the automation point");
+    }
+
+    #[test]
+    fn transport_rec_arms_and_plays() {
+        struct TState {
+            ui: AppUi,
+            app: AppState,
+        }
+        let state = TState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+        };
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TState| {
+                transport(&mut st.ui, &mut st.app, u);
+            },
+            state,
+        );
+        assert!(!h.state().app.rt.recording);
+        h.get_by_label("\u{25cf} Rec").click();
+        h.step();
+        assert!(h.state().app.rt.recording, "Rec must arm recording");
+        assert!(h.state().app.rt.playing, "Rec must start transport");
+        assert!(h.state().app.rt.take_l.is_empty(), "new take starts empty");
     }
 
     #[test]

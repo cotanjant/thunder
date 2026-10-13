@@ -299,6 +299,12 @@ pub struct EngineRt {
     pub peak: f32,
     /// Per-channel post-fader peak, decaying. Feeds the mixer meters.
     pub ch_peaks: Vec<f32>,
+    /// Master-bus recording. Captured post-fader while playing.
+    pub recording: bool,
+    pub take_l: Vec<f32>,
+    pub take_r: Vec<f32>,
+    /// Set when the take hit the length cap and recording stopped itself.
+    pub take_full: bool,
     pub scope: Vec<f32>,
     scope_pos: usize,
     scope_tick: usize,
@@ -346,6 +352,10 @@ impl EngineRt {
             ignore_loop: false,
             peak: 0.0,
             ch_peaks: Vec::new(),
+            recording: false,
+            take_l: Vec::new(),
+            take_r: Vec::new(),
+            take_full: false,
             scope: vec![0.0; SCOPE_LEN],
             scope_pos: 0,
             scope_tick: 0,
@@ -781,6 +791,16 @@ impl EngineRt {
         r *= song.master_vol * 0.22;
         l = l.tanh();
         r = r.tanh();
+        if self.recording && self.playing {
+            // 5 minutes of stereo f32 ≈ 100 MB; then stop, keep the take.
+            if self.take_l.len() >= 44100 * 60 * 5 {
+                self.recording = false;
+                self.take_full = true;
+            } else {
+                self.take_l.push(l);
+                self.take_r.push(r);
+            }
+        }
         self.peak = (self.peak * 0.9995).max(l.abs().max(r.abs()));
         self.scope_tick += 1;
         if self.scope_tick.is_multiple_of(4) {
@@ -805,6 +825,7 @@ impl EngineRt {
         self.playheads.clear();
         self.metro_heads.clear();
         self.pending.clear();
+        self.recording = false;
         for p in self.ch_peaks.iter_mut() {
             *p = 0.0;
         }
@@ -976,5 +997,31 @@ mod tests {
             l.iter().chain(r.iter()).all(|x| x.is_finite()),
             "NaN in output"
         );
+    }
+
+    #[test]
+    fn take_records_while_playing() {
+        let song = crate::song::demo_song();
+        let mut rt = EngineRt::new(44100.0);
+        rt.ensure_channels(&song);
+        rt.song_mode = true;
+        rt.playing = true;
+        rt.recording = true;
+        let mut l = vec![0.0; 44100];
+        let mut r = vec![0.0; 44100];
+        rt.process(&song, &mut l, &mut r);
+        assert_eq!(rt.take_l.len(), 44100, "one second of take");
+        assert!(rt.take_l.iter().all(|x| x.is_finite()));
+        rt.playing = false;
+        rt.process(&song, &mut l, &mut r);
+        assert_eq!(rt.take_l.len(), 44100, "stopped transport adds nothing");
+        let path = std::env::temp_dir().join("thunder-take-test.wav");
+        let path = path.to_str().unwrap();
+        let n = crate::export::write_wav_file(path, &rt.take_l, &rt.take_r, 44100.0).unwrap();
+        assert_eq!(n, 44100);
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.len(), 44100 * 2);
+        std::fs::remove_file(path).ok();
     }
 }

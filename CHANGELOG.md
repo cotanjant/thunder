@@ -3,6 +3,13 @@
 Changes are listed per release, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Master-bus recording: the Rec button captures what plays, shows the take
+  length, and saves it as a WAV file. Takes cap at five minutes.
+
 ## [v0.2.6] - 2026-10-13
 
 ### Fixed

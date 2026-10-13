@@ -29,6 +29,12 @@ pub fn render_to_stereo(song: &Song, sample_rate: f32, once: bool) -> (Vec<f32>,
 pub fn export_wav(song: &Song, path: &str) -> Result<String, String> {
     let sr = 44100.0;
     let (l, r) = render_to_stereo(song, sr, true);
+    let n = write_wav_file(path, &l, &r, sr)?;
+    Ok(format!("exported {n} samples to {path}"))
+}
+
+/// Shared WAV writer: mixdown export and recorded takes use the same path.
+pub fn write_wav_file(path: &str, l: &[f32], r: &[f32], sr: f32) -> Result<usize, String> {
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate: sr as u32,
@@ -41,7 +47,7 @@ pub fn export_wav(song: &Song, path: &str) -> Result<String, String> {
         w.write_sample(*b).map_err(|e| e.to_string())?;
     }
     w.finalize().map_err(|e| e.to_string())?;
-    Ok(format!("exported {} samples to {path}", l.len()))
+    Ok(l.len().min(r.len()))
 }
 
 // ---------------------------------------------------------------------------
