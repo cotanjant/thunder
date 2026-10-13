@@ -3,6 +3,20 @@
 Changes are listed per release, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.2.6] - 2026-10-13
+
+### Fixed
+
+- Dragging notes in the piano roll did nothing. The drag classifier read
+  the moved cursor instead of the press position, so every drag resized
+  instead of moving (or missed entirely). Grabs now use the press origin.
+- Same press-origin fix for automation point drags.
+
+### Added
+
+- Headless UI tests that click and drag the real panels: note place, move,
+  resize, automation move, transport toggle.
+
 ## [v0.2.5] - 2026-10-08
 
 ### Added
@@ -97,6 +111,7 @@ Initial release.
 - Audio thread drops to silence on lock contention (`Mutex::try_lock`)
 - Linux build needs ALSA/X11/Wayland dev packages (see README)
 
+[v0.2.6]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.6
 [v0.2.5]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.5
 [v0.2.4]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.4
 [v0.2.3]: https://github.com/canureal/thunder-daw/releases/tag/v0.2.3

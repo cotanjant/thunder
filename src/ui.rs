@@ -116,10 +116,9 @@ pub struct AppUi {
     sel_note: Option<usize>,
     prop_note: Option<usize>,
     drag: Option<(usize, DragKind, i32, i32)>,
-    pending_add: Option<(u32, u8)>,
+    press_cell: Option<(i32, i32)>,
     auto_sel: AutoSel,
     auto_drag: Option<usize>,
-    auto_pressed: bool,
     save_path: String,
     wav_path: String,
     mid_path: String,
@@ -173,10 +172,9 @@ impl Default for AppUi {
             sel_note: None,
             prop_note: None,
             drag: None,
-            pending_add: None,
+            press_cell: None,
             auto_sel: AutoSel::Vol,
             auto_drag: None,
-            auto_pressed: false,
             save_path: "thunder-daw.json".into(),
             wav_path: "mixdown.wav".into(),
             mid_path: "song.mid".into(),
@@ -764,7 +762,13 @@ fn piano_options(ui: &mut AppUi, u: &mut egui::Ui) {
     });
 }
 
-fn piano_canvas(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
+fn piano_canvas(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    ch: usize,
+    pat: usize,
+    u: &mut egui::Ui,
+) -> egui::Rect {
     let (midi_lo, midi_hi) = piano_midi_range(ui.piano_bot);
     let rows = (midi_hi - midi_lo + 1) as usize;
     let avail_w = u.available_width().max(300.0);
@@ -906,50 +910,64 @@ fn piano_canvas(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut
             tick >= n.tick as i32 && tick < (n.tick + n.len) as i32 && midi == n.midi as i32
         })
     };
-    if resp.drag_started() {
-        ui.pending_add = None;
-        if let Some(pos) = resp.hover_pos() {
-            let t = tick_at(pos.x);
-            let m = midi_at(pos.y);
-            // FL preview keyboard: the key strip plays instead of editing.
-            if pos.x < rect.min.x + KEY_W {
-                if m >= midi_lo as i32 && m <= midi_hi as i32 {
-                    s.rt.live_note(m as u8);
-                }
-            } else if (0..64).contains(&t) && m >= midi_lo as i32 && m <= midi_hi as i32 {
-                if let Some(idx) = hit_note(t, m) {
-                    // Erase tool deletes on press, like FL's delete tool.
-                    if ui.tool == PianoTool::Erase
-                        && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
-                        && idx < notes.len()
-                    {
-                        notes.remove(idx);
-                        ui.sel_note = None;
-                    } else if ui.tool == PianoTool::Hear {
-                        // Hear tool only plays the pitch.
-                        s.rt.live_note(m as u8);
-                    } else {
-                        let n = &notes_snapshot[idx];
-                        let right_edge = x_of(n.tick + n.len);
-                        let kind = if pos.x > right_edge - 7.0 {
-                            DragKind::Resize
-                        } else {
-                            DragKind::Move
-                        };
-                        ui.drag = Some((idx, kind, t - n.tick as i32, m - n.midi as i32));
-                        ui.sel_note = Some(idx);
-                    }
-                } else if ui.tool == PianoTool::Draw {
-                    let snap_t =
-                        ((t / ui.snap.max(1) as i32) * ui.snap.max(1) as i32).clamp(0, 63) as u32;
-                    ui.pending_add = Some((snap_t, scale_checked(ui, m as u8)));
+    // Press origin: where the current press started. With click-sensing
+    // widgets drag_started only fires after movement began, so grabs must
+    // be computed from the origin, not the moved cursor.
+    let origin = u.ctx().input(|i| i.pointer.press_origin());
+    let in_grid =
+        |t: i32, m: i32| (0..64).contains(&t) && m >= midi_lo as i32 && m <= midi_hi as i32;
+    if resp.drag_started()
+        && let Some(p0) = origin
+    {
+        let t0 = tick_at(p0.x);
+        let m0 = midi_at(p0.y);
+        if p0.x < rect.min.x + KEY_W {
+            if m0 >= midi_lo as i32 && m0 <= midi_hi as i32 {
+                s.rt.live_note(m0 as u8);
+            }
+        } else if in_grid(t0, m0) {
+            ui.press_cell = Some((t0, m0));
+            if let Some(idx) = hit_note(t0, m0) {
+                // Erase tool deletes on press, like FL's delete tool.
+                if ui.tool == PianoTool::Erase
+                    && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                    && idx < notes.len()
+                {
+                    notes.remove(idx);
+                    ui.sel_note = None;
                 } else if ui.tool == PianoTool::Hear {
-                    s.rt.live_note(m as u8);
+                    // Hear tool only plays the pitch.
+                    s.rt.live_note(m0 as u8);
+                } else if resp.hover_pos().is_some() {
+                    let n = &notes_snapshot[idx];
+                    let right_edge = x_of(n.tick + n.len);
+                    // Classify from the press origin: the cursor has already
+                    // moved by the time a drag starts.
+                    let kind = if p0.x > right_edge - 7.0 {
+                        DragKind::Resize
+                    } else {
+                        DragKind::Move
+                    };
+                    ui.drag = Some((idx, kind, t0 - n.tick as i32, m0 - n.midi as i32));
+                    ui.sel_note = Some(idx);
                 }
             }
         }
     }
-    if resp.dragged()
+    if resp.drag_stopped() {
+        // A press-drag-release that grabbed nothing still drops one note
+        // at the press cell for the Draw tool.
+        if ui.drag.is_none()
+            && ui.tool == PianoTool::Draw
+            && let Some((t0, m0)) = ui.press_cell
+            && in_grid(t0, m0)
+        {
+            let snap_t = ((t0 / ui.snap.max(1) as i32) * ui.snap.max(1) as i32).clamp(0, 63) as u32;
+            place_note(ui, s, ch, pat, snap_t, scale_checked(ui, m0 as u8));
+        }
+        ui.drag = None;
+        ui.press_cell = None;
+    } else if resp.dragged()
         && let Some((idx, kind, gt, gm)) = ui.drag
         && let Some(pos) = resp.hover_pos()
     {
@@ -973,45 +991,56 @@ fn piano_canvas(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut
                 }
             }
         }
-    } else {
-        ui.drag = None;
-    }
-    if resp.clicked() {
-        if let Some((t, m)) = ui.pending_add.take() {
-            // Press-drag-release path: press already chose the cell.
-            place_note(ui, s, ch, pat, t, m);
-        } else if let Some(pos) = resp.hover_pos() {
-            // Pure click path: no press event fired, hit-test here instead.
+    } else if ui.tool == PianoTool::Erase {
+        // Erase-drag: delete every note the cursor passes over.
+        if let Some(pos) = resp.hover_pos() {
             let t = tick_at(pos.x);
             let m = midi_at(pos.y);
-            if pos.x < rect.min.x + KEY_W {
-                if m >= midi_lo as i32 && m <= midi_hi as i32 {
-                    s.rt.live_note(m as u8);
+            if in_grid(t, m)
+                && let Some(idx) = hit_note(t, m)
+                && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                && idx < notes.len()
+            {
+                notes.remove(idx);
+                ui.sel_note = None;
+            }
+        }
+    }
+    // Pure clicks never reach the drag handlers: hit-test here instead.
+    // Skipped on drag-release frames so a drag never adds twice.
+    if resp.clicked()
+        && !resp.drag_stopped()
+        && let Some(pos) = resp.hover_pos()
+    {
+        let t = tick_at(pos.x);
+        let m = midi_at(pos.y);
+        if pos.x < rect.min.x + KEY_W {
+            if m >= midi_lo as i32 && m <= midi_hi as i32 {
+                s.rt.live_note(m as u8);
+            }
+        } else if in_grid(t, m) {
+            match ui.tool {
+                PianoTool::Draw => {
+                    if let Some(idx) = hit_note(t, m) {
+                        ui.sel_note = Some(idx);
+                    } else {
+                        let snap_t = ((t / ui.snap.max(1) as i32) * ui.snap.max(1) as i32)
+                            .clamp(0, 63) as u32;
+                        let mp = scale_checked(ui, m as u8);
+                        place_note(ui, s, ch, pat, snap_t, mp);
+                    }
                 }
-            } else if (0..64).contains(&t) && m >= midi_lo as i32 && m <= midi_hi as i32 {
-                match ui.tool {
-                    PianoTool::Draw => {
-                        if let Some(idx) = hit_note(t, m) {
-                            ui.sel_note = Some(idx);
-                        } else {
-                            let snap_t = ((t / ui.snap.max(1) as i32) * ui.snap.max(1) as i32)
-                                .clamp(0, 63) as u32;
-                            let mp = scale_checked(ui, m as u8);
-                            place_note(ui, s, ch, pat, snap_t, mp);
-                        }
+                PianoTool::Erase => {
+                    if let Some(idx) = hit_note(t, m)
+                        && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                        && idx < notes.len()
+                    {
+                        notes.remove(idx);
+                        ui.sel_note = None;
                     }
-                    PianoTool::Erase => {
-                        if let Some(idx) = hit_note(t, m)
-                            && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
-                            && idx < notes.len()
-                        {
-                            notes.remove(idx);
-                            ui.sel_note = None;
-                        }
-                    }
-                    PianoTool::Hear => {
-                        s.rt.live_note(m as u8);
-                    }
+                }
+                PianoTool::Hear => {
+                    s.rt.live_note(m as u8);
                 }
             }
         }
@@ -1046,6 +1075,7 @@ fn piano_canvas(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut
     {
         notes.remove(idx);
     }
+    rect
 }
 
 fn note_dialog(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
@@ -1148,7 +1178,13 @@ fn velocity_lane(s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
     }
 }
 
-fn automation_lane(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
+fn automation_lane(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    ch: usize,
+    pat: usize,
+    u: &mut egui::Ui,
+) -> egui::Rect {
     u.horizontal(|u| {
         u.label("Automation:");
         u.selectable_value(&mut ui.auto_sel, AutoSel::Vol, "Volume");
@@ -1232,12 +1268,13 @@ fn automation_lane(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &
         }
         best
     };
+    // Grab at the press origin: drag_started only fires once movement
+    // began, so the cursor has already left the pressed point.
     if resp.drag_started() {
         ui.auto_drag = None;
-        ui.auto_pressed = true;
-        if let Some(pos) = resp.hover_pos() {
-            let t = tick_at(pos.x);
-            if near_idx(&points, pos).is_none() {
+        if let Some(p0) = u.ctx().input(|i| i.pointer.press_origin()) {
+            let t = tick_at(p0.x);
+            if near_idx(&points, p0).is_none() {
                 let pts = if is_vol {
                     &mut s.song.patterns[pat].auto_vol
                 } else {
@@ -1246,55 +1283,51 @@ fn automation_lane(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &
                 if let Some(list) = pts.get_mut(ch) {
                     list.push(AutoPoint {
                         tick: t,
-                        value: val_at(pos.y),
+                        value: val_at(p0.y),
                     });
                     ui.auto_drag = Some(list.len() - 1);
                 }
             } else {
-                ui.auto_drag = near_idx(&points, pos);
+                ui.auto_drag = near_idx(&points, p0);
             }
         }
     }
-    if resp.dragged() {
-        if let Some(idx) = ui.auto_drag
-            && let Some(pos) = resp.hover_pos()
-        {
-            let pts = if is_vol {
-                &mut s.song.patterns[pat].auto_vol
-            } else {
-                &mut s.song.patterns[pat].auto_cut
-            };
-            if let Some(list) = pts.get_mut(ch)
-                && let Some(p) = list.get_mut(idx)
-            {
-                p.tick = tick_at(pos.x);
-                p.value = val_at(pos.y);
-            }
-        }
-    } else {
+    if resp.drag_stopped() {
         ui.auto_drag = None;
-    }
-    // Pure clicks never start a drag, so add the point here instead.
-    // A press that already added one sets auto_pressed: don't double up.
-    if resp.clicked() {
-        if ui.auto_pressed {
-            ui.auto_pressed = false;
-        } else if ui.auto_drag.is_none()
-            && let Some(pos) = resp.hover_pos()
+    } else if resp.dragged()
+        && let Some(idx) = ui.auto_drag
+        && let Some(pos) = resp.hover_pos()
+    {
+        let pts = if is_vol {
+            &mut s.song.patterns[pat].auto_vol
+        } else {
+            &mut s.song.patterns[pat].auto_cut
+        };
+        if let Some(list) = pts.get_mut(ch)
+            && let Some(p) = list.get_mut(idx)
         {
-            let t = tick_at(pos.x);
-            let pts = if is_vol {
-                &mut s.song.patterns[pat].auto_vol
-            } else {
-                &mut s.song.patterns[pat].auto_cut
-            };
-            if let Some(list) = pts.get_mut(ch) {
-                list.push(AutoPoint {
-                    tick: t,
-                    value: val_at(pos.y),
-                });
-                ui.status = "automation point added".into();
-            }
+            p.tick = tick_at(pos.x);
+            p.value = val_at(pos.y);
+        }
+    }
+    // Pure clicks never reach the drag handlers: add the point here.
+    // Skipped on drag-release frames so a drag never adds twice.
+    if resp.clicked()
+        && !resp.drag_stopped()
+        && let Some(pos) = resp.hover_pos()
+    {
+        let t = tick_at(pos.x);
+        let pts = if is_vol {
+            &mut s.song.patterns[pat].auto_vol
+        } else {
+            &mut s.song.patterns[pat].auto_cut
+        };
+        if let Some(list) = pts.get_mut(ch) {
+            list.push(AutoPoint {
+                tick: t,
+                value: val_at(pos.y),
+            });
+            ui.status = "automation point added".into();
         }
     }
     if resp.clicked_by(egui::PointerButton::Secondary)
@@ -1312,6 +1345,7 @@ fn automation_lane(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &
             list.remove(idx);
         }
     }
+    rect
 }
 
 // ---------------------------------------------------------------------------
@@ -1689,4 +1723,210 @@ pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         }
     });
     u.label(format!("{} samples in project", s.song.samples.len()));
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use crate::engine::AppState;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    struct TestState {
+        ui: AppUi,
+        app: AppState,
+        rect: Option<egui::Rect>,
+    }
+
+    fn piano_harness() -> Harness<'static, TestState> {
+        let state = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                let r = piano_canvas(&mut st.ui, &mut st.app, 4, 0, u);
+                st.rect = Some(r);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.step();
+        h
+    }
+
+    fn cell_center(h: &Harness<'_, TestState>, tick: u32, midi: u8) -> egui::Pos2 {
+        let rect = h.state().rect.expect("canvas rect recorded");
+        let cell_w = (rect.width() - KEY_W) / 64.0;
+        let (_, midi_hi) = piano_midi_range(40);
+        egui::pos2(
+            rect.min.x + KEY_W + (tick as f32 + 0.5) * cell_w,
+            rect.min.y + (midi_hi - midi) as f32 * 9.0 + 4.5,
+        )
+    }
+
+    fn click_at(h: &mut Harness<'_, TestState>, pos: egui::Pos2) {
+        use egui::PointerButton;
+        h.hover_at(pos);
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+
+    #[test]
+    fn piano_click_adds_note() {
+        let mut h = piano_harness();
+        assert!(h.state().app.song.patterns[0].notes[4].is_empty());
+        let target = cell_center(&h, 8, 60);
+        click_at(&mut h, target);
+        let notes = &h.state().app.song.patterns[0].notes[4];
+        assert_eq!(notes.len(), 1, "click must place exactly one note");
+        assert_eq!(notes[0].tick, 8);
+        assert_eq!(notes[0].midi, 60);
+    }
+
+    #[test]
+    fn piano_drag_moves_note() {
+        let mut state = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        state.app.song.patterns[0].notes[4].push(Note::new(8, 4, 60, 0.9));
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                let r = piano_canvas(&mut st.ui, &mut st.app, 4, 0, u);
+                st.rect = Some(r);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.step();
+        let from = cell_center(&h, 8, 60);
+        let to = cell_center(&h, 16, 60);
+        h.hover_at(from);
+        h.drag_at(from);
+        h.step();
+        h.hover_at(to);
+        h.step();
+        h.drop_at(to);
+        h.step();
+        let notes = &h.state().app.song.patterns[0].notes[4];
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].tick, 16, "drag must move the note");
+        assert_eq!(notes[0].midi, 60);
+    }
+
+    #[test]
+    fn piano_drag_resizes_note() {
+        let mut state = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        state.app.song.patterns[0].notes[4].push(Note::new(8, 4, 60, 0.9));
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                let r = piano_canvas(&mut st.ui, &mut st.app, 4, 0, u);
+                st.rect = Some(r);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.step();
+        let rect = h.state().rect.expect("canvas rect recorded");
+        let cell_w = (rect.width() - KEY_W) / 64.0;
+        let (_, midi_hi) = piano_midi_range(40);
+        // Press just inside the note's right edge, drag two steps right.
+        let y = rect.min.y + (midi_hi - 60) as f32 * 9.0 + 4.5;
+        let from = egui::pos2(rect.min.x + KEY_W + 12.0 * cell_w - 3.0, y);
+        let to = egui::pos2(rect.min.x + KEY_W + 16.5 * cell_w, y);
+        h.hover_at(from);
+        h.drag_at(from);
+        h.step();
+        h.hover_at(to);
+        h.step();
+        h.drop_at(to);
+        h.step();
+        let notes = &h.state().app.song.patterns[0].notes[4];
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].tick, 8, "resize must not move the note");
+        assert_eq!(notes[0].len, 9, "resize must extend the note");
+    }
+
+    #[test]
+    fn automation_drag_moves_point() {
+        use crate::song::AutoPoint;
+        struct AState {
+            ui: AppUi,
+            app: AppState,
+            rect: Option<egui::Rect>,
+        }
+        let mut state = AState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        state.app.song.patterns[0].auto_vol[4].push(AutoPoint {
+            tick: 16,
+            value: 1.0,
+        });
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut AState| {
+                let r = automation_lane(&mut st.ui, &mut st.app, 4, 0, u);
+                st.rect = Some(r);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.step();
+        let rect = h.state().rect.expect("lane rect recorded");
+        let x_of = |tick: u32| rect.min.x + KEY_W + tick as f32 / 64.0 * (rect.width() - KEY_W);
+        let y = rect.max.y - 4.0 - (1.0 / 1.5) * (72.0 - 8.0);
+        let from = egui::pos2(x_of(16), y);
+        let to = egui::pos2(x_of(32), y);
+        h.hover_at(from);
+        h.drag_at(from);
+        h.step();
+        h.hover_at(to);
+        h.step();
+        h.drop_at(to);
+        h.step();
+        let pts = &h.state().app.song.patterns[0].auto_vol[4];
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].tick, 32, "drag must move the automation point");
+    }
+
+    #[test]
+    fn transport_play_toggles() {
+        struct TState {
+            ui: AppUi,
+            app: AppState,
+        }
+        let state = TState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+        };
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TState| {
+                transport(&mut st.ui, &mut st.app, u);
+            },
+            state,
+        );
+        assert!(!h.state().app.rt.playing);
+        h.get_by_label("▶ Play").click();
+        h.step();
+        assert!(h.state().app.rt.playing, "Play must start transport");
+    }
 }
