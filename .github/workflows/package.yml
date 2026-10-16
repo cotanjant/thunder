@@ -45,7 +45,7 @@ jobs:
             -output app/Thunder.app/Contents/MacOS/thunder
           chmod +x app/Thunder.app/Contents/MacOS/thunder
           echo -n "APPLTDaw" > app/Thunder.app/Contents/PkgInfo
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
           path: src
@@ -87,7 +87,7 @@ jobs:
           gh release download "$TAG" --repo cotanjant/thunder \
             --pattern 'thunder-x86_64-unknown-linux-gnu.tar.xz' --dir pkg
           tar -xf pkg/thunder-x86_64-unknown-linux-gnu.tar.xz -C pkg --strip-components=1
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
           path: src
