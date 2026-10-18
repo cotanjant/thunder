@@ -2,6 +2,7 @@
 //! playlist arrangement, JSON save/load.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub const TICKS_PER_STEP: u32 = 4; // 64th-note resolution
 pub const STEPS: usize = 16;
@@ -78,14 +79,20 @@ impl ChannelKind {
 
 /// One user sample. PCM is reloaded from `path` on project load
 /// (never stored in the JSON).
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SampleRef {
     pub name: String,
     pub path: String,
     #[serde(skip)]
-    pub data: Vec<f32>,
+    pub data: Arc<[f32]>,
     #[serde(skip)]
     pub sr: f32,
+}
+
+impl PartialEq for SampleRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.path == other.path && self.sr == other.sr
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -691,5 +698,19 @@ mod tests {
             assert!(n.tick < TICKS_PATTERN);
             assert!((0.05..=1.0).contains(&n.vel));
         }
+    }
+
+    #[test]
+    fn song_clone_shares_sample_audio() {
+        let mut song = new_empty();
+        song.samples.push(SampleRef {
+            name: "tone.wav".into(),
+            path: "tone.wav".into(),
+            data: vec![0.1, -0.1].into(),
+            sr: 44100.0,
+        });
+
+        let copy = song.clone();
+        assert!(Arc::ptr_eq(&song.samples[0].data, &copy.samples[0].data));
     }
 }

@@ -728,7 +728,7 @@ impl EngineRt {
                     }
                     PlayKind::Sample(idx) => match song.samples.get(idx) {
                         Some(s) if !s.data.is_empty() && s.sr > 0.0 => {
-                            (s.data.as_slice(), s.sr / self.sr, true)
+                            (s.data.as_ref(), s.sr / self.sr, true)
                         }
                         _ => (&[][..], 1.0, false),
                     },
@@ -866,7 +866,7 @@ pub fn sample_into_song(s: &mut AppState, path: &str) -> Result<usize, String> {
     s.song.samples.push(crate::song::SampleRef {
         name,
         path: path.into(),
-        data,
+        data: data.into(),
         sr,
     });
     Ok(s.song.samples.len() - 1)

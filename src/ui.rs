@@ -584,7 +584,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     for smp in song.samples.iter_mut() {
                         match load_sample_file(&smp.path) {
                             Ok((data, sr)) => {
-                                smp.data = data;
+                                smp.data = data.into();
                                 smp.sr = sr;
                             }
                             Err(_) => missing += 1,
