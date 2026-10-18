@@ -126,6 +126,10 @@ pub struct AppUi {
     sample_path: String,
     browser_dir: String,
     browser_cache: Vec<String>,
+    undo: Vec<Song>,
+    redo: Vec<Song>,
+    history_current: Option<Song>,
+    history_pending: bool,
     pub status: String,
     taps: Vec<Instant>,
     show_tutorial: bool,
@@ -183,11 +187,103 @@ impl Default for AppUi {
             sample_path: String::new(),
             browser_dir: "samples".into(),
             browser_cache: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            history_current: None,
+            history_pending: false,
             status: "press Play or open the Tutorial".into(),
             taps: Vec::new(),
             show_tutorial: !tutorial_seen(),
         }
     }
+}
+
+const HISTORY_LIMIT: usize = 100;
+
+impl AppUi {
+    pub fn record_song(&mut self, song: &Song, pointer_down: bool) {
+        let Some(current) = &self.history_current else {
+            self.history_current = Some(song.clone());
+            return;
+        };
+        if current != song {
+            if !pointer_down || !self.history_pending {
+                if self.undo.len() == HISTORY_LIMIT {
+                    self.undo.remove(0);
+                }
+                self.undo.push(current.clone());
+                self.redo.clear();
+                self.history_pending = pointer_down;
+            }
+            self.history_current = Some(song.clone());
+        }
+        if !pointer_down {
+            self.history_pending = false;
+        }
+    }
+
+    pub fn reset_history(&mut self, song: &Song) {
+        self.undo.clear();
+        self.redo.clear();
+        self.history_current = Some(song.clone());
+        self.history_pending = false;
+    }
+
+    fn undo_song(&mut self, song: &mut Song) -> bool {
+        let Some(previous) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(song.clone());
+        *song = previous;
+        self.history_current = Some(song.clone());
+        self.history_pending = false;
+        true
+    }
+
+    fn redo_song(&mut self, song: &mut Song) -> bool {
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(song.clone());
+        *song = next;
+        self.history_current = Some(song.clone());
+        self.history_pending = false;
+        true
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+}
+
+fn sync_runtime_after_history(s: &mut AppState) {
+    let song = s.song.clone();
+    s.rt.ensure_channels(&song);
+    for i in 0..song.channels.len() {
+        s.rt.rebuild_channel(&song, i);
+    }
+}
+
+pub fn undo(ui: &mut AppUi, s: &mut AppState) -> bool {
+    if !ui.undo_song(&mut s.song) {
+        return false;
+    }
+    sync_runtime_after_history(s);
+    ui.status = "undo".into();
+    true
+}
+
+pub fn redo(ui: &mut AppUi, s: &mut AppState) -> bool {
+    if !ui.redo_song(&mut s.song) {
+        return false;
+    }
+    sync_runtime_after_history(s);
+    ui.status = "redo".into();
+    true
 }
 
 const NOTE_NAMES: [&str; 12] = [
@@ -290,6 +386,18 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         }
         if u.button("⏮ Reset").clicked() {
             s.rt.reset_transport();
+        }
+        if u.add_enabled(ui.can_undo(), egui::Button::new("↶ Undo"))
+            .on_hover_text("Undo (Ctrl/Cmd+Z)")
+            .clicked()
+        {
+            undo(ui, s);
+        }
+        if u.add_enabled(ui.can_redo(), egui::Button::new("↷ Redo"))
+            .on_hover_text("Redo (Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y)")
+            .clicked()
+        {
+            redo(ui, s);
         }
         // Record the master bus. Starts playback too; pressing again keeps
         // the take and stops recording. A new take discards the old one.
@@ -430,6 +538,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     ui.sel_pat = ui.sel_pat.min(N_PATTERNS - 1);
                     s.rt.pattern = ui.sel_pat;
                     s.rt.set_sample_rate(sr, &s.song);
+                    ui.reset_history(&s.song);
                     ui.status = if missing == 0 {
                         format!("loaded {}", ui.save_path)
                     } else {
@@ -1426,6 +1535,7 @@ pub fn tutorial(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     ui.sel_ch = 4;
                     ui.sel_pat = 0;
                     s.rt.pattern = 0;
+                    ui.reset_history(&s.song);
                     ui.status = "demo loaded: press Play".into();
                     close = true;
                 }
@@ -1911,6 +2021,36 @@ mod ui_tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].tick, 8, "resize must not move the note");
         assert_eq!(notes[0].len, 9, "resize must extend the note");
+    }
+
+    #[test]
+    fn song_history_undoes_and_redoes_an_edit() {
+        let mut ui = AppUi::default();
+        let mut song = crate::song::new_empty();
+        ui.record_song(&song, false);
+        song.bpm = 140.0;
+        ui.record_song(&song, false);
+
+        assert!(ui.undo_song(&mut song));
+        assert_eq!(song.bpm, 128.0);
+        assert!(ui.redo_song(&mut song));
+        assert_eq!(song.bpm, 140.0);
+    }
+
+    #[test]
+    fn song_history_coalesces_a_drag() {
+        let mut ui = AppUi::default();
+        let mut song = crate::song::new_empty();
+        ui.record_song(&song, false);
+        song.bpm = 130.0;
+        ui.record_song(&song, true);
+        song.bpm = 140.0;
+        ui.record_song(&song, true);
+        ui.record_song(&song, false);
+
+        assert!(ui.undo_song(&mut song));
+        assert_eq!(song.bpm, 128.0);
+        assert!(!ui.undo_song(&mut song));
     }
 
     #[test]

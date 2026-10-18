@@ -1019,7 +1019,7 @@ mod tests {
         let path = path.to_str().unwrap();
         let n = crate::export::write_wav_file(path, &rt.take_l, &rt.take_r, 44100.0).unwrap();
         assert_eq!(n, 44100);
-        let mut reader = hound::WavReader::open(path).unwrap();
+        let reader = hound::WavReader::open(path).unwrap();
         assert_eq!(reader.spec().channels, 2);
         assert_eq!(reader.len(), 44100 * 2);
         std::fs::remove_file(path).ok();

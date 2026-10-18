@@ -41,12 +41,35 @@ impl eframe::App for DawApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
+        if let Ok(s) = self.state.lock() {
+            let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
+            self.ui.record_song(&s.song, pointer_down);
+        }
         // Space toggles transport, like FL. Not while typing in a text box.
         if !ui.ctx().egui_wants_keyboard_input()
             && ui.ctx().input(|i| i.key_pressed(eframe::egui::Key::Space))
             && let Ok(mut s) = self.state.lock()
         {
             s.rt.playing = !s.rt.playing;
+        }
+        if !ui.ctx().egui_wants_keyboard_input()
+            && let Ok(mut s) = self.state.lock()
+        {
+            let (command, shift, z, y) = ui.ctx().input(|i| {
+                (
+                    i.modifiers.command,
+                    i.modifiers.shift,
+                    i.key_pressed(eframe::egui::Key::Z),
+                    i.key_pressed(eframe::egui::Key::Y),
+                )
+            });
+            if command && z && shift {
+                ui::redo(&mut self.ui, &mut s);
+            } else if command && z {
+                ui::undo(&mut self.ui, &mut s);
+            } else if command && y {
+                ui::redo(&mut self.ui, &mut s);
+            }
         }
         eframe::egui::Panel::top("transport").show(ui, |u| {
             if let Ok(mut s) = self.state.lock() {
@@ -100,6 +123,10 @@ impl eframe::App for DawApp {
                 }
             });
         });
+        if let Ok(s) = self.state.lock() {
+            let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
+            self.ui.record_song(&s.song, pointer_down);
+        }
     }
 }
 

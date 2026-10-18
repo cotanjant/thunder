@@ -78,7 +78,7 @@ impl ChannelKind {
 
 /// One user sample. PCM is reloaded from `path` on project load
 /// (never stored in the JSON).
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SampleRef {
     pub name: String,
     pub path: String,
@@ -88,7 +88,7 @@ pub struct SampleRef {
     pub sr: f32,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub tick: u32,
     pub len: u32,
@@ -107,13 +107,13 @@ impl Note {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AutoPoint {
     pub tick: u32,
     pub value: f32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
     pub name: String,
     pub kind: ChannelKind,
@@ -193,7 +193,7 @@ impl Default for Channel {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pattern {
     /// One note list per channel (channel indices align with Song::channels).
     pub notes: Vec<Vec<Note>>,
@@ -201,7 +201,7 @@ pub struct Pattern {
     pub auto_cut: Vec<Vec<AutoPoint>>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Song {
     pub save_version: u32,
     pub title: String,
