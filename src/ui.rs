@@ -3,8 +3,8 @@
 
 use crate::engine::{AppState, load_sample_file, sample_into_song};
 use crate::song::{
-    AutoPoint, ChannelKind, KitPiece, N_PATTERNS, Note, STEPS, Song, WaveKind, eval_auto,
-    tool_arpeggiate, tool_chord, tool_humanize, tool_quantize, tool_strum,
+    AudioClip, AutoPoint, ChannelKind, KitPiece, N_PATTERNS, Note, STEPS, Song, WaveKind,
+    eval_auto, tool_arpeggiate, tool_chord, tool_humanize, tool_quantize, tool_strum,
 };
 use eframe::egui;
 use std::time::Instant;
@@ -100,6 +100,8 @@ enum DragKind {
 pub struct AppUi {
     pub sel_ch: usize,
     pub sel_pat: usize,
+    sel_bar: usize,
+    clip_sample: usize,
     // FL-style window visibility (toolbar view toggles).
     pub show_browser: bool,
     pub show_rack: bool,
@@ -163,6 +165,8 @@ impl Default for AppUi {
         Self {
             sel_ch: 4,
             sel_pat: 0,
+            sel_bar: 0,
+            clip_sample: 0,
             show_browser: true,
             show_rack: true,
             show_piano: true,
@@ -1645,6 +1649,37 @@ const CLIP_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(130, 130, 140),
 ];
 
+fn add_audio_clip(ui: &mut AppUi, s: &mut AppState, sample: usize) -> bool {
+    let Some(name) = s.song.samples.get(sample).map(|sample| sample.name.clone()) else {
+        ui.status = "choose an imported audio file first".into();
+        return false;
+    };
+    let Some(bar) =
+        (!s.song.arrangement.is_empty()).then(|| ui.sel_bar.min(s.song.arrangement.len() - 1))
+    else {
+        ui.status = "add a playlist bar first".into();
+        return false;
+    };
+    s.song.audio_clips.push(AudioClip {
+        bar,
+        sample,
+        gain: 1.0,
+    });
+    ui.status = format!("added {name} at bar {}", bar + 1);
+    true
+}
+
+fn remove_audio_clips_at_selected_bar(ui: &mut AppUi, s: &mut AppState) -> bool {
+    let before = s.song.audio_clips.len();
+    s.song.audio_clips.retain(|clip| clip.bar != ui.sel_bar);
+    if before == s.song.audio_clips.len() {
+        ui.status = "no audio clip at this bar".into();
+        return false;
+    }
+    ui.status = format!("removed audio clips at bar {}", ui.sel_bar + 1);
+    true
+}
+
 pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     u.heading("Playlist (arrangement)");
     // Clip lane: one block per bar, colored by pattern. Click selects the
@@ -1712,6 +1747,7 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         {
             let bar = ((pos.x - rect.min.x) / cell_w).floor() as usize;
             if bar < bars {
+                ui.sel_bar = bar;
                 let pat = s.song.arrangement[bar];
                 if pat >= 0 {
                     ui.sel_pat = pat as usize;
@@ -1724,6 +1760,7 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         {
             let bar = ((pos.x - rect.min.x) / cell_w).floor() as usize;
             if bar < bars {
+                ui.sel_bar = bar;
                 let pat = s.song.arrangement[bar];
                 if pat >= 0 {
                     ui.sel_pat = pat as usize;
@@ -1733,12 +1770,59 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 }
             }
         }
+        u.label("Audio clips");
+        let (audio_rect, audio_resp) =
+            u.allocate_exact_size(egui::vec2(cell_w * bars as f32, 28.0), egui::Sense::click());
+        let painter = u.painter_at(audio_rect);
+        painter.rect_filled(audio_rect, 2.0, egui::Color32::from_gray(12));
+        for clip in &s.song.audio_clips {
+            if clip.bar >= bars {
+                continue;
+            }
+            let x0 = audio_rect.min.x + clip.bar as f32 * cell_w;
+            let selected = clip.bar == ui.sel_bar;
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(x0 + 1.0, audio_rect.min.y + 2.0),
+                    egui::vec2(cell_w - 2.0, audio_rect.height() - 4.0),
+                ),
+                3.0,
+                if selected {
+                    egui::Color32::from_rgb(100, 180, 220)
+                } else {
+                    egui::Color32::from_rgb(55, 105, 145)
+                },
+            );
+            let name = s
+                .song
+                .samples
+                .get(clip.sample)
+                .map(|sample| sample.name.chars().take(10).collect::<String>())
+                .unwrap_or_else(|| "missing".into());
+            painter.text(
+                egui::pos2(x0 + cell_w * 0.5, audio_rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                name,
+                egui::FontId::proportional(11.0),
+                egui::Color32::BLACK,
+            );
+        }
+        if audio_resp.clicked()
+            && let Some(pos) = audio_resp.hover_pos()
+        {
+            ui.sel_bar = ((pos.x - audio_rect.min.x) / cell_w).floor() as usize;
+        }
     }
     // Bar editing row.
     let mut dirty_len: Option<usize> = None;
     u.horizontal(|u| {
-        u.label(format!("{} bars", s.song.arrangement.len()));
+        u.label(format!(
+            "{} bars, selected {}",
+            s.song.arrangement.len(),
+            ui.sel_bar + 1
+        ));
         if u.button("+ Bar").clicked() {
+            ui.sel_bar = s.song.arrangement.len();
             s.song.arrangement.push(-1);
         }
         if u.button("- Bar").clicked() && !s.song.arrangement.is_empty() {
@@ -1763,9 +1847,30 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 }
             }
         }
+        if !s.song.samples.is_empty() {
+            let mut sample = ui.clip_sample.min(s.song.samples.len() - 1);
+            egui::ComboBox::from_id_salt("audio_clip_sample")
+                .selected_text(s.song.samples[sample].name.clone())
+                .show_ui(u, |u| {
+                    for (idx, entry) in s.song.samples.iter().enumerate() {
+                        u.selectable_value(&mut sample, idx, entry.name.clone());
+                    }
+                });
+            ui.clip_sample = sample;
+            if u.button("+ Audio").clicked() {
+                add_audio_clip(ui, s, sample);
+            }
+            if u.button("Remove audio").clicked() {
+                remove_audio_clips_at_selected_bar(ui, s);
+            }
+        } else {
+            u.label("import audio in Browser");
+        }
     });
     if let Some(bar) = dirty_len {
         s.song.arrangement.remove(bar);
+        s.song.audio_clips.retain(|clip| clip.bar < bar);
+        ui.sel_bar = ui.sel_bar.min(bar.saturating_sub(1));
     }
 }
 
@@ -2157,6 +2262,24 @@ mod ui_tests {
         assert_eq!(ui.sel_pat, 1);
         assert_eq!(state.song.patterns[1].notes[4].len(), 1);
         assert_eq!(state.song.patterns[1].auto_vol[4].len(), 1);
+    }
+
+    #[test]
+    fn audio_clip_is_added_and_removed_at_selected_bar() {
+        let mut ui = AppUi::default();
+        let mut state = AppState::new();
+        state.song.arrangement.push(-1);
+        state.song.samples.push(crate::song::SampleRef {
+            name: "tone.wav".into(),
+            path: "tone.wav".into(),
+            data: vec![0.5].into(),
+            sr: 44100.0,
+        });
+
+        assert!(add_audio_clip(&mut ui, &mut state, 0));
+        assert_eq!(state.song.audio_clips.len(), 1);
+        assert!(remove_audio_clips_at_selected_bar(&mut ui, &mut state));
+        assert!(state.song.audio_clips.is_empty());
     }
 
     #[test]

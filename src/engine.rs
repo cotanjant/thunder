@@ -272,6 +272,10 @@ enum SongEvent {
     Click {
         accent: bool,
     },
+    AudioClip {
+        sample: usize,
+        gain: f32,
+    },
 }
 
 pub struct EngineRt {
@@ -529,6 +533,18 @@ impl EngineRt {
             for k in k_start..k_end {
                 let tick_at = (k as f64 * spt).round() as u64;
                 let in_pat = (k % TICKS_PATTERN as u64) as u32;
+                if self.song_mode && in_pat == 0 {
+                    let bar = (k / TICKS_PATTERN as u64) as usize;
+                    for clip in song.audio_clips.iter().filter(|clip| clip.bar == bar) {
+                        self.pending.push((
+                            tick_at,
+                            SongEvent::AudioClip {
+                                sample: clip.sample,
+                                gain: clip.gain,
+                            },
+                        ));
+                    }
+                }
                 if let Some(pat) = self.pattern_at_tick(song, k) {
                     self.cur_pat = pat;
                     self.cur_tick = in_pat;
@@ -597,6 +613,9 @@ impl EngineRt {
                         if self.metro_heads.len() < 8 {
                             self.metro_heads.push(MetroHead { accent, pos: 0 });
                         }
+                    }
+                    SongEvent::AudioClip { sample, gain } => {
+                        self.push_playhead(PlayKind::Sample(sample), gain.clamp(0.0, 2.0));
                     }
                 }
                 ei += 1;
@@ -1023,5 +1042,32 @@ mod tests {
         assert_eq!(reader.spec().channels, 2);
         assert_eq!(reader.len(), 44100 * 2);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn playlist_audio_clip_renders() {
+        let mut song = crate::song::new_empty();
+        song.arrangement.push(-1);
+        song.samples.push(crate::song::SampleRef {
+            name: "tone.wav".into(),
+            path: "tone.wav".into(),
+            data: vec![0.5; 4410].into(),
+            sr: 44100.0,
+        });
+        song.audio_clips.push(crate::song::AudioClip {
+            bar: 0,
+            sample: 0,
+            gain: 1.0,
+        });
+        let mut rt = EngineRt::new(44100.0);
+        rt.ensure_channels(&song);
+        rt.song_mode = true;
+        rt.playing = true;
+        let mut l = vec![0.0; 1024];
+        let mut r = vec![0.0; 1024];
+        rt.process(&song, &mut l, &mut r);
+
+        assert!(l.iter().any(|sample| sample.abs() > 0.01));
+        assert!(l.iter().chain(&r).all(|sample| sample.is_finite()));
     }
 }

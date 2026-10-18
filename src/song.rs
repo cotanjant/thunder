@@ -208,6 +208,13 @@ pub struct Pattern {
     pub auto_cut: Vec<Vec<AutoPoint>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AudioClip {
+    pub bar: usize,
+    pub sample: usize,
+    pub gain: f32,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Song {
     pub save_version: u32,
@@ -224,6 +231,8 @@ pub struct Song {
     pub patterns: Vec<Pattern>,
     /// One entry per bar: pattern index, or -1 for silence.
     pub arrangement: Vec<i32>,
+    #[serde(default)]
+    pub audio_clips: Vec<AudioClip>,
     pub samples: Vec<SampleRef>,
 }
 
@@ -499,6 +508,7 @@ pub fn new_empty() -> Song {
         channels,
         patterns,
         arrangement: Vec::new(),
+        audio_clips: Vec::new(),
         samples: Vec::new(),
     }
 }
@@ -580,6 +590,7 @@ pub fn demo_song() -> Song {
         channels,
         patterns,
         arrangement: vec![0, 0, 1, 2, 0, 3, 2, 1],
+        audio_clips: Vec::new(),
         samples: Vec::new(),
     }
 }
@@ -712,5 +723,15 @@ mod tests {
 
         let copy = song.clone();
         assert!(Arc::ptr_eq(&song.samples[0].data, &copy.samples[0].data));
+    }
+
+    #[test]
+    fn old_project_without_audio_clips_loads() {
+        let song = new_empty();
+        let mut json = serde_json::to_value(song).unwrap();
+        json.as_object_mut().unwrap().remove("audio_clips");
+
+        let back: Song = serde_json::from_value(json).unwrap();
+        assert!(back.audio_clips.is_empty());
     }
 }
