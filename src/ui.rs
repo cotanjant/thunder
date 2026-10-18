@@ -126,6 +126,7 @@ pub struct AppUi {
     sample_path: String,
     browser_dir: String,
     browser_cache: Vec<String>,
+    note_clipboard: Vec<Note>,
     undo: Vec<Song>,
     redo: Vec<Song>,
     history_current: Option<Song>,
@@ -187,6 +188,7 @@ impl Default for AppUi {
             sample_path: String::new(),
             browser_dir: "samples".into(),
             browser_cache: Vec::new(),
+            note_clipboard: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             history_current: None,
@@ -283,6 +285,62 @@ pub fn redo(ui: &mut AppUi, s: &mut AppState) -> bool {
     }
     sync_runtime_after_history(s);
     ui.status = "redo".into();
+    true
+}
+
+pub fn copy_notes(ui: &mut AppUi, s: &AppState) -> bool {
+    let notes = s.song.patterns.get(ui.sel_pat).and_then(|pattern| {
+        pattern
+            .notes
+            .get(ui.sel_ch.min(s.song.channels.len().saturating_sub(1)))
+    });
+    let Some(notes) = notes.filter(|notes| !notes.is_empty()) else {
+        ui.status = "no notes to copy".into();
+        return false;
+    };
+    ui.note_clipboard = notes.clone();
+    ui.status = format!("copied {} notes", ui.note_clipboard.len());
+    true
+}
+
+pub fn paste_notes(ui: &mut AppUi, s: &mut AppState) -> bool {
+    if ui.note_clipboard.is_empty() {
+        ui.status = "no copied notes".into();
+        return false;
+    }
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let Some(notes) = s
+        .song
+        .patterns
+        .get_mut(ui.sel_pat)
+        .and_then(|pattern| pattern.notes.get_mut(ch))
+    else {
+        return false;
+    };
+    notes.extend(ui.note_clipboard.iter().copied());
+    notes.sort_by_key(|note| note.tick);
+    ui.status = format!("pasted {} notes", ui.note_clipboard.len());
+    true
+}
+
+pub fn duplicate_pattern(ui: &mut AppUi, s: &mut AppState) -> bool {
+    let source = ui.sel_pat.min(s.song.patterns.len().saturating_sub(1));
+    let destination = (1..s.song.patterns.len())
+        .map(|offset| (source + offset) % s.song.patterns.len())
+        .find(|&idx| {
+            let pattern = &s.song.patterns[idx];
+            pattern.notes.iter().all(Vec::is_empty)
+                && pattern.auto_vol.iter().all(Vec::is_empty)
+                && pattern.auto_cut.iter().all(Vec::is_empty)
+        });
+    let Some(destination) = destination else {
+        ui.status = "no empty pattern slot".into();
+        return false;
+    };
+    s.song.patterns[destination] = s.song.patterns[source].clone();
+    ui.sel_pat = destination;
+    s.rt.pattern = destination;
+    ui.status = format!("duplicated P{} to P{}", source + 1, destination + 1);
     true
 }
 
@@ -799,6 +857,24 @@ fn piano_toolbar(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.sel_note = None;
             ui.prop_note = None;
             return;
+        }
+        if u.button("Copy")
+            .on_hover_text("Copy this channel's notes (Ctrl/Cmd+C)")
+            .clicked()
+        {
+            copy_notes(ui, s);
+        }
+        if u.add_enabled(!ui.note_clipboard.is_empty(), egui::Button::new("Paste"))
+            .on_hover_text("Paste copied notes into this channel (Ctrl/Cmd+V)")
+            .clicked()
+        {
+            paste_notes(ui, s);
+        }
+        if u.button("Clone P")
+            .on_hover_text("Copy this pattern to the next empty pattern slot")
+            .clicked()
+        {
+            duplicate_pattern(ui, s);
         }
         if u.button("Quant")
             .on_hover_text("Snap starts to grid")
@@ -2051,6 +2127,36 @@ mod ui_tests {
         assert!(ui.undo_song(&mut song));
         assert_eq!(song.bpm, 128.0);
         assert!(!ui.undo_song(&mut song));
+    }
+
+    #[test]
+    fn copy_paste_notes_between_patterns() {
+        let mut ui = AppUi::default();
+        let mut state = AppState::new();
+        state.song.patterns[0].notes[4].push(Note::new(8, 4, 60, 0.8));
+        ui.sel_ch = 4;
+        ui.sel_pat = 0;
+
+        assert!(copy_notes(&mut ui, &state));
+        ui.sel_pat = 1;
+        assert!(paste_notes(&mut ui, &mut state));
+        assert_eq!(state.song.patterns[1].notes[4][0].midi, 60);
+    }
+
+    #[test]
+    fn duplicate_pattern_keeps_notes_and_automation() {
+        let mut ui = AppUi::default();
+        let mut state = AppState::new();
+        state.song.patterns[0].notes[4].push(Note::new(8, 4, 60, 0.8));
+        state.song.patterns[0].auto_vol[4].push(AutoPoint {
+            tick: 8,
+            value: 0.5,
+        });
+
+        assert!(duplicate_pattern(&mut ui, &mut state));
+        assert_eq!(ui.sel_pat, 1);
+        assert_eq!(state.song.patterns[1].notes[4].len(), 1);
+        assert_eq!(state.song.patterns[1].auto_vol[4].len(), 1);
     }
 
     #[test]

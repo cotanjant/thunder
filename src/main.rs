@@ -55,12 +55,14 @@ impl eframe::App for DawApp {
         if !ui.ctx().egui_wants_keyboard_input()
             && let Ok(mut s) = self.state.lock()
         {
-            let (command, shift, z, y) = ui.ctx().input(|i| {
+            let (command, shift, z, y, c, v) = ui.ctx().input(|i| {
                 (
                     i.modifiers.command,
                     i.modifiers.shift,
                     i.key_pressed(eframe::egui::Key::Z),
                     i.key_pressed(eframe::egui::Key::Y),
+                    i.key_pressed(eframe::egui::Key::C),
+                    i.key_pressed(eframe::egui::Key::V),
                 )
             });
             if command && z && shift {
@@ -69,6 +71,10 @@ impl eframe::App for DawApp {
                 ui::undo(&mut self.ui, &mut s);
             } else if command && y {
                 ui::redo(&mut self.ui, &mut s);
+            } else if command && c {
+                ui::copy_notes(&mut self.ui, &s);
+            } else if command && v {
+                ui::paste_notes(&mut self.ui, &mut s);
             }
         }
         eframe::egui::Panel::top("transport").show(ui, |u| {
