@@ -25,7 +25,7 @@ hound = "3"
 dirs = "6"
 
 [dev-dependencies]
-egui_kittest = "0.36"
+egui_kittest = "0.37"
 
 [profile.dist]
 inherits = "release"
