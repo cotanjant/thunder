@@ -2,7 +2,10 @@
 //! PCM kit + pitched sampler playback routed through per-channel DSP,
 //! delay/reverb sends, sample-clock scheduler, and disk-streaming take recorder.
 
-use crate::song::{ChannelKind, KitPiece, Song, TICKS_PATTERN, VoiceSpec, WaveKind, eval_auto};
+use crate::song::{
+    AutoTarget, ChannelKind, ClipKind, KitPiece, Song, VoiceSpec, WaveKind, eval_auto,
+    eval_auto_clip,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fundsp::prelude::{
     AudioUnit, Shared, Wave, adsr_live, dc, highpass_hz, lowpass, midi_hz, pan, reverb_stereo, saw,
@@ -26,6 +29,10 @@ struct VoiceRt {
     gate: Shared,
     cutoff: Shared,
     vel: f32,
+    pan: f32,
+    cur_hz: f32,
+    target_hz: f32,
+    glide_rate: f32,
     off: usize,
     age: u64,
 }
@@ -89,6 +96,10 @@ fn make_voice(
     let mut unit = unit;
     unit.set_sample_rate(sample_rate);
     unit.allocate();
+    // adsr_live only arms after seeing at least one sample with gate <= 0.0;
+    // prime it once so a note starting on tick 0 triggers cleanly.
+    gate.set_value(0.0);
+    let _ = unit.get_stereo();
     unit
 }
 
@@ -262,9 +273,14 @@ enum PlayKind {
 struct PlayHead {
     kind: PlayKind,
     ch: Option<usize>,
+    mixer_insert: usize,
     pos: f32,
+    end_pos: Option<f32>,
     pitch_ratio: f32,
     gain: f32,
+    pan: f32,
+    fade_in_samples: usize,
+    fade_out_samples: usize,
     lp_z: f32,
     env_sample: usize,
     gate_off: usize,
@@ -282,9 +298,14 @@ impl PlayHead {
         Self {
             kind,
             ch,
+            mixer_insert: 0,
             pos: 0.0,
+            end_pos: None,
             pitch_ratio,
             gain,
+            pan: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
             lp_z: 0.0,
             env_sample: 0,
             gate_off,
@@ -331,11 +352,22 @@ struct MetroHead {
     pos: usize,
 }
 
+struct NoteTrigger {
+    ch: usize,
+    midi: u8,
+    vel: f32,
+    pan: f32,
+    fine_pitch: f32,
+    len_ticks: u32,
+}
+
 enum SongEvent {
     NoteOn {
         ch: usize,
         midi: u8,
         vel: f32,
+        pan: f32,
+        fine_pitch: f32,
         len_ticks: u32,
     },
     Click {
@@ -344,6 +376,12 @@ enum SongEvent {
     AudioClip {
         sample: usize,
         gain: f32,
+        pitch_semitones: f32,
+        offset_ticks: u32,
+        len_ticks: u32,
+        fade_in_ticks: u32,
+        fade_out_ticks: u32,
+        mixer_insert: usize,
     },
 }
 
@@ -353,6 +391,59 @@ struct SmoothCh {
     cut: f32,
     dly: f32,
     rev: f32,
+}
+
+struct SmoothMix {
+    vol: f32,
+    pan: f32,
+    dly: f32,
+    rev: f32,
+}
+
+#[derive(Clone, Default)]
+struct RingDelay {
+    buf: Vec<(f32, f32)>,
+    pos: usize,
+}
+
+impl RingDelay {
+    fn reserve(&mut self, max_delay: usize) {
+        let need = max_delay.saturating_add(1).max(1);
+        if self.buf.len() < need {
+            self.buf.resize(need, (0.0, 0.0));
+            self.pos = 0;
+        }
+    }
+
+    fn push_pop(&mut self, input: (f32, f32), delay_samples: usize) -> (f32, f32) {
+        if delay_samples == 0 || self.buf.len() <= delay_samples {
+            return input;
+        }
+        let len = self.buf.len();
+        let rp = (self.pos + len - delay_samples) % len;
+        let out = self.buf[rp];
+        self.buf[self.pos] = input;
+        self.pos = (self.pos + 1) % len;
+        out
+    }
+
+    fn clear(&mut self) {
+        self.buf.fill((0.0, 0.0));
+        self.pos = 0;
+    }
+}
+
+fn mixer_graph_sig(song: &Song) -> u64 {
+    let mut h = (song.mixer_tracks.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for (i, t) in song.mixer_tracks.iter().enumerate() {
+        h ^= ((t.latency_samples as u64) << 16) ^ (i as u64);
+        h = h.rotate_left(7);
+        for r in &t.routes {
+            h ^= ((r.target as u64) << 8) ^ (r.sidechain_only as u64);
+            h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        }
+    }
+    h
 }
 
 pub struct EngineRt {
@@ -379,6 +470,8 @@ pub struct EngineRt {
     pub peak: f32,
     /// Per-channel post-fader peak, decaying. Feeds the mixer meters.
     pub ch_peaks: Vec<f32>,
+    /// Per-mixer-insert post-fader peak, decaying.
+    pub mix_peaks: Vec<f32>,
     /// Master-bus recording. Captured post-fader while playing.
     pub recording: bool,
     pub take_l: Vec<f32>,
@@ -392,9 +485,22 @@ pub struct EngineRt {
     scope_tick: usize,
     auto_vol: Vec<f32>,
     auto_cut: Vec<Option<f32>>,
+    mix_auto_vol: Vec<f32>,
+    master_auto_vol: Option<f32>,
     smooth: Vec<SmoothCh>,
+    mix_smooth: Vec<SmoothMix>,
     ch_accum: Vec<(f32, f32)>,
+    mix_direct_in: Vec<(f32, f32)>,
+    mix_route_in: Vec<(f32, f32)>,
+    track_lat_delay: Vec<RingDelay>,
+    direct_pdc_delay: Vec<RingDelay>,
+    route_pdc_delay: Vec<Vec<RingDelay>>,
+    pdc_order: Vec<usize>,
+    pdc_direct_delay: Vec<usize>,
+    pdc_route_delay: Vec<Vec<(usize, usize)>>,
+    mixer_sig: u64,
     voice_specs: Vec<VoiceSpec>,
+    channel_last_hz: Vec<Option<f32>>,
     age: u64,
     live_voice: VoiceRt,
     live_off: usize,
@@ -412,6 +518,10 @@ impl EngineRt {
             gate,
             cutoff,
             vel: 1.0,
+            pan: 0.0,
+            cur_hz: midi_hz(69.0_f32),
+            target_hz: midi_hz(69.0_f32),
+            glide_rate: 1.0,
             off: 0,
             age: 0,
         };
@@ -439,6 +549,7 @@ impl EngineRt {
             ignore_loop: false,
             peak: 0.0,
             ch_peaks: Vec::new(),
+            mix_peaks: Vec::new(),
             recording: false,
             take_l: Vec::new(),
             take_r: Vec::new(),
@@ -450,9 +561,22 @@ impl EngineRt {
             scope_tick: 0,
             auto_vol: Vec::new(),
             auto_cut: Vec::new(),
+            mix_auto_vol: Vec::new(),
+            master_auto_vol: None,
             smooth: Vec::new(),
+            mix_smooth: Vec::new(),
             ch_accum: Vec::new(),
+            mix_direct_in: Vec::new(),
+            mix_route_in: Vec::new(),
+            track_lat_delay: Vec::new(),
+            direct_pdc_delay: Vec::new(),
+            route_pdc_delay: Vec::new(),
+            pdc_order: Vec::new(),
+            pdc_direct_delay: Vec::new(),
+            pdc_route_delay: Vec::new(),
+            mixer_sig: u64::MAX,
             voice_specs: Vec::new(),
+            channel_last_hz: Vec::new(),
             age: 0,
             live_voice,
             live_off: 0,
@@ -482,12 +606,59 @@ impl EngineRt {
         reverb.allocate();
         self.reverb = reverb;
         self.voices.clear();
+        self.mixer_sig = u64::MAX;
         self.ensure_channels(song);
         self.reset_transport();
     }
 
-    /// (Re)build voice pools to match the song's channels.
+    fn ensure_mixer_graph(&mut self, song: &Song) {
+        let sig = mixer_graph_sig(song);
+        let nmix = song.mixer_tracks.len();
+        if self.mixer_sig == sig && self.mix_direct_in.len() == nmix {
+            return;
+        }
+        self.mixer_sig = sig;
+        let pdc = song.compute_pdc();
+        self.pdc_order = pdc.order;
+        self.pdc_direct_delay = pdc.direct_delay;
+        self.pdc_route_delay = pdc.route_delay;
+
+        self.mix_peaks.resize(nmix, 0.0);
+        self.mix_auto_vol.resize(nmix, 1.0);
+        self.mix_direct_in.resize(nmix, (0.0, 0.0));
+        self.mix_route_in.resize(nmix, (0.0, 0.0));
+        self.mix_smooth.clear();
+        for t in &song.mixer_tracks {
+            self.mix_smooth.push(SmoothMix {
+                vol: t.volume,
+                pan: t.pan,
+                dly: t.delay_send,
+                rev: t.reverb_send,
+            });
+        }
+        self.track_lat_delay.resize_with(nmix, RingDelay::default);
+        self.direct_pdc_delay.resize_with(nmix, RingDelay::default);
+        self.route_pdc_delay.resize_with(nmix, Vec::new);
+        for (i, t) in song.mixer_tracks.iter().enumerate() {
+            self.track_lat_delay[i].reserve(t.latency_samples);
+            self.direct_pdc_delay[i].reserve(self.pdc_direct_delay.get(i).copied().unwrap_or(0));
+            let rlen = t.routes.len();
+            self.route_pdc_delay[i].resize_with(rlen, RingDelay::default);
+            for (ri, rdelay) in self.route_pdc_delay[i].iter_mut().enumerate() {
+                let d = self
+                    .pdc_route_delay
+                    .get(i)
+                    .and_then(|v| v.get(ri))
+                    .map(|x| x.1)
+                    .unwrap_or(0);
+                rdelay.reserve(d);
+            }
+        }
+    }
+
+    /// (Re)build voice pools and mixer PDC plan to match the song.
     pub fn ensure_channels(&mut self, song: &Song) {
+        self.ensure_mixer_graph(song);
         if self.voices.len() == song.channels.len() {
             for i in 0..song.channels.len() {
                 let spec = song.channels[i].voice_spec();
@@ -502,9 +673,10 @@ impl EngineRt {
         self.voice_specs.clear();
         for ch in &song.channels {
             let spec = ch.voice_spec();
+            let base_hz = midi_hz(ch.midi_base as f32);
             let mut pool = Vec::with_capacity(VOICES_PER_CH);
             for _ in 0..VOICES_PER_CH {
-                let pitch = shared(midi_hz(ch.midi_base as f32));
+                let pitch = shared(base_hz);
                 let gate = shared(0.0);
                 let cutoff = shared(ch.cutoff);
                 let unit = make_voice(spec, &pitch, &gate, &cutoff, self.sr as f64);
@@ -514,6 +686,10 @@ impl EngineRt {
                     gate,
                     cutoff,
                     vel: 1.0,
+                    pan: 0.0,
+                    cur_hz: base_hz,
+                    target_hz: base_hz,
+                    glide_rate: 1.0,
                     off: 0,
                     age: 0,
                 });
@@ -532,6 +708,7 @@ impl EngineRt {
         self.auto_cut = vec![None; song.channels.len()];
         self.ch_peaks = vec![0.0; song.channels.len()];
         self.ch_accum = vec![(0.0, 0.0); song.channels.len()];
+        self.channel_last_hz = vec![None; song.channels.len()];
     }
 
     /// Rebuild one channel's pool (wave / Q / ADSR changed).
@@ -555,21 +732,27 @@ impl EngineRt {
         }
     }
 
-    /// First free voice, else steal the oldest-sounding one.
-    fn alloc_voice(&mut self, ch: usize) -> Option<&mut VoiceRt> {
+    /// First free voice within polyphony cap, else steal the oldest-sounding one.
+    fn alloc_voice(&mut self, ch: usize, max_poly: u8) -> Option<&mut VoiceRt> {
         let pool = self.voices.get_mut(ch)?;
-        let idx = pool
+        let cap = if max_poly == 0 {
+            pool.len()
+        } else {
+            (max_poly as usize).clamp(1, pool.len())
+        };
+        let sub = &mut pool[..cap];
+        let idx = sub
             .iter()
             .position(|v| v.off == 0)
             .or_else(|| {
-                pool.iter()
+                sub.iter()
                     .enumerate()
                     .min_by_key(|(_, v)| v.age)
                     .map(|(i, _)| i)
             })
             .unwrap_or(0);
         self.age = self.age.wrapping_add(1);
-        let v = &mut pool[idx];
+        let v = &mut sub[idx];
         v.age = self.age;
         Some(v)
     }
@@ -582,7 +765,10 @@ impl EngineRt {
     }
 
     pub fn live_note(&mut self, midi: u8) {
-        self.live_voice.pitch.set_value(midi_hz(midi as f32));
+        let hz = midi_hz(midi as f32);
+        self.live_voice.pitch.set_value(hz);
+        self.live_voice.cur_hz = hz;
+        self.live_voice.target_hz = hz;
         self.live_voice.gate.set_value(1.0);
         self.live_off = (self.sr * 0.4) as usize;
     }
@@ -597,10 +783,16 @@ impl EngineRt {
         let off = (self.sr * 0.35) as usize;
         match channel.kind {
             ChannelKind::Synth { .. } => {
-                if let Some(v) = self.alloc_voice(ch) {
-                    v.pitch.set_value(midi_hz(midi as f32));
+                let hz = midi_hz(midi as f32);
+                let poly = channel.polyphony;
+                if let Some(v) = self.alloc_voice(ch, poly) {
+                    v.pitch.set_value(hz);
+                    v.cur_hz = hz;
+                    v.target_hz = hz;
+                    v.glide_rate = 1.0;
                     v.gate.set_value(1.0);
                     v.vel = vel.clamp(0.05, 1.0);
+                    v.pan = 0.0;
                     v.off = off;
                 }
             }
@@ -665,16 +857,6 @@ impl EngineRt {
             .collect()
     }
 
-    fn pattern_at_tick(&self, song: &Song, abs_tick: u64) -> Option<usize> {
-        if self.song_mode {
-            let bar = (abs_tick / TICKS_PATTERN as u64) as usize;
-            let p = *song.arrangement.get(bar)?;
-            if p < 0 { None } else { Some(p as usize) }
-        } else {
-            Some(self.pattern)
-        }
-    }
-
     pub fn process(&mut self, song: &Song, out_l: &mut [f32], out_r: &mut [f32]) {
         self.ensure_channels(song);
         let n = out_l.len().min(out_r.len());
@@ -691,73 +873,96 @@ impl EngineRt {
         if self.playing {
             let k_start = (self.sample_pos as f64 / spt).ceil() as u64;
             let k_end = ((self.sample_pos + n as u64) as f64 / spt).ceil() as u64;
+            let solo_tracks = song.playlist_tracks.iter().any(|t| t.solo);
+            let bar_ticks = song.time_sig.ticks_per_bar().max(1) as u64;
+            let beat_ticks = song.time_sig.ticks_per_beat().max(1) as u64;
+
             for k in k_start..k_end {
                 let tick_at = (k as f64 * spt).round() as u64;
-                let in_pat = (k % TICKS_PATTERN as u64) as u32;
-                if self.song_mode && in_pat == 0 {
-                    let bar = (k / TICKS_PATTERN as u64) as usize;
-                    for clip in song.audio_clips.iter().filter(|clip| clip.bar == bar) {
-                        if self.pending.len() < PENDING_CAP {
-                            self.pending.push((
-                                tick_at,
-                                SongEvent::AudioClip {
-                                    sample: clip.sample,
-                                    gain: clip.gain,
-                                },
-                            ));
+                if self.song_mode {
+                    for clip in &song.clips {
+                        if clip.mute {
+                            continue;
                         }
-                    }
-                }
-                if let Some(pat) = self.pattern_at_tick(song, k) {
-                    self.cur_pat = pat;
-                    self.cur_tick = in_pat;
-                    let Some(pdata) = song.patterns.get(pat) else {
-                        continue;
-                    };
-                    for ci in 0..song.channels.len() {
-                        if let Some(pts) = pdata.auto_vol.get(ci)
-                            && let Some(v) = eval_auto(pts, in_pat)
-                            && ci < self.auto_vol.len()
+                        if let Some(tr) = song.playlist_tracks.get(clip.track)
+                            && ((solo_tracks && !tr.solo) || (!solo_tracks && tr.mute))
                         {
-                            self.auto_vol[ci] = v.clamp(0.0, 1.5);
+                            continue;
                         }
-                        if let Some(pts) = pdata.auto_cut.get(ci)
-                            && ci < self.auto_cut.len()
-                        {
-                            if let Some(v) = eval_auto(pts, in_pat) {
-                                let v = v.clamp(40.0, 18000.0);
-                                self.auto_cut[ci] = Some(v);
-                                if ci < self.voices.len() {
-                                    for voice in self.voices[ci].iter() {
-                                        voice.cutoff.set_value(v);
-                                    }
-                                }
-                            } else {
-                                self.auto_cut[ci] = None;
+                        let start = clip.start_tick as u64;
+                        let end = start + clip.len_ticks as u64;
+                        match &clip.kind {
+                            ClipKind::Pattern { pattern } if k >= start && k < end => {
+                                let Some(pdata) = song.patterns.get(*pattern) else {
+                                    continue;
+                                };
+                                let pat_len = pdata.len_ticks().max(1) as u64;
+                                let in_pat =
+                                    ((clip.offset_ticks as u64 + (k - start)) % pat_len) as u32;
+                                self.cur_pat = *pattern;
+                                self.cur_tick = in_pat;
+                                self.collect_pattern_tick(song, pdata, in_pat, tick_at, spt);
                             }
-                        }
-                        if let Some(notes) = pdata.notes.get(ci) {
-                            for note in notes.iter().filter(|nn| nn.tick == in_pat) {
-                                let mut at = tick_at;
-                                if in_pat % 8 == 4 {
-                                    at += (song.swing.clamp(0.0, 0.75) as f64 * 2.0 * spt) as u64;
-                                }
+                            ClipKind::Audio {
+                                sample,
+                                gain,
+                                pitch_semitones,
+                                fade_in_ticks,
+                                fade_out_ticks,
+                            } if k == start => {
+                                let mixer_insert = song
+                                    .playlist_tracks
+                                    .get(clip.track)
+                                    .and_then(|t| t.linked_insert)
+                                    .unwrap_or(0);
                                 if self.pending.len() < PENDING_CAP {
                                     self.pending.push((
-                                        at,
-                                        SongEvent::NoteOn {
-                                            ch: ci,
-                                            midi: note.midi,
-                                            vel: note.vel,
-                                            len_ticks: note.len.max(1),
+                                        tick_at,
+                                        SongEvent::AudioClip {
+                                            sample: *sample,
+                                            gain: *gain,
+                                            pitch_semitones: *pitch_semitones,
+                                            offset_ticks: clip.offset_ticks,
+                                            len_ticks: clip.len_ticks,
+                                            fade_in_ticks: *fade_in_ticks,
+                                            fade_out_ticks: *fade_out_ticks,
+                                            mixer_insert,
                                         },
                                     ));
                                 }
                             }
+                            ClipKind::Automation { target, points } if k >= start && k < end => {
+                                if let Some(v) = eval_auto_clip(points, (k - start) as f32) {
+                                    self.apply_auto_target(*target, v);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if song.metronome
-                        && in_pat.is_multiple_of(16)
+                        && k.is_multiple_of(beat_ticks)
+                        && self.pending.len() < PENDING_CAP
+                    {
+                        self.pending.push((
+                            tick_at,
+                            SongEvent::Click {
+                                accent: k.is_multiple_of(bar_ticks),
+                            },
+                        ));
+                    }
+                } else {
+                    let pat = self.pattern.min(song.patterns.len().saturating_sub(1));
+                    let Some(pdata) = song.patterns.get(pat) else {
+                        continue;
+                    };
+                    let pat_len = pdata.len_ticks().max(1) as u64;
+                    let in_pat = (k % pat_len) as u32;
+                    self.cur_pat = pat;
+                    self.cur_tick = in_pat;
+                    self.collect_pattern_tick(song, pdata, in_pat, tick_at, spt);
+                    let pat_beat = pdata.time_sig.ticks_per_beat().max(1);
+                    if song.metronome
+                        && in_pat.is_multiple_of(pat_beat)
                         && self.pending.len() < PENDING_CAP
                     {
                         self.pending.push((
@@ -781,26 +986,62 @@ impl EngineRt {
                         ch,
                         midi,
                         vel,
+                        pan,
+                        fine_pitch,
                         len_ticks,
-                    } => self.fire_note(song, ch, midi, vel, len_ticks, spt),
+                    } => {
+                        let trig = NoteTrigger {
+                            ch,
+                            midi,
+                            vel,
+                            pan,
+                            fine_pitch,
+                            len_ticks,
+                        };
+                        self.fire_note(song, &trig, spt);
+                    }
                     SongEvent::Click { accent } => {
                         if self.metro_heads.len() < 8 {
                             self.metro_heads.push(MetroHead { accent, pos: 0 });
                         }
                     }
-                    SongEvent::AudioClip { sample, gain } => {
-                        self.push_playhead(PlayHead::new(
+                    SongEvent::AudioClip {
+                        sample,
+                        gain,
+                        pitch_semitones,
+                        offset_ticks,
+                        len_ticks,
+                        fade_in_ticks,
+                        fade_out_ticks,
+                        mixer_insert,
+                    } => {
+                        let s_sr = song
+                            .samples
+                            .get(sample)
+                            .map(|s| s.sr.max(1.0))
+                            .unwrap_or(self.sr.max(1.0));
+                        let ratio = 2.0_f32.powf(pitch_semitones / 12.0);
+                        let ticks_to_src = spt as f32 * (s_sr / self.sr.max(1.0)) * ratio;
+                        let start_pos = offset_ticks as f32 * ticks_to_src;
+                        let span_src = len_ticks.max(1) as f32 * ticks_to_src;
+                        let mut head = PlayHead::new(
                             PlayKind::Sample(sample),
                             None,
-                            1.0,
+                            ratio,
                             gain.clamp(0.0, 2.0),
                             usize::MAX,
-                        ));
+                        );
+                        head.mixer_insert = mixer_insert;
+                        head.pos = start_pos;
+                        head.end_pos = Some(start_pos + span_src);
+                        head.fade_in_samples = (fade_in_ticks as f64 * spt) as usize;
+                        head.fade_out_samples = (fade_out_ticks as f64 * spt) as usize;
+                        self.push_playhead(head);
                     }
                 }
                 ei += 1;
             }
-            // Envelopes always tick so live preview works while stopped.
+            // Envelopes & portamento always tick so live preview works while stopped.
             self.tick_gates();
             if self.live_off > 0 {
                 self.live_off -= 1;
@@ -816,16 +1057,101 @@ impl EngineRt {
         if self.playing {
             self.sample_pos += n as u64;
             self.tick_pos = self.sample_pos as f64 / spt;
-            if self.song_mode && !song.arrangement.is_empty() {
-                let total = song.arrangement.len() as u64 * TICKS_PATTERN as u64;
-                let end_sample = (total as f64 * spt) as u64;
-                if self.sample_pos >= end_sample {
-                    if song.loop_song && !self.ignore_loop {
-                        // New pass re-collects its own events; drop the old ones.
-                        self.sample_pos = 0;
-                        self.pending.clear();
-                    } else {
-                        self.playing = false;
+            if self.song_mode {
+                let total = song.playlist_len_ticks() as u64;
+                if total > 0 {
+                    let end_sample = (total as f64 * spt) as u64;
+                    if self.sample_pos >= end_sample {
+                        if song.loop_song && !self.ignore_loop {
+                            // New pass re-collects its own events; drop the old ones.
+                            self.sample_pos = 0;
+                            self.pending.clear();
+                        } else {
+                            self.playing = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_auto_target(&mut self, target: AutoTarget, value: f32) {
+        match target {
+            AutoTarget::ChannelVol(ci) => {
+                if ci < self.auto_vol.len() {
+                    self.auto_vol[ci] = value.clamp(0.0, 1.5);
+                }
+            }
+            AutoTarget::ChannelCut(ci) => {
+                let v = value.clamp(40.0, 18000.0);
+                if ci < self.auto_cut.len() {
+                    self.auto_cut[ci] = Some(v);
+                }
+                if ci < self.voices.len() {
+                    for voice in self.voices[ci].iter() {
+                        voice.cutoff.set_value(v);
+                    }
+                }
+            }
+            AutoTarget::InsertVol(ins) => {
+                if ins < self.mix_auto_vol.len() {
+                    self.mix_auto_vol[ins] = value.clamp(0.0, 1.5);
+                }
+            }
+            AutoTarget::MasterVol => {
+                self.master_auto_vol = Some(value.clamp(0.0, 1.5));
+            }
+        }
+    }
+
+    fn collect_pattern_tick(
+        &mut self,
+        song: &Song,
+        pdata: &crate::song::Pattern,
+        in_pat: u32,
+        tick_at: u64,
+        spt: f64,
+    ) {
+        for ci in 0..song.channels.len() {
+            if let Some(pts) = pdata.auto_vol.get(ci)
+                && let Some(v) = eval_auto(pts, in_pat)
+                && ci < self.auto_vol.len()
+            {
+                self.auto_vol[ci] = v.clamp(0.0, 1.5);
+            }
+            if let Some(pts) = pdata.auto_cut.get(ci)
+                && ci < self.auto_cut.len()
+            {
+                if let Some(v) = eval_auto(pts, in_pat) {
+                    let v = v.clamp(40.0, 18000.0);
+                    self.auto_cut[ci] = Some(v);
+                    if ci < self.voices.len() {
+                        for voice in self.voices[ci].iter() {
+                            voice.cutoff.set_value(v);
+                        }
+                    }
+                } else {
+                    self.auto_cut[ci] = None;
+                }
+            }
+            if let Some(notes) = pdata.notes.get(ci) {
+                for note in notes.iter().filter(|nn| nn.tick == in_pat) {
+                    let mut at = tick_at;
+                    if in_pat % 8 == 4 {
+                        at += (song.swing.clamp(0.0, 0.75) as f64 * 2.0 * spt) as u64;
+                    }
+                    if self.pending.len() < PENDING_CAP {
+                        self.pending.push((
+                            at,
+                            SongEvent::NoteOn {
+                                ch: ci,
+                                midi: note.midi,
+                                vel: note.vel,
+                                pan: note.pan,
+                                fine_pitch: note.fine_pitch,
+                                len_ticks: note.len.max(1),
+                            },
+                        ));
                     }
                 }
             }
@@ -835,6 +1161,10 @@ impl EngineRt {
     fn tick_gates(&mut self) {
         for pool in self.voices.iter_mut() {
             for v in pool.iter_mut() {
+                if (v.cur_hz - v.target_hz).abs() > 0.01 {
+                    v.cur_hz += (v.target_hz - v.cur_hz) * v.glide_rate;
+                    v.pitch.set_value(v.cur_hz);
+                }
                 if v.off > 0 {
                     v.off -= 1;
                     if v.off == 0 {
@@ -845,7 +1175,15 @@ impl EngineRt {
         }
     }
 
-    fn fire_note(&mut self, song: &Song, ch: usize, midi: u8, vel: f32, len_ticks: u32, spt: f64) {
+    fn fire_note(&mut self, song: &Song, trig: &NoteTrigger, spt: f64) {
+        let NoteTrigger {
+            ch,
+            midi,
+            vel,
+            pan,
+            fine_pitch,
+            len_ticks,
+        } = *trig;
         let Some(channel) = song.channels.get(ch) else {
             return;
         };
@@ -856,60 +1194,103 @@ impl EngineRt {
         if !solo_any && channel.mute {
             return;
         }
+        // Choke groups: cut any channel whose cut_by matches this channel's cut_group.
+        if let Some(group) = channel.cut_group
+            && group > 0
+        {
+            for (cj, target_ch) in song.channels.iter().enumerate() {
+                if target_ch.cut_by == Some(group) {
+                    if let Some(pool) = self.voices.get_mut(cj) {
+                        for v in pool.iter_mut() {
+                            v.gate.set_value(0.0);
+                            v.off = 0;
+                        }
+                    }
+                    for h in self.playheads.iter_mut() {
+                        if h.ch == Some(cj) {
+                            h.gate_off = h.env_sample;
+                        }
+                    }
+                }
+            }
+        }
+
         let off = ((len_ticks as f64 * spt) as usize).max(1);
+        let pitch_midi = (midi as f32 + fine_pitch).clamp(0.0, 127.0);
+        let poly = channel.polyphony;
+        let porta = channel.portamento;
+        let base_midi = channel.midi_base;
         match channel.kind {
             ChannelKind::Synth { .. } => {
-                if ch < self.voices.len()
-                    && let Some(v) = self.alloc_voice(ch)
-                {
-                    v.pitch.set_value(midi_hz(midi as f32));
-                    v.gate.set_value(1.0);
-                    v.vel = vel.clamp(0.05, 1.0);
-                    v.off = off;
+                if ch < self.voices.len() {
+                    let target_hz = midi_hz(pitch_midi);
+                    let prev_hz = self.channel_last_hz.get(ch).and_then(|x| *x);
+                    let glide = if porta > 0.001 && prev_hz.is_some() {
+                        (1.0 - (-1.0 / (porta * self.sr.max(1.0))).exp()).clamp(0.0005, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let start_hz = if glide < 1.0 {
+                        prev_hz.unwrap_or(target_hz)
+                    } else {
+                        target_hz
+                    };
+                    if let Some(v) = self.alloc_voice(ch, poly) {
+                        v.cur_hz = start_hz;
+                        v.target_hz = target_hz;
+                        v.glide_rate = glide;
+                        v.pitch.set_value(start_hz);
+                        v.gate.set_value(1.0);
+                        v.vel = vel.clamp(0.05, 1.0);
+                        v.pan = pan.clamp(-1.0, 1.0);
+                        v.off = off;
+                    }
+                    if ch < self.channel_last_hz.len() {
+                        self.channel_last_hz[ch] = Some(target_hz);
+                    }
                 }
             }
             ChannelKind::Kit { piece } => {
-                self.push_playhead(PlayHead::new(
-                    PlayKind::Kit(piece),
-                    Some(ch),
-                    1.0,
-                    vel,
-                    usize::MAX,
-                ));
+                let ratio = 2.0_f32.powf(fine_pitch / 12.0);
+                let mut head =
+                    PlayHead::new(PlayKind::Kit(piece), Some(ch), ratio, vel, usize::MAX);
+                head.pan = pan.clamp(-1.0, 1.0);
+                self.push_playhead(head);
             }
             ChannelKind::Sampler { sample } => {
                 if let Some(idx) = sample {
-                    let ratio = 2.0_f32.powf((midi as f32 - channel.midi_base as f32) / 12.0);
-                    self.push_playhead(PlayHead::new(
-                        PlayKind::Sample(idx),
-                        Some(ch),
-                        ratio,
-                        vel,
-                        off,
-                    ));
+                    let ratio = 2.0_f32.powf((pitch_midi - base_midi as f32) / 12.0);
+                    let mut head = PlayHead::new(PlayKind::Sample(idx), Some(ch), ratio, vel, off);
+                    head.pan = pan.clamp(-1.0, 1.0);
+                    self.push_playhead(head);
                 }
             }
         }
     }
 
     fn render_sample(&mut self, song: &Song) -> (f32, f32) {
-        let mut l = 0.0f32;
-        let mut r = 0.0f32;
         let mut dly_send = 0.0f32;
         let mut rev_send = 0.0f32;
 
         for pair in self.ch_accum.iter_mut() {
             *pair = (0.0, 0.0);
         }
+        for pair in self.mix_direct_in.iter_mut() {
+            *pair = (0.0, 0.0);
+        }
+        for pair in self.mix_route_in.iter_mut() {
+            *pair = (0.0, 0.0);
+        }
 
-        // Accumulate synth voices per channel.
+        // Accumulate synth voices per channel (with per-note pan offset).
         for (ci, pool) in self.voices.iter_mut().enumerate() {
             let mut vl_sum = 0.0f32;
             let mut vr_sum = 0.0f32;
             for v in pool.iter_mut() {
                 let (vl, vr) = v.unit.get_stereo();
-                vl_sum += vl * v.vel;
-                vr_sum += vr * v.vel;
+                let (pl, pr) = pan_gains(v.pan, std::f32::consts::SQRT_2 * v.vel);
+                vl_sum += vl * pl;
+                vr_sum += vr * pr;
             }
             if let Some(acc) = self.ch_accum.get_mut(ci) {
                 acc.0 += vl_sum;
@@ -919,6 +1300,7 @@ impl EngineRt {
 
         // Render PCM playheads (kit / pitched sampler / playlist audio clips).
         let sr = self.sr.max(1.0);
+        let nmix = song.mixer_tracks.len();
         let mut i = 0;
         while i < self.playheads.len() {
             let mut done = false;
@@ -941,7 +1323,8 @@ impl EngineRt {
                         _ => (&[][..], 1.0, false),
                     },
                 };
-                if !sr_ok || (h.pos as usize) >= data.len() {
+                let past_end = h.end_pos.is_some_and(|e| h.pos >= e);
+                if !sr_ok || (h.pos as usize) >= data.len() || past_end {
                     done = true;
                 } else {
                     let p0 = h.pos as usize;
@@ -975,12 +1358,31 @@ impl EngineRt {
                             done = true;
                         }
                         if let Some(acc) = self.ch_accum.get_mut(ci) {
-                            acc.0 += v;
-                            acc.1 += v;
+                            let (pl, pr) = pan_gains(h.pan, std::f32::consts::SQRT_2);
+                            acc.0 += v * pl;
+                            acc.1 += v * pr;
                         }
                     } else {
-                        l += v * 0.9;
-                        r += v * 0.9;
+                        let mut fade = 1.0f32;
+                        if h.fade_in_samples > 0 && h.env_sample < h.fade_in_samples {
+                            fade *= h.env_sample as f32 / h.fade_in_samples as f32;
+                        }
+                        if h.fade_out_samples > 0
+                            && let Some(end_p) = h.end_pos
+                        {
+                            let rem_samples =
+                                (end_p - h.pos).max(0.0) / (base_ratio * h.pitch_ratio).max(1e-4);
+                            if (rem_samples as usize) < h.fade_out_samples {
+                                fade *= (rem_samples / h.fade_out_samples as f32).clamp(0.0, 1.0);
+                            }
+                        }
+                        h.env_sample += 1;
+                        let s_out = v * 0.9 * fade;
+                        let target = h.mixer_insert.min(nmix.saturating_sub(1));
+                        if let Some(m) = self.mix_direct_in.get_mut(target) {
+                            m.0 += s_out;
+                            m.1 += s_out;
+                        }
                     }
                     h.pos += base_ratio * h.pitch_ratio;
                 }
@@ -992,7 +1394,7 @@ impl EngineRt {
             }
         }
 
-        // Smooth channel controls, pan, mix, meter, and accumulate sends.
+        // Smooth channel controls, pan, feed mixer inserts, meter, and accumulate sends.
         let smooth_k = (220.0 / sr).clamp(0.001, 0.25);
         let solo_any = song.channels.iter().any(|c| c.solo);
         for (ci, channel) in song.channels.iter().enumerate() {
@@ -1020,8 +1422,11 @@ impl EngineRt {
             let (lg, rg) = pan_gains(pan_s, fader);
             let cl = raw_l * lg;
             let cr = raw_r * rg;
-            l += cl;
-            r += cr;
+            let target = channel.mixer_insert.min(nmix.saturating_sub(1));
+            if let Some(m) = self.mix_direct_in.get_mut(target) {
+                m.0 += cl;
+                m.1 += cr;
+            }
             let mono = (cl + cr) * 0.5;
             dly_send += mono * dly_s;
             rev_send += mono * rev_s;
@@ -1031,13 +1436,10 @@ impl EngineRt {
             }
         }
 
-        {
-            let (vl, vr) = self.live_voice.unit.get_stereo();
-            l += vl * 0.8;
-            r += vr * 0.8;
-        }
-
-        // Metronome overlay.
+        // Route live fallback synth + metronome into Master (insert 0).
+        let (mut m_live_l, mut m_live_r) = self.live_voice.unit.get_stereo();
+        m_live_l *= 0.8;
+        m_live_r *= 0.8;
         let mut i = 0;
         while i < self.metro_heads.len() {
             let done = {
@@ -1051,8 +1453,8 @@ impl EngineRt {
                     true
                 } else {
                     let v = buf[h.pos] * 0.5;
-                    l += v;
-                    r += v;
+                    m_live_l += v;
+                    m_live_r += v;
                     h.pos += 1;
                     false
                 }
@@ -1064,16 +1466,87 @@ impl EngineRt {
             }
         }
 
+        // Process Mixer Insert DAG in topological order with automatic PDC.
+        let mut l = 0.0f32;
+        let mut r = 0.0f32;
+        let solo_inserts = song.mixer_tracks.iter().skip(1).any(|m| m.solo);
+        for oi in 0..self.pdc_order.len() {
+            let t = self.pdc_order[oi];
+            let Some(track) = song.mixer_tracks.get(t) else {
+                continue;
+            };
+            let d_del = self.pdc_direct_delay.get(t).copied().unwrap_or(0);
+            let direct = self.direct_pdc_delay[t].push_pop(self.mix_direct_in[t], d_del);
+            let pre = (
+                direct.0 + self.mix_route_in[t].0,
+                direct.1 + self.mix_route_in[t].1,
+            );
+            let post_lat = self.track_lat_delay[t].push_pop(pre, track.latency_samples);
+
+            let (t_vol, t_pan, t_dly, t_rev) = if let Some(sm) = self.mix_smooth.get_mut(t) {
+                sm.vol += (track.volume - sm.vol) * smooth_k;
+                sm.pan += (track.pan - sm.pan) * smooth_k;
+                sm.dly += (track.delay_send - sm.dly) * smooth_k;
+                sm.rev += (track.reverb_send - sm.rev) * smooth_k;
+                (sm.vol, sm.pan, sm.dly, sm.rev)
+            } else {
+                (track.volume, track.pan, track.delay_send, track.reverb_send)
+            };
+            let is_muted = if t == 0 {
+                track.mute
+            } else {
+                (solo_inserts && !track.solo) || (!solo_inserts && track.mute)
+            };
+            let auto_g = self.mix_auto_vol.get(t).copied().unwrap_or(1.0);
+            let gain = if is_muted { 0.0 } else { t_vol * auto_g };
+            let (gl, gr) = pan_gains(t_pan, gain * std::f32::consts::SQRT_2);
+            let tl = post_lat.0 * gl;
+            let tr = post_lat.1 * gr;
+
+            if t < self.mix_peaks.len() {
+                self.mix_peaks[t] = (self.mix_peaks[t] * 0.94).max(tl.abs().max(tr.abs()));
+            }
+            let mono_t = (tl + tr) * 0.5;
+            dly_send += mono_t * t_dly;
+            rev_send += mono_t * t_rev;
+
+            if t == 0 {
+                l += tl;
+                r += tr;
+            } else {
+                for (ri, route) in track.routes.iter().enumerate() {
+                    let r_del = self
+                        .pdc_route_delay
+                        .get(t)
+                        .and_then(|v| v.get(ri))
+                        .map(|x| x.1)
+                        .unwrap_or(0);
+                    let routed = if let Some(rd) =
+                        self.route_pdc_delay.get_mut(t).and_then(|v| v.get_mut(ri))
+                    {
+                        rd.push_pop((tl, tr), r_del)
+                    } else {
+                        (tl, tr)
+                    };
+                    if !route.sidechain_only && route.target < self.mix_route_in.len() {
+                        self.mix_route_in[route.target].0 += routed.0 * route.amount;
+                        self.mix_route_in[route.target].1 += routed.1 * route.amount;
+                    }
+                }
+            }
+        }
+
         // Sends: manual stereo delay + fundsp Schroeder reverb.
         let (dl, dr) = self
             .delay
             .process(self.sr, song.delay_time, dly_send, dly_send);
         let (rl, rr) = self.reverb.filter_stereo(rev_send, rev_send);
-        l += dl * song.delay_mix + rl * song.reverb_mix;
-        r += dr * song.delay_mix + rr * song.reverb_mix;
+        l += dl * song.delay_mix + rl * song.reverb_mix + m_live_l;
+        r += dr * song.delay_mix + rr * song.reverb_mix + m_live_r;
 
-        l *= song.master_vol * 0.22;
-        r *= song.master_vol * 0.22;
+        let master_scale = song.master_vol * self.master_auto_vol.unwrap_or(1.0) * 0.22;
+        l *= master_scale;
+        r *= master_scale;
         l = l.tanh();
         r = r.tanh();
         if self.recording && self.playing {
@@ -1119,7 +1592,23 @@ impl EngineRt {
         self.metro_heads.clear();
         self.pending.clear();
         self.recording = false;
+        self.master_auto_vol = None;
+        self.mix_auto_vol.fill(1.0);
+        for d in self.track_lat_delay.iter_mut() {
+            d.clear();
+        }
+        for d in self.direct_pdc_delay.iter_mut() {
+            d.clear();
+        }
+        for row in self.route_pdc_delay.iter_mut() {
+            for d in row.iter_mut() {
+                d.clear();
+            }
+        }
         for p in self.ch_peaks.iter_mut() {
+            *p = 0.0;
+        }
+        for p in self.mix_peaks.iter_mut() {
             *p = 0.0;
         }
     }
@@ -1156,6 +1645,7 @@ struct AudioTelemetry {
     take_samples: AtomicU64,
     ack_seq: AtomicU64,
     ch_peaks: [AtomicU32; MAX_TELEM_CH],
+    mix_peaks: [AtomicU32; MAX_TELEM_CH],
     scope: [AtomicU32; SCOPE_LEN],
 }
 
@@ -1173,6 +1663,7 @@ impl AudioTelemetry {
             take_samples: AtomicU64::new(0),
             ack_seq: AtomicU64::new(0),
             ch_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            mix_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             scope: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
         }
     }
@@ -1364,6 +1855,9 @@ impl AudioWorker {
         for (i, p) in self.rt.ch_peaks.iter().take(MAX_TELEM_CH).enumerate() {
             t.ch_peaks[i].store(p.to_bits(), Ordering::Relaxed);
         }
+        for (i, p) in self.rt.mix_peaks.iter().take(MAX_TELEM_CH).enumerate() {
+            t.mix_peaks[i].store(p.to_bits(), Ordering::Relaxed);
+        }
         let n = self.rt.scope.len().min(SCOPE_LEN);
         for k in 0..n {
             let v = self.rt.scope[(self.rt.scope_pos + k) % n];
@@ -1427,6 +1921,13 @@ impl AppState {
         }
         for i in 0..nch {
             self.rt.ch_peaks[i] = f32::from_bits(t.ch_peaks[i].load(Ordering::Relaxed));
+        }
+        let nmix = self.song.mixer_tracks.len().min(MAX_TELEM_CH);
+        if self.rt.mix_peaks.len() != self.song.mixer_tracks.len() {
+            self.rt.mix_peaks.resize(self.song.mixer_tracks.len(), 0.0);
+        }
+        for i in 0..nmix {
+            self.rt.mix_peaks[i] = f32::from_bits(t.mix_peaks[i].load(Ordering::Relaxed));
         }
         for (i, s) in self.rt.scope.iter_mut().enumerate().take(SCOPE_LEN) {
             *s = f32::from_bits(t.scope[i].load(Ordering::Relaxed));
@@ -1840,18 +2341,13 @@ mod tests {
     #[test]
     fn playlist_audio_clip_renders() {
         let mut song = crate::song::new_empty();
-        song.arrangement.push(-1);
         song.samples.push(crate::song::SampleRef {
             name: "tone.wav".into(),
             path: "tone.wav".into(),
             data: vec![0.5; 4410].into(),
             sr: 44100.0,
         });
-        song.audio_clips.push(crate::song::AudioClip {
-            bar: 0,
-            sample: 0,
-            gain: 1.0,
-        });
+        song.add_audio_clip(0, 0, 0, 1.0);
         let mut rt = EngineRt::new(44100.0);
         rt.ensure_channels(&song);
         rt.song_mode = true;
@@ -1862,5 +2358,96 @@ mod tests {
 
         assert!(l.iter().any(|sample| sample.abs() > 0.01));
         assert!(l.iter().chain(&r).all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn pdc_aligns_parallel_mixer_paths() {
+        let mut song = crate::song::new_empty();
+        let mut imp = vec![0.0f32; 512];
+        // Place the impulse after the 44-sample (1 ms) attack ramp reaches full gain.
+        for s in &mut imp[64..80] {
+            *s = 1.0;
+        }
+        song.samples.push(crate::song::SampleRef {
+            name: "imp.wav".into(),
+            path: "imp.wav".into(),
+            data: imp.into(),
+            sr: 44100.0,
+        });
+        // Two channels triggering identical pulse at tick 0 -> Insert 1 (lat=64) and Insert 2 (lat=0).
+        song.channels[0].kind = ChannelKind::Sampler { sample: Some(0) };
+        song.channels[0].mixer_insert = 1;
+        song.channels[0].cutoff = 18000.0;
+        song.channels[0].attack = 0.001;
+        song.channels[0].reverb_send = 0.0;
+        song.channels[1].kind = ChannelKind::Sampler { sample: Some(0) };
+        song.channels[1].mixer_insert = 2;
+        song.channels[1].cutoff = 18000.0;
+        song.channels[1].attack = 0.001;
+        song.channels[1].reverb_send = 0.0;
+        song.mixer_tracks[1].latency_samples = 64;
+        song.mixer_tracks[2].latency_samples = 0;
+        song.patterns[0].notes[0].push(crate::song::Note::new(0, 8, 60, 1.0));
+        song.patterns[0].notes[1].push(crate::song::Note::new(0, 8, 60, 1.0));
+
+        let mut rt = EngineRt::new(44100.0);
+        rt.playing = true;
+        let mut l = vec![0.0; 512];
+        let mut r = vec![0.0; 512];
+        rt.process(&song, &mut l, &mut r);
+
+        // Pulse starts at sample 64, and both Insert 1 (+64 latency) and Insert 2 (+64 PDC)
+        // delay it to sample 128; if Insert 2 were uncompensated it would appear at 64..128.
+        let early_peak = l[..128].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let late_peak = l[128..200].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(early_peak < 1e-4, "uncompensated early audio: {early_peak}");
+        assert!(late_peak > 0.01, "aligned signal missing: {late_peak}");
+    }
+
+    #[test]
+    fn choke_group_cuts_target_channel() {
+        let mut song = crate::song::new_empty();
+        song.channels[4].cut_by = Some(1);
+        song.channels[0].cut_group = Some(1);
+        song.patterns[0].notes[4].push(crate::song::Note::new(0, 32, 48, 1.0));
+        song.patterns[0].notes[0].push(crate::song::Note::new(4, 4, 36, 1.0));
+        let mut rt = EngineRt::new(44100.0);
+        rt.playing = true;
+        // At 128 BPM (~1292 samples/tick), tick 4 fires around sample 5168.
+        let mut l = vec![0.0; 8192];
+        let mut r = vec![0.0; 8192];
+        rt.process(&song, &mut l, &mut r);
+        assert!(
+            rt.voices[4].iter().all(|v| v.off == 0),
+            "choke group must cut ringing synth voices"
+        );
+    }
+
+    #[test]
+    fn multi_track_overlapping_clips_and_auto_render() {
+        let mut song = crate::song::new_empty();
+        song.patterns[0].notes[0].push(crate::song::Note::new(0, 4, 36, 1.0));
+        song.patterns[1].notes[4].push(crate::song::Note::new(0, 16, 45, 1.0));
+        song.add_pattern_clip(0, 0, 0);
+        song.add_pattern_clip(1, 0, 1);
+        song.add_auto_clip(2, 0, 64, AutoTarget::MasterVol);
+        let mut rt = EngineRt::new(44100.0);
+        rt.song_mode = true;
+        rt.playing = true;
+        let mut l = vec![0.0; 8192];
+        let mut r = vec![0.0; 8192];
+        rt.process(&song, &mut l, &mut r);
+        assert!(
+            rt.ch_peaks[0] > 0.01 && rt.ch_peaks[4] > 0.01,
+            "ch0={} ch4={}",
+            rt.ch_peaks[0],
+            rt.ch_peaks[4]
+        );
+        assert!(
+            rt.mix_peaks[1] > 0.01 && rt.mix_peaks[5] > 0.01,
+            "mix1={} mix5={}",
+            rt.mix_peaks[1],
+            rt.mix_peaks[5]
+        );
     }
 }

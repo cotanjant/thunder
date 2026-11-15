@@ -52,7 +52,7 @@ impl eframe::App for DawApp {
             self.state.set_playing(next);
         }
         if !ui.ctx().egui_wants_keyboard_input() {
-            let (command, shift, z, y, c, v) = ui.ctx().input(|i| {
+            let (command, shift, z, y, c, v, l) = ui.ctx().input(|i| {
                 (
                     i.modifiers.command,
                     i.modifiers.shift,
@@ -60,6 +60,7 @@ impl eframe::App for DawApp {
                     i.key_pressed(eframe::egui::Key::Y),
                     i.key_pressed(eframe::egui::Key::C),
                     i.key_pressed(eframe::egui::Key::V),
+                    i.key_pressed(eframe::egui::Key::L),
                 )
             });
             if command && z && shift {
@@ -72,6 +73,8 @@ impl eframe::App for DawApp {
                 ui::copy_notes(&mut self.ui, &self.state);
             } else if command && v {
                 ui::paste_notes(&mut self.ui, &mut self.state);
+            } else if command && l {
+                ui::link_selected_channel_to_insert(&mut self.ui, &mut self.state);
             }
         }
         eframe::egui::Panel::top("transport").show(ui, |u| {
@@ -112,7 +115,7 @@ impl eframe::App for DawApp {
                         }
                         if self.ui.show_mixer {
                             u.vertical(|u| {
-                                ui::mixer(&mut self.state, u);
+                                ui::mixer(&mut self.ui, &mut self.state, u);
                             });
                         }
                     });
