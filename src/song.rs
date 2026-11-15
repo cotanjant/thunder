@@ -149,7 +149,7 @@ impl Default for ChannelKind {
 
 /// Everything needed to build one fundsp voice, copied out of a [`Channel`].
 /// Keeps voice construction honest instead of passing 6 loose DSP arguments.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct VoiceSpec {
     pub wave: WaveKind,
     pub q: f32,

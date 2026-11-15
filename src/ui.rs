@@ -432,13 +432,12 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.show_mixer = v;
         }
         u.separator();
-        let mut playing = s.rt.playing;
+        let playing = s.rt.playing;
         if u.button(if playing { "⏹ Stop" } else { "▶ Play" })
             .on_hover_text("Spacebar works too")
             .clicked()
         {
-            playing = !playing;
-            s.rt.playing = playing;
+            s.set_playing(!playing);
         }
         if u.button("Tutorial")
             .on_hover_text("First-time walkthrough")
@@ -447,7 +446,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.show_tutorial = !ui.show_tutorial;
         }
         if u.button("⏮ Reset").clicked() {
-            s.rt.reset_transport();
+            s.reset_transport();
         }
         if u.add_enabled(ui.can_undo(), egui::Button::new("↶ Undo"))
             .on_hover_text("Undo (Ctrl/Cmd+Z)")
@@ -469,20 +468,14 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             .on_hover_text("Record what plays, save it below")
             .changed()
         {
-            if rec {
-                s.rt.take_l.clear();
-                s.rt.take_r.clear();
-                s.rt.take_full = false;
-                s.rt.playing = true;
-            }
-            s.rt.recording = rec;
+            s.set_recording(rec, rec);
             ui.status = if rec {
                 "recording…".into()
             } else {
                 "take kept".into()
             };
         }
-        let take_secs = s.rt.take_l.len() / s.rt.sr.max(1.0) as usize;
+        let take_secs = s.take_duration_secs();
         u.label(format!(
             "{}take {}:{:02}{}",
             if s.rt.recording { "● " } else { "" },
@@ -505,8 +498,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             song_mode = false;
         }
         if song_mode != s.rt.song_mode {
-            s.rt.song_mode = song_mode;
-            s.rt.reset_transport();
+            s.set_song_mode(song_mode);
         }
         if !song_mode {
             let mut pat = ui.sel_pat;
@@ -519,8 +511,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 });
             if pat != ui.sel_pat {
                 ui.sel_pat = pat;
-                s.rt.pattern = pat;
-                s.rt.reset_transport();
+                s.set_pattern(pat);
             }
         }
         let mut bpm = s.song.bpm;
@@ -571,6 +562,12 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             egui::ProgressBar::new(s.rt.peak.clamp(0.0, 1.0))
                 .text(format!("{:.0}%", s.rt.peak * 100.0)),
         );
+        if s.rt.xruns > 0 {
+            u.colored_label(
+                egui::Color32::from_rgb(230, 160, 60),
+                format!("xruns:{}", s.rt.xruns),
+            );
+        }
     });
     u.horizontal(|u| {
         u.label("Project:");
@@ -594,12 +591,10 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                             Err(_) => missing += 1,
                         }
                     }
-                    let sr = s.rt.sr;
-                    s.song = song;
-                    ui.sel_ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+                    ui.sel_ch = ui.sel_ch.min(song.channels.len().saturating_sub(1));
                     ui.sel_pat = ui.sel_pat.min(N_PATTERNS - 1);
-                    s.rt.pattern = ui.sel_pat;
-                    s.rt.set_sample_rate(sr, &s.song);
+                    s.apply_loaded_song(song);
+                    s.set_pattern(ui.sel_pat);
                     ui.reset_history(&s.song);
                     ui.status = if missing == 0 {
                         format!("loaded {}", ui.save_path)
@@ -629,15 +624,10 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         u.label("Take:");
         u.add(egui::TextEdit::singleline(&mut ui.take_path).desired_width(100.0));
         if u.button("Save").clicked() {
-            if s.rt.take_l.is_empty() {
+            if !s.has_take() {
                 ui.status = "nothing recorded yet".into();
             } else {
-                match crate::export::write_wav_file(
-                    &ui.take_path.clone(),
-                    &s.rt.take_l.clone(),
-                    &s.rt.take_r.clone(),
-                    s.rt.sr,
-                ) {
+                match s.save_take(&ui.take_path.clone()) {
                     Ok(n) => ui.status = format!("saved take ({n} samples)"),
                     Err(e) => ui.status = format!("take save failed: {e}"),
                 }
@@ -678,7 +668,7 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                         });
                     if w != wave {
                         s.song.channels[i].kind = ChannelKind::Synth { wave: w };
-                        s.rt.rebuild_channel(&s.song.clone(), i);
+                        s.rebuild_channel(i);
                     }
                 }
                 ChannelKind::Kit { piece } => {
@@ -742,17 +732,15 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
         });
     }
-    // Borrow dance: rebuild_channel needs &Song while holding &mut AppState.
-    // Handled by cloning the song for the call above (cheap: notes only).
 }
 
 fn preview_channel(s: &mut AppState, i: usize) {
     match s.song.channels[i].kind.clone() {
-        ChannelKind::Synth { .. } => s.rt.live_note(s.song.channels[i].midi_base),
-        ChannelKind::Kit { piece } => s.rt.live_kit(piece),
+        ChannelKind::Synth { .. } => s.live_note_ch(i, s.song.channels[i].midi_base),
+        ChannelKind::Kit { piece } => s.live_kit(piece),
         ChannelKind::Sampler { sample } => {
             if let Some(idx) = sample {
-                s.rt.live_sample(idx);
+                s.live_sample(idx);
             }
         }
     }
@@ -1609,12 +1597,10 @@ pub fn tutorial(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             w.label("6. Transport: save the project, export a WAV mixdown or MIDI file.");
             w.horizontal(|w| {
                 if w.button("Load demo song").clicked() {
-                    s.song = crate::song::demo_song();
-                    let sr = s.rt.sr;
-                    s.rt.set_sample_rate(sr, &s.song);
+                    s.apply_loaded_song(crate::song::demo_song());
                     ui.sel_ch = 4;
                     ui.sel_pat = 0;
-                    s.rt.pattern = 0;
+                    s.set_pattern(0);
                     ui.reset_history(&s.song);
                     ui.status = "demo loaded: press Play".into();
                     close = true;
@@ -1751,7 +1737,7 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 let pat = s.song.arrangement[bar];
                 if pat >= 0 {
                     ui.sel_pat = pat as usize;
-                    s.rt.pattern = pat as usize;
+                    s.select_pattern(pat as usize);
                 }
             }
         }
@@ -1764,7 +1750,7 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 let pat = s.song.arrangement[bar];
                 if pat >= 0 {
                     ui.sel_pat = pat as usize;
-                    s.rt.pattern = pat as usize;
+                    s.select_pattern(pat as usize);
                     ui.show_piano = true;
                     ui.status = format!("editing P{}", pat + 1);
                 }
@@ -1838,7 +1824,7 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             });
         if v as usize != ui.sel_pat {
             ui.sel_pat = v as usize;
-            s.rt.pattern = v as usize;
+            s.select_pattern(v as usize);
         }
         if u.button("Fill").clicked() {
             for slot in s.song.arrangement.iter_mut() {
@@ -1927,7 +1913,7 @@ pub fn mixer(s: &mut AppState, u: &mut egui::Ui) {
                 .changed()
                 {
                     s.song.channels[i].cutoff = cut;
-                    s.rt.set_channel_cutoff(i, cut);
+                    s.set_channel_cutoff(i, cut);
                 }
                 let mut dl = s.song.channels[i].delay_send;
                 if u.add(egui::Slider::new(&mut dl, 0.0..=1.0).text("dly"))
@@ -2025,7 +2011,7 @@ pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             if u.button("▶").on_hover_text("Preview").clicked() {
                 match sample_into_song(s, &path) {
                     Ok(idx) => {
-                        s.rt.live_sample(idx);
+                        s.live_sample(idx);
                         ui.status = format!("preview {path}");
                     }
                     Err(e) => ui.status = format!("preview failed: {e}"),

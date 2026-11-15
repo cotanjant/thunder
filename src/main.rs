@@ -11,12 +11,12 @@ mod song;
 mod ui;
 
 use engine::{AppState, start_audio};
-use std::sync::{Arc, Mutex};
 use ui::AppUi;
 
 struct DawApp {
-    state: Arc<Mutex<AppState>>,
+    state: AppState,
     ui: AppUi,
+    _stream: Option<cpal::Stream>,
 }
 
 /// FL Studio look: near-black blue-gray, green LEDs and selections.
@@ -41,20 +41,17 @@ impl eframe::App for DawApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
-        if let Ok(s) = self.state.lock() {
-            let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
-            self.ui.record_song(&s.song, pointer_down);
-        }
+        self.state.sync_audio();
+        let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
+        self.ui.record_song(&self.state.song, pointer_down);
         // Space toggles transport, like FL. Not while typing in a text box.
         if !ui.ctx().egui_wants_keyboard_input()
             && ui.ctx().input(|i| i.key_pressed(eframe::egui::Key::Space))
-            && let Ok(mut s) = self.state.lock()
         {
-            s.rt.playing = !s.rt.playing;
+            let next = !self.state.rt.playing;
+            self.state.set_playing(next);
         }
-        if !ui.ctx().egui_wants_keyboard_input()
-            && let Ok(mut s) = self.state.lock()
-        {
+        if !ui.ctx().egui_wants_keyboard_input() {
             let (command, shift, z, y, c, v) = ui.ctx().input(|i| {
                 (
                     i.modifiers.command,
@@ -66,28 +63,24 @@ impl eframe::App for DawApp {
                 )
             });
             if command && z && shift {
-                ui::redo(&mut self.ui, &mut s);
+                ui::redo(&mut self.ui, &mut self.state);
             } else if command && z {
-                ui::undo(&mut self.ui, &mut s);
+                ui::undo(&mut self.ui, &mut self.state);
             } else if command && y {
-                ui::redo(&mut self.ui, &mut s);
+                ui::redo(&mut self.ui, &mut self.state);
             } else if command && c {
-                ui::copy_notes(&mut self.ui, &s);
+                ui::copy_notes(&mut self.ui, &self.state);
             } else if command && v {
-                ui::paste_notes(&mut self.ui, &mut s);
+                ui::paste_notes(&mut self.ui, &mut self.state);
             }
         }
         eframe::egui::Panel::top("transport").show(ui, |u| {
-            if let Ok(mut s) = self.state.lock() {
-                ui::transport(&mut self.ui, &mut s, u);
-            }
+            ui::transport(&mut self.ui, &mut self.state, u);
         });
         if self.ui.show_browser {
             eframe::egui::Panel::left("browser").show(ui, |u| {
                 eframe::egui::ScrollArea::vertical().show(u, |u| {
-                    if let Ok(mut s) = self.state.lock() {
-                        ui::browser(&mut self.ui, &mut s, u);
-                    }
+                    ui::browser(&mut self.ui, &mut self.state, u);
                 });
             });
         }
@@ -98,41 +91,38 @@ impl eframe::App for DawApp {
         });
         eframe::egui::CentralPanel::default().show(ui, |u| {
             eframe::egui::ScrollArea::vertical().show(u, |u| {
-                if let Ok(mut s) = self.state.lock() {
-                    ui::tutorial(&mut self.ui, &mut s, u);
-                    if self.ui.show_rack {
-                        ui::channel_rack(&mut self.ui, &mut s, u);
-                        u.separator();
-                    }
-                    if self.ui.show_piano {
-                        ui::piano_roll(&mut self.ui, &mut s, u);
-                        u.separator();
-                    }
-                    if self.ui.show_playlist || self.ui.show_mixer {
-                        u.horizontal(|u| {
-                            if self.ui.show_playlist {
-                                u.vertical(|u| {
-                                    ui::playlist(&mut self.ui, &mut s, u);
-                                });
-                            }
-                            if self.ui.show_playlist && self.ui.show_mixer {
-                                u.separator();
-                            }
-                            if self.ui.show_mixer {
-                                u.vertical(|u| {
-                                    ui::mixer(&mut s, u);
-                                });
-                            }
-                        });
-                        u.separator();
-                    }
+                ui::tutorial(&mut self.ui, &mut self.state, u);
+                if self.ui.show_rack {
+                    ui::channel_rack(&mut self.ui, &mut self.state, u);
+                    u.separator();
+                }
+                if self.ui.show_piano {
+                    ui::piano_roll(&mut self.ui, &mut self.state, u);
+                    u.separator();
+                }
+                if self.ui.show_playlist || self.ui.show_mixer {
+                    u.horizontal(|u| {
+                        if self.ui.show_playlist {
+                            u.vertical(|u| {
+                                ui::playlist(&mut self.ui, &mut self.state, u);
+                            });
+                        }
+                        if self.ui.show_playlist && self.ui.show_mixer {
+                            u.separator();
+                        }
+                        if self.ui.show_mixer {
+                            u.vertical(|u| {
+                                ui::mixer(&mut self.state, u);
+                            });
+                        }
+                    });
+                    u.separator();
                 }
             });
         });
-        if let Ok(s) = self.state.lock() {
-            let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
-            self.ui.record_song(&s.song, pointer_down);
-        }
+        let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
+        self.ui.record_song(&self.state.song, pointer_down);
+        self.state.sync_audio();
     }
 }
 
@@ -166,8 +156,8 @@ fn main() {
         println!("offline-test OK");
         return;
     }
-    let state = Arc::new(Mutex::new(AppState::new()));
-    let _stream = match start_audio(Arc::clone(&state)) {
+    let mut state = AppState::new();
+    let stream = match start_audio(&mut state) {
         Some(st) => {
             println!("audio started");
             Some(st)
@@ -177,17 +167,16 @@ fn main() {
             None
         }
     };
-    let app_state = Arc::clone(&state);
     let options = eframe::NativeOptions::default();
-    let _ = _stream;
     if let Err(e) = eframe::run_native(
         "Thunder",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(fl_visuals());
             Ok(Box::new(DawApp {
-                state: app_state,
+                state,
                 ui: AppUi::default(),
+                _stream: stream,
             }) as Box<dyn eframe::App>)
         }),
     ) {
