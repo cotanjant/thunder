@@ -3,9 +3,11 @@
 
 use crate::engine::{AppState, load_sample_file, sample_into_song};
 use crate::song::{
-    AutoClipPoint, AutoPoint, AutoTarget, Channel, ChannelKind, ClipKind, KitPiece, Note, Song,
-    TICKS_PER_STEP, TimeSig, WaveKind, eval_auto, eval_auto_clip, palette_color, tool_arpeggiate,
-    tool_chord, tool_humanize_in, tool_quantize_in, tool_strum_in,
+    ArpCfg, ArpDir, AutoClipPoint, AutoPoint, AutoTarget, Channel, ChannelKind, ChordKind,
+    ClipKind, KitPiece, Note, QuantizeCfg, RandCfg, ScaleKind, SnapGrid, Song, StrumCfg,
+    TICKS_PER_STEP, TimeSig, WaveKind, eval_auto, eval_auto_clip, palette_color, tool_chord_ext,
+    tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts, tool_randomize,
+    tool_riff_arp, tool_slice_at, tool_strum_opts,
 };
 use eframe::egui;
 use std::time::Instant;
@@ -14,76 +16,103 @@ use std::time::Instant;
 // UI state (not part of the saved song)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ScaleKind {
-    Chromatic,
-    Major,
-    Minor,
-    PentMaj,
-    PentMin,
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusPanel {
+    #[default]
+    Rack,
+    PianoRoll,
+    Playlist,
+    Mixer,
 }
 
-impl ScaleKind {
-    fn name(&self) -> &'static str {
-        match self {
-            ScaleKind::Chromatic => "Chromatic",
-            ScaleKind::Major => "Major",
-            ScaleKind::Minor => "Minor",
-            ScaleKind::PentMaj => "Pent Maj",
-            ScaleKind::PentMin => "Pent Min",
-        }
-    }
-    fn contains(&self, pc: u8, root: u8) -> bool {
-        let rel = (12 + pc as i32 - (root % 12) as i32) % 12;
-        match self {
-            ScaleKind::Chromatic => true,
-            ScaleKind::Major => matches!(rel, 0 | 2 | 4 | 5 | 7 | 9 | 11),
-            ScaleKind::Minor => matches!(rel, 0 | 2 | 3 | 5 | 7 | 8 | 10),
-            ScaleKind::PentMaj => matches!(rel, 0 | 2 | 4 | 7 | 9),
-            ScaleKind::PentMin => matches!(rel, 0 | 3 | 5 | 7 | 10),
-        }
-    }
-    /// Nearest pitch at or below `midi` that sits in the scale.
-    fn snap_midi(&self, midi: u8, root: u8) -> u8 {
-        if *self == ScaleKind::Chromatic {
-            return midi;
-        }
-        let mut m = midi;
-        for _ in 0..12 {
-            if self.contains(m % 12, root) {
-                return m;
-            }
-            m = m.saturating_sub(1).max(21);
-        }
-        midi
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ChordMode {
-    Off,
-    Maj,
-    Min,
-}
-
-/// FL-style piano roll tools. Draw places notes, Erase removes them with
-/// left-click, Hear plays pitches without writing anything.
+/// FL-style piano roll tools.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum PianoTool {
     #[default]
     Draw,
+    Paint,
+    Slice,
+    Mute,
     Erase,
     Hear,
 }
 
 impl PianoTool {
+    const ALL: [PianoTool; 6] = [
+        PianoTool::Draw,
+        PianoTool::Paint,
+        PianoTool::Slice,
+        PianoTool::Mute,
+        PianoTool::Erase,
+        PianoTool::Hear,
+    ];
+
     fn name(&self) -> &'static str {
         match self {
             PianoTool::Draw => "Draw",
+            PianoTool::Paint => "Paint",
+            PianoTool::Slice => "Slice",
+            PianoTool::Mute => "Mute",
             PianoTool::Erase => "Erase",
             PianoTool::Hear => "Hear",
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum NoteLane {
+    #[default]
+    Velocity,
+    Pan,
+    Cutoff,
+    FinePitch,
+    Release,
+}
+
+impl NoteLane {
+    const ALL: [NoteLane; 5] = [
+        NoteLane::Velocity,
+        NoteLane::Pan,
+        NoteLane::Cutoff,
+        NoteLane::FinePitch,
+        NoteLane::Release,
+    ];
+
+    fn name(&self) -> &'static str {
+        match self {
+            NoteLane::Velocity => "Vel",
+            NoteLane::Pan => "Pan",
+            NoteLane::Cutoff => "Cut",
+            NoteLane::FinePitch => "Pitch",
+            NoteLane::Release => "Rel",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PianoModalKind {
+    Quantize,
+    Strum,
+    Flam,
+    Arp,
+    Randomize,
+    Flip,
+}
+
+struct PianoModal {
+    kind: PianoModalKind,
+    ch: usize,
+    pat: usize,
+    backup: Vec<Note>,
+    sel: Vec<usize>,
+    quant: QuantizeCfg,
+    strum: StrumCfg,
+    flam_gap: u32,
+    flam_vel: f32,
+    arp: ArpCfg,
+    rand: RandCfg,
+    flip_h: bool,
+    flip_v: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,10 +164,19 @@ enum DragKind {
     Resize,
 }
 
+struct NoteDragState {
+    anchor_idx: usize,
+    kind: DragKind,
+    start_tick: i32,
+    start_midi: i32,
+    orig: Vec<(usize, u32, u8, u32)>,
+}
+
 pub struct AppUi {
     pub sel_ch: usize,
     pub sel_pat: usize,
     pub sel_insert: usize,
+    pub focus: FocusPanel,
     sel_track: usize,
     sel_clip: Option<u64>,
     clip_drag: Option<(u64, ClipDragKind, i32, u32)>,
@@ -160,15 +198,25 @@ pub struct AppUi {
     pub show_mixer: bool,
     tool: PianoTool,
     piano_bot: u8,
-    snap: u32,
+    piano_zoom_x: f32,
+    piano_zoom_y: f32,
+    snap_grid: SnapGrid,
     scale: ScaleKind,
     root: u8,
     snap_scale: bool,
-    chord: ChordMode,
-    sel_note: Option<usize>,
+    chord: ChordKind,
+    chord_inv: u8,
+    next_slide: bool,
+    show_ghosts: bool,
+    editable_ghosts: bool,
+    note_lane: NoteLane,
+    sel_notes: Vec<usize>,
+    marquee: Option<(egui::Pos2, egui::Pos2)>,
     prop_note: Option<usize>,
-    drag: Option<(usize, DragKind, i32, i32)>,
+    drag: Option<NoteDragState>,
     press_cell: Option<(i32, i32)>,
+    paint_last_tick: Option<u32>,
+    modal: Option<PianoModal>,
     auto_sel: AutoSel,
     auto_drag: Option<usize>,
     save_path: String,
@@ -216,6 +264,7 @@ impl Default for AppUi {
             sel_ch: 4,
             sel_pat: 0,
             sel_insert: 1,
+            focus: FocusPanel::Rack,
             sel_track: 0,
             sel_clip: None,
             clip_drag: None,
@@ -236,15 +285,25 @@ impl Default for AppUi {
             show_mixer: true,
             tool: PianoTool::Draw,
             piano_bot: 40,
-            snap: 4,
+            piano_zoom_x: 1.0,
+            piano_zoom_y: 1.0,
+            snap_grid: SnapGrid::S1_16,
             scale: ScaleKind::Major,
             root: 0,
             snap_scale: false,
-            chord: ChordMode::Off,
-            sel_note: None,
+            chord: ChordKind::Off,
+            chord_inv: 0,
+            next_slide: false,
+            show_ghosts: true,
+            editable_ghosts: false,
+            note_lane: NoteLane::Velocity,
+            sel_notes: Vec::new(),
+            marquee: None,
             prop_note: None,
             drag: None,
             press_cell: None,
+            paint_last_tick: None,
+            modal: None,
             auto_sel: AutoSel::Vol,
             auto_drag: None,
             save_path: "thunder.json".into(),
@@ -355,16 +414,28 @@ pub fn redo(ui: &mut AppUi, s: &mut AppState) -> bool {
 }
 
 pub fn copy_notes(ui: &mut AppUi, s: &AppState) -> bool {
-    let notes = s.song.patterns.get(ui.sel_pat).and_then(|pattern| {
-        pattern
-            .notes
-            .get(ui.sel_ch.min(s.song.channels.len().saturating_sub(1)))
-    });
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let notes = s
+        .song
+        .patterns
+        .get(ui.sel_pat)
+        .and_then(|pattern| pattern.notes.get(ch));
     let Some(notes) = notes.filter(|notes| !notes.is_empty()) else {
         ui.status = "no notes to copy".into();
         return false;
     };
-    ui.note_clipboard = notes.clone();
+    if ui.sel_notes.is_empty() {
+        ui.note_clipboard = notes.clone();
+    } else {
+        ui.note_clipboard = ui
+            .sel_notes
+            .iter()
+            .filter_map(|&idx| notes.get(idx).copied())
+            .collect();
+    }
+    if ui.note_clipboard.is_empty() {
+        ui.note_clipboard = notes.clone();
+    }
     ui.status = format!("copied {} notes", ui.note_clipboard.len());
     true
 }
@@ -385,8 +456,97 @@ pub fn paste_notes(ui: &mut AppUi, s: &mut AppState) -> bool {
     };
     notes.extend(ui.note_clipboard.iter().copied());
     notes.sort_by_key(|note| note.tick);
+    ui.sel_notes.clear();
     ui.status = format!("pasted {} notes", ui.note_clipboard.len());
     true
+}
+
+pub fn select_all_notes(ui: &mut AppUi, s: &AppState) {
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let len = s
+        .song
+        .patterns
+        .get(ui.sel_pat)
+        .and_then(|p| p.notes.get(ch))
+        .map(|ns| ns.len())
+        .unwrap_or(0);
+    ui.sel_notes = (0..len).collect();
+    ui.status = format!("selected {len} notes");
+}
+
+pub fn invert_note_selection(ui: &mut AppUi, s: &AppState) {
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let len = s
+        .song
+        .patterns
+        .get(ui.sel_pat)
+        .and_then(|p| p.notes.get(ch))
+        .map(|ns| ns.len())
+        .unwrap_or(0);
+    ui.sel_notes = (0..len).filter(|i| !ui.sel_notes.contains(i)).collect();
+    ui.status = format!("selected {} notes", ui.sel_notes.len());
+}
+
+pub fn duplicate_selected_notes(ui: &mut AppUi, s: &mut AppState) -> bool {
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let Some(pat) = s.song.patterns.get_mut(ui.sel_pat) else {
+        return false;
+    };
+    let max_ticks = pat.len_ticks();
+    let Some(notes) = pat.notes.get_mut(ch) else {
+        return false;
+    };
+    let added = tool_duplicate_after(notes, &ui.sel_notes, max_ticks);
+    if added.is_empty() {
+        return false;
+    }
+    ui.sel_notes = added;
+    ui.status = format!("duplicated {} notes", ui.sel_notes.len());
+    true
+}
+
+pub fn legato_selected_notes(ui: &mut AppUi, s: &mut AppState) -> bool {
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let Some(pat) = s.song.patterns.get_mut(ui.sel_pat) else {
+        return false;
+    };
+    let max_ticks = pat.len_ticks();
+    let Some(notes) = pat.notes.get_mut(ch) else {
+        return false;
+    };
+    if notes.is_empty() {
+        return false;
+    }
+    tool_legato(notes, &ui.sel_notes, max_ticks);
+    ui.status = "legato applied".into();
+    true
+}
+
+pub fn delete_selected_notes(ui: &mut AppUi, s: &mut AppState) -> bool {
+    if ui.sel_notes.is_empty() {
+        return false;
+    }
+    let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let Some(notes) = s
+        .song
+        .patterns
+        .get_mut(ui.sel_pat)
+        .and_then(|p| p.notes.get_mut(ch))
+    else {
+        return false;
+    };
+    let mut idxs = std::mem::take(&mut ui.sel_notes);
+    idxs.sort_unstable();
+    idxs.dedup();
+    let mut removed = false;
+    for idx in idxs.into_iter().rev() {
+        if idx < notes.len() {
+            notes.remove(idx);
+            removed = true;
+        }
+    }
+    ui.prop_note = None;
+    removed
 }
 
 pub fn link_selected_channel_to_insert(ui: &mut AppUi, s: &mut AppState) -> bool {
@@ -1225,28 +1385,141 @@ fn scale_checked(ui: &AppUi, midi: u8) -> u8 {
     }
 }
 
-/// Add a single note or a chord stamp, then report it in the status line.
-fn place_note(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, tick: u32, midi: u8) {
-    match ui.chord {
-        ChordMode::Off => {
-            if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
-                notes.push(Note::new(tick, ui.snap.max(1), midi, 0.85));
-                notes.sort_by_key(|n| n.tick);
-                ui.sel_note = notes.iter().rposition(|n| n.tick == tick && n.midi == midi);
-                ui.status = format!("note {} at tick {tick}", note_label(midi));
-            }
+/// Add a single note (optional slide) or a chord stamp, then report it in the status line.
+fn place_note(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    ch: usize,
+    pat: usize,
+    tick: u32,
+    midi: u8,
+    cell_w: f32,
+) {
+    let Some(pat_data) = s.song.patterns.get_mut(pat) else {
+        return;
+    };
+    let max_ticks = pat_data.len_ticks().max(1);
+    let len = ui
+        .snap_grid
+        .default_len(cell_w)
+        .min(max_ticks - tick)
+        .max(1);
+    let Some(notes) = pat_data.notes.get_mut(ch) else {
+        return;
+    };
+    if ui.chord == ChordKind::Off {
+        let mut n = Note::new_in(tick, len, midi, 0.85, max_ticks);
+        n.slide = ui.next_slide;
+        notes.push(n);
+        notes.sort_by_key(|x| x.tick);
+        ui.sel_notes = notes
+            .iter()
+            .rposition(|x| x.tick == tick && x.midi == midi)
+            .into_iter()
+            .collect();
+        ui.status = format!(
+            "{}note {} at tick {tick}",
+            if ui.next_slide { "slide " } else { "" },
+            note_label(midi)
+        );
+    } else {
+        let chord_notes = tool_chord_ext(tick, midi, ui.chord, ui.chord_inv, len, max_ticks);
+        let count = chord_notes.len();
+        notes.extend(chord_notes);
+        notes.sort_by_key(|x| x.tick);
+        ui.sel_notes.clear();
+        ui.status = format!("{} chord ({count}) at tick {tick}", ui.chord.name());
+    }
+}
+
+fn open_piano_modal(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, kind: PianoModalKind) {
+    let backup = s
+        .song
+        .patterns
+        .get(pat)
+        .and_then(|p| p.notes.get(ch))
+        .cloned()
+        .unwrap_or_default();
+    if backup.is_empty() {
+        ui.status = "no notes to process".into();
+        return;
+    }
+    let step = ui.snap_grid.step_ticks(8.0).max(1.0);
+    let pat_max = s
+        .song
+        .patterns
+        .get(pat)
+        .map(|p| p.len_ticks())
+        .unwrap_or(64);
+    let mut modal = PianoModal {
+        kind,
+        ch,
+        pat,
+        backup,
+        sel: ui.sel_notes.clone(),
+        quant: QuantizeCfg {
+            grid: step,
+            strength: 1.0,
+            swing: 0.0,
+            max_ticks: pat_max,
+        },
+        strum: StrumCfg {
+            amount: 2,
+            vel_slope: 0.0,
+            preserve_end: true,
+            max_ticks: pat_max,
+        },
+        flam_gap: 2,
+        flam_vel: 0.55,
+        arp: ArpCfg {
+            step_ticks: TICKS_PER_STEP,
+            gate: 0.9,
+            octaves: 1,
+            dir: ArpDir::Up,
+            max_ticks: pat_max,
+        },
+        rand: RandCfg {
+            pitch_range: 0,
+            vel_amt: 0.15,
+            pan_amt: 0.1,
+            seed: 42,
+        },
+        flip_h: true,
+        flip_v: false,
+    };
+    apply_piano_modal_preview(s, &modal);
+    modal.kind = kind;
+    ui.modal = Some(modal);
+}
+
+fn apply_piano_modal_preview(s: &mut AppState, m: &PianoModal) {
+    let Some(pat_data) = s.song.patterns.get_mut(m.pat) else {
+        return;
+    };
+    let max_ticks = pat_data.len_ticks().max(1);
+    let Some(notes) = pat_data.notes.get_mut(m.ch) else {
+        return;
+    };
+    *notes = m.backup.clone();
+    match m.kind {
+        PianoModalKind::Quantize => {
+            let mut cfg = m.quant;
+            cfg.max_ticks = max_ticks;
+            tool_quantize_opts(notes, &m.sel, &cfg);
         }
-        ChordMode::Maj | ChordMode::Min => {
-            let minor = ui.chord == ChordMode::Min;
-            if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
-                notes.extend(tool_chord(tick, midi, minor));
-                notes.sort_by_key(|n| n.tick);
-                ui.status = format!(
-                    "{} chord at tick {tick}",
-                    if minor { "minor" } else { "major" }
-                );
-            }
+        PianoModalKind::Strum => {
+            let mut cfg = m.strum;
+            cfg.max_ticks = max_ticks;
+            tool_strum_opts(notes, &m.sel, &cfg);
         }
+        PianoModalKind::Flam => tool_flam(notes, &m.sel, m.flam_gap, m.flam_vel),
+        PianoModalKind::Arp => {
+            let mut cfg = m.arp;
+            cfg.max_ticks = max_ticks;
+            tool_riff_arp(notes, &cfg);
+        }
+        PianoModalKind::Randomize => tool_randomize(notes, &m.sel, &m.rand),
+        PianoModalKind::Flip => tool_flip(notes, &m.sel, m.flip_h, m.flip_v),
     }
 }
 
@@ -1257,40 +1530,45 @@ pub fn piano_roll(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     let pat = ui.sel_pat;
     piano_options(ui, u);
     piano_canvas(ui, s, ch, pat, u);
-    velocity_lane(s, ch, pat, u);
+    note_property_lane(ui, s, ch, pat, u);
     automation_lane(ui, s, ch, pat, u);
     note_dialog(ui, s, ch, pat, u);
+    piano_tool_modal(ui, s, u);
 }
 
 fn piano_toolbar(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
     let pat = ui.sel_pat;
-    u.horizontal(|u| {
+    u.horizontal_wrapped(|u| {
         u.heading(format!(
             "Piano roll : {} / P{}",
             s.song.channels[ch].name,
             pat + 1
         ));
-        // FL-style tool modes: draw writes, erase deletes, hear only plays.
-        for tool in [PianoTool::Draw, PianoTool::Erase, PianoTool::Hear] {
+        for tool in PianoTool::ALL {
             if u.selectable_label(ui.tool == tool, tool.name())
                 .on_hover_text(match tool {
-                    PianoTool::Draw => "Draw: click adds a note, drag moves it (P)",
-                    PianoTool::Erase => "Erase: left-click deletes notes (D)",
-                    PianoTool::Hear => "Hear: click plays pitches, writes nothing (Y)",
+                    PianoTool::Draw => "Draw: click adds/selects notes, drag moves/resizes",
+                    PianoTool::Paint => "Paint: drag stamps notes sequentially across steps",
+                    PianoTool::Slice => "Slice: split notes at cursor tick",
+                    PianoTool::Mute => "Mute: click or drag to mute/unmute notes",
+                    PianoTool::Erase => "Erase: click or drag-hover deletes notes",
+                    PianoTool::Hear => "Hear: preview pitches without editing",
                 })
                 .clicked()
             {
+                ui.focus = FocusPanel::PianoRoll;
                 ui.tool = tool;
             }
         }
-        // Target channel: switch instrument without leaving the piano roll.
+        u.toggle_value(&mut ui.next_slide, "Slide")
+            .on_hover_text("Toggle FL-style pitch slide for newly placed notes");
         let mut target = ch;
         egui::ComboBox::from_id_salt("target_ch")
             .selected_text(s.song.channels[ch].name.clone())
             .show_ui(u, |u| {
                 for (i, c) in s.song.channels.iter().enumerate() {
-                    let tick = s.song.patterns[pat]
+                    let has_notes = s.song.patterns[pat]
                         .notes
                         .get(i)
                         .map(|ns| !ns.is_empty())
@@ -1298,27 +1576,39 @@ fn piano_toolbar(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     u.selectable_value(
                         &mut target,
                         i,
-                        format!("{}{}", if tick { "● " } else { "" }, c.name),
+                        format!("{}{}", if has_notes { "● " } else { "" }, c.name),
                     );
                 }
             });
         if target != ch {
             ui.sel_ch = target;
-            ui.sel_note = None;
+            ui.sel_notes.clear();
             ui.prop_note = None;
             return;
         }
         if u.button("Copy")
-            .on_hover_text("Copy this channel's notes (Ctrl/Cmd+C)")
+            .on_hover_text("Copy selected/channel notes (Ctrl/Cmd+C)")
             .clicked()
         {
             copy_notes(ui, s);
         }
         if u.add_enabled(!ui.note_clipboard.is_empty(), egui::Button::new("Paste"))
-            .on_hover_text("Paste copied notes into this channel (Ctrl/Cmd+V)")
+            .on_hover_text("Paste notes (Ctrl/Cmd+V)")
             .clicked()
         {
             paste_notes(ui, s);
+        }
+        if u.button("Dup")
+            .on_hover_text("Duplicate selection after end (Ctrl/Cmd+B)")
+            .clicked()
+        {
+            duplicate_selected_notes(ui, s);
+        }
+        if u.button("Legato")
+            .on_hover_text("Extend notes to next start (Ctrl/Cmd+L when focused)")
+            .clicked()
+        {
+            legato_selected_notes(ui, s);
         }
         if u.button("Clone P")
             .on_hover_text("Copy this pattern to the next empty pattern slot")
@@ -1326,64 +1616,45 @@ fn piano_toolbar(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         {
             duplicate_pattern(ui, s);
         }
-        if u.button("Quant")
-            .on_hover_text("Snap starts to grid")
-            .clicked()
-        {
-            let max_ticks = s.song.patterns[pat].len_ticks();
-            if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
-                tool_quantize_in(notes, ui.snap, max_ticks);
-                ui.status = "quantized".into();
-            }
+        if u.button("Quant").clicked() {
+            open_piano_modal(ui, s, ch, pat, PianoModalKind::Quantize);
         }
-        if u.button("Human")
-            .on_hover_text("Timing + velocity feel")
-            .clicked()
-        {
-            let max_ticks = s.song.patterns[pat].len_ticks();
-            if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(42);
-                tool_humanize_in(notes, seed, max_ticks);
-            }
-            ui.status = "humanized".into();
+        if u.button("Strum").clicked() {
+            open_piano_modal(ui, s, ch, pat, PianoModalKind::Strum);
         }
-        if u.button("Strum").on_hover_text("Spread chords").clicked() {
-            let max_ticks = s.song.patterns[pat].len_ticks();
-            if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
-                tool_strum_in(notes, 2, max_ticks);
-                ui.status = "strummed".into();
-            }
+        if u.button("Flam").clicked() {
+            open_piano_modal(ui, s, ch, pat, PianoModalKind::Flam);
         }
-        if u.button("Arp")
-            .on_hover_text("16th arpeggio from pitches")
-            .clicked()
-            && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
-        {
-            tool_arpeggiate(notes);
-            ui.status = "arpeggiated".into();
+        if u.button("Arp").clicked() {
+            open_piano_modal(ui, s, ch, pat, PianoModalKind::Arp);
         }
-        if u.button("Chord: off").clicked() {
-            ui.chord = match ui.chord {
-                ChordMode::Off => ChordMode::Maj,
-                ChordMode::Maj => ChordMode::Min,
-                ChordMode::Min => ChordMode::Off,
-            };
+        if u.button("Rand").clicked() {
+            open_piano_modal(ui, s, ch, pat, PianoModalKind::Randomize);
         }
-        let chord_txt = match ui.chord {
-            ChordMode::Off => "Chord: off",
-            ChordMode::Maj => "Chord: Maj",
-            ChordMode::Min => "Chord: min",
-        };
-        u.label(chord_txt);
+        if u.button("Flip").clicked() {
+            open_piano_modal(ui, s, ch, pat, PianoModalKind::Flip);
+        }
+        egui::ComboBox::from_id_salt("chord_stamp")
+            .selected_text(format!("Chord: {}", ui.chord.name()))
+            .show_ui(u, |u| {
+                for ck in ChordKind::ALL {
+                    u.selectable_value(&mut ui.chord, ck, ck.name());
+                }
+            });
+        if ui.chord != ChordKind::Off {
+            u.add(
+                egui::DragValue::new(&mut ui.chord_inv)
+                    .range(0..=3)
+                    .prefix("Inv:"),
+            );
+        }
         if u.button("Clear").clicked()
             && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
         {
             notes.clear();
+            ui.sel_notes.clear();
         }
-        if u.button("Oct−").clicked()
+        if u.button("Oct-").clicked()
             && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
         {
             for n in notes.iter_mut() {
@@ -1401,51 +1672,41 @@ fn piano_toolbar(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
 }
 
 fn piano_options(ui: &mut AppUi, u: &mut egui::Ui) {
-    u.horizontal(|u| {
+    u.horizontal_wrapped(|u| {
         u.label("Snap:");
-        egui::ComboBox::from_id_salt("snap")
-            .selected_text(format!("1/{}", 64 / ui.snap.max(1)))
+        egui::ComboBox::from_id_salt("snap_grid")
+            .selected_text(ui.snap_grid.name())
             .show_ui(u, |u| {
-                for sn in [1u32, 2, 4] {
-                    u.selectable_value(&mut ui.snap, sn, format!("1/{}", 64 / sn));
+                for sn in SnapGrid::ALL {
+                    u.selectable_value(&mut ui.snap_grid, sn, sn.name());
                 }
             });
         u.label("Scale:");
-        let mut sc = ui.scale;
         egui::ComboBox::from_id_salt("scale")
-            .selected_text(sc.name())
+            .selected_text(ui.scale.name())
             .show_ui(u, |u| {
-                for cand in [
-                    ScaleKind::Chromatic,
-                    ScaleKind::Major,
-                    ScaleKind::Minor,
-                    ScaleKind::PentMaj,
-                    ScaleKind::PentMin,
-                ] {
-                    u.selectable_value(&mut sc, cand, cand.name());
+                for cand in ScaleKind::ALL {
+                    u.selectable_value(&mut ui.scale, cand, cand.name());
                 }
             });
-        ui.scale = sc;
         u.label("Root:");
-        let mut root = ui.root;
         egui::ComboBox::from_id_salt("root")
-            .selected_text(NOTE_NAMES[(root % 12) as usize])
+            .selected_text(NOTE_NAMES[(ui.root % 12) as usize])
             .show_ui(u, |u| {
                 for r in 0u8..12 {
-                    u.selectable_value(&mut root, r, NOTE_NAMES[r as usize]);
+                    u.selectable_value(&mut ui.root, r, NOTE_NAMES[r as usize]);
                 }
             });
-        ui.root = root;
-        let mut snap_scale = ui.snap_scale;
-        if u.toggle_value(&mut snap_scale, "ScaleSnap")
-            .on_hover_text("Force added and moved notes into the scale")
-            .changed()
-        {
-            ui.snap_scale = snap_scale;
+        u.toggle_value(&mut ui.snap_scale, "ScaleSnap")
+            .on_hover_text("Force added and moved notes into the scale");
+        u.toggle_value(&mut ui.show_ghosts, "Ghosts");
+        if ui.show_ghosts {
+            u.toggle_value(&mut ui.editable_ghosts, "EditGhosts")
+                .on_hover_text("Double-click ghost note to switch channel");
         }
-        let mut bot = ui.piano_bot;
-        u.add(egui::Slider::new(&mut bot, 21..=72).text("Octave"));
-        ui.piano_bot = bot;
+        u.add(egui::Slider::new(&mut ui.piano_zoom_x, 1.0..=4.0).text("ZoomX"));
+        u.add(egui::Slider::new(&mut ui.piano_zoom_y, 1.0..=2.5).text("ZoomY"));
+        u.add(egui::Slider::new(&mut ui.piano_bot, 21..=72).text("Octave"));
     });
 }
 
@@ -1456,6 +1717,30 @@ fn piano_canvas(
     pat: usize,
     u: &mut egui::Ui,
 ) -> egui::Rect {
+    let zoomed = (ui.piano_zoom_x - 1.0).abs() > 0.01 || (ui.piano_zoom_y - 1.0).abs() > 0.01;
+    let avail_w = u.available_width().max(300.0);
+    if !zoomed {
+        piano_canvas_inner(ui, s, ch, pat, avail_w, u)
+    } else {
+        let mut out_rect = egui::Rect::NOTHING;
+        egui::ScrollArea::both()
+            .id_salt("piano_scroll")
+            .max_height(420.0)
+            .show(u, |u| {
+                out_rect = piano_canvas_inner(ui, s, ch, pat, avail_w, u);
+            });
+        out_rect
+    }
+}
+
+fn piano_canvas_inner(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    ch: usize,
+    pat: usize,
+    base_avail_w: f32,
+    u: &mut egui::Ui,
+) -> egui::Rect {
     let (midi_lo, midi_hi) = piano_midi_range(ui.piano_bot);
     let rows = (midi_hi - midi_lo + 1) as usize;
     let pdata = &s.song.patterns[pat];
@@ -1463,15 +1748,29 @@ fn piano_canvas(
     let bar_ticks = pdata.time_sig.ticks_per_bar().max(1);
     let beat_ticks = pdata.time_sig.ticks_per_beat().max(1);
     let max_tick = (pat_ticks - 1) as i32;
-    let avail_w = u.available_width().max(300.0);
-    let cell_w = (avail_w - KEY_W) / pat_ticks as f32;
-    let cell_h = 9.0;
-    let h = rows as f32 * cell_h;
-    let (rect, resp) = u.allocate_exact_size(egui::vec2(avail_w, h), egui::Sense::click_and_drag());
+    let base_cell_w = (base_avail_w - KEY_W) / pat_ticks as f32;
+    let cell_w = base_cell_w * ui.piano_zoom_x;
+    let cell_h = 9.0 * ui.piano_zoom_y;
+    let total_w = KEY_W + pat_ticks as f32 * cell_w;
+    let total_h = rows as f32 * cell_h;
+    let (rect, resp) =
+        u.allocate_exact_size(egui::vec2(total_w, total_h), egui::Sense::click_and_drag());
     let painter = u.painter_at(rect);
     painter.rect_filled(rect, 2.0, egui::Color32::from_gray(16));
 
-    let tick_at = |x: f32| ((x - rect.min.x - KEY_W) / cell_w).floor() as i32;
+    // Middle-mouse pan when zoomed.
+    if resp.hovered()
+        && u.ctx()
+            .input(|i| i.pointer.button_down(egui::PointerButton::Middle))
+    {
+        let delta = u.ctx().input(|i| i.pointer.delta());
+        if delta != egui::Vec2::ZERO {
+            u.scroll_with_delta(delta);
+        }
+    }
+
+    let tick_f_at = |x: f32| (x - rect.min.x - KEY_W) / cell_w;
+    let tick_at = |x: f32| tick_f_at(x).floor() as i32;
     let midi_at = |y: f32| midi_hi as i32 - ((y - rect.min.y) / cell_h).floor() as i32;
     let x_of = |tick: u32| rect.min.x + KEY_W + tick as f32 * cell_w;
     let y_of = |midi: u8| rect.min.y + (midi_hi - midi) as f32 * cell_h;
@@ -1520,9 +1819,10 @@ fn piano_canvas(
             );
         }
     }
-    // Grid lines.
+
+    // Grid lines (bar, beat, step + triplet hints when active).
     for t in 0u32..=pat_ticks {
-        let x = rect.min.x + KEY_W + t as f32 * cell_w;
+        let x = x_of(t);
         let strong = t.is_multiple_of(bar_ticks) || t == 0;
         let mid = t.is_multiple_of(beat_ticks);
         let step_line = t.is_multiple_of(TICKS_PER_STEP);
@@ -1543,8 +1843,11 @@ fn piano_canvas(
             ),
         );
     }
+
     // Ghost notes from other channels.
-    if let Some(pdata) = s.song.patterns.get(pat) {
+    if ui.show_ghosts
+        && let Some(pdata) = s.song.patterns.get(pat)
+    {
         for (ci, notes) in pdata.notes.iter().enumerate() {
             if ci == ch {
                 continue;
@@ -1567,6 +1870,7 @@ fn piano_canvas(
             }
         }
     }
+
     // Notes.
     let notes_snapshot = s
         .song
@@ -1575,28 +1879,75 @@ fn piano_canvas(
         .and_then(|p| p.notes.get(ch))
         .cloned()
         .unwrap_or_default();
+    ui.sel_notes.retain(|&idx| idx < notes_snapshot.len());
     for (idx, n) in notes_snapshot.iter().enumerate() {
         if n.midi < midi_lo || n.midi > midi_hi || n.tick >= pat_ticks {
             continue;
         }
-        let col = if Some(idx) == ui.sel_note {
+        let selected = ui.sel_notes.contains(&idx);
+        let note_rect = egui::Rect::from_min_max(
+            egui::pos2(x_of(n.tick), y_of(n.midi) + 1.0),
+            egui::pos2(
+                x_of((n.tick + n.len).min(pat_ticks)),
+                y_of(n.midi) + cell_h - 1.0,
+            ),
+        );
+        let col = if selected {
             egui::Color32::YELLOW
+        } else if n.mute {
+            egui::Color32::from_gray(85)
         } else {
             let g = (120.0 + n.vel * 120.0) as u8;
             egui::Color32::from_rgb(60, g, 90)
         };
+        painter.rect_filled(note_rect, 2.0, col);
+        if n.slide && note_rect.width() >= 5.0 {
+            let x1 = note_rect.max.x - 1.5;
+            let x0 = (note_rect.max.x - (note_rect.height() * 1.1).min(note_rect.width() * 0.6))
+                .max(note_rect.min.x + 1.5);
+            let tri = vec![
+                egui::pos2(x0, note_rect.max.y - 1.5),
+                egui::pos2(x1, note_rect.max.y - 1.5),
+                egui::pos2(x1, note_rect.min.y + 1.5),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                tri,
+                if selected {
+                    egui::Color32::from_rgb(30, 30, 30)
+                } else {
+                    egui::Color32::from_rgb(235, 245, 255)
+                },
+                egui::Stroke::NONE,
+            ));
+        }
+        if n.mute {
+            let ym = note_rect.center().y;
+            painter.line_segment(
+                [
+                    egui::pos2(note_rect.min.x + 2.0, ym),
+                    egui::pos2(note_rect.max.x - 2.0, ym),
+                ],
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(200, 90, 90)),
+            );
+        }
+    }
+
+    // Marquee overlay.
+    if let Some((a, b)) = ui.marquee {
+        let mr = egui::Rect::from_two_pos(a, b);
         painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x_of(n.tick), y_of(n.midi) + 1.0),
-                egui::pos2(
-                    x_of((n.tick + n.len).min(pat_ticks)),
-                    y_of(n.midi) + cell_h - 1.0,
-                ),
-            ),
-            2.0,
-            col,
+            mr,
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(120, 190, 255, 35),
+        );
+        painter.rect_stroke(
+            mr,
+            1.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(130, 210, 255)),
+            egui::StrokeKind::Inside,
         );
     }
+
     // Playhead.
     if s.rt.playing && s.rt.cur_pat == pat {
         let x = x_of(s.rt.cur_tick.min(pat_ticks - 1));
@@ -1606,19 +1957,48 @@ fn piano_canvas(
         );
     }
 
-    // Interactions.
+    // Helpers & modifiers.
     let hit_note = |tick: i32, midi: i32| -> Option<usize> {
         notes_snapshot.iter().rposition(|n| {
             tick >= n.tick as i32 && tick < (n.tick + n.len) as i32 && midi == n.midi as i32
         })
     };
-    let origin = u.ctx().input(|i| i.pointer.press_origin());
     let in_grid = |t: i32, m: i32| {
         (0..pat_ticks as i32).contains(&t) && m >= midi_lo as i32 && m <= midi_hi as i32
     };
+    let (origin, mods, scroll_y) = u.ctx().input(|i| {
+        (
+            i.pointer.press_origin(),
+            i.modifiers,
+            i.smooth_scroll_delta.y,
+        )
+    });
+    let snap_grid = ui.snap_grid;
+    let snap_pos = |x: f32| -> u32 {
+        let tf = tick_f_at(x);
+        if mods.alt {
+            tf.floor().clamp(0.0, max_tick as f32) as u32
+        } else {
+            snap_grid.snap_floor(tf, cell_w, pat_ticks)
+        }
+    };
+
+    // Alt + wheel over hovered or selected notes adjusts velocity.
+    if resp.hovered() && mods.alt && scroll_y.abs() > 0.5 {
+        let delta = if scroll_y > 0.0 { 0.05 } else { -0.05 };
+        if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
+            for &idx in &ui.sel_notes {
+                if let Some(n) = notes.get_mut(idx) {
+                    n.vel = (n.vel + delta).clamp(0.05, 1.0);
+                }
+            }
+        }
+    }
+
     if resp.drag_started()
         && let Some(p0) = origin
     {
+        ui.focus = FocusPanel::PianoRoll;
         let t0 = tick_at(p0.x);
         let m0 = midi_at(p0.y);
         if p0.x < rect.min.x + KEY_W {
@@ -1627,62 +2007,175 @@ fn piano_canvas(
             }
         } else if in_grid(t0, m0) {
             ui.press_cell = Some((t0, m0));
+            ui.paint_last_tick = None;
             if let Some(idx) = hit_note(t0, m0) {
-                if ui.tool == PianoTool::Erase
-                    && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
-                    && idx < notes.len()
-                {
-                    notes.remove(idx);
-                    ui.sel_note = None;
-                } else if ui.tool == PianoTool::Hear {
-                    s.live_note_ch(ch, m0 as u8);
-                } else if resp.hover_pos().is_some() {
-                    let n = &notes_snapshot[idx];
-                    let right_edge = x_of(n.tick + n.len);
-                    let kind = if p0.x > right_edge - 7.0 {
-                        DragKind::Resize
-                    } else {
-                        DragKind::Move
-                    };
-                    ui.drag = Some((idx, kind, t0 - n.tick as i32, m0 - n.midi as i32));
-                    ui.sel_note = Some(idx);
+                match ui.tool {
+                    PianoTool::Erase => {
+                        if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                            && idx < notes.len()
+                        {
+                            notes.remove(idx);
+                            ui.sel_notes.clear();
+                        }
+                    }
+                    PianoTool::Hear => s.live_note_ch(ch, m0 as u8),
+                    PianoTool::Slice => {
+                        let cut = snap_pos(p0.x);
+                        if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                            && tool_slice_at(notes, cut, Some(m0 as u8))
+                        {
+                            ui.sel_notes.clear();
+                        }
+                    }
+                    PianoTool::Mute => {
+                        if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                            && let Some(n) = notes.get_mut(idx)
+                        {
+                            n.mute = !n.mute;
+                        }
+                    }
+                    PianoTool::Draw | PianoTool::Paint => {
+                        if !ui.sel_notes.contains(&idx) && !mods.command {
+                            ui.sel_notes = vec![idx];
+                        }
+                        if mods.shift
+                            && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                        {
+                            // Shift+drag clones selected notes before moving.
+                            let mut cloned_idxs = Vec::new();
+                            for &si in &ui.sel_notes {
+                                if let Some(src) = notes.get(si).copied() {
+                                    cloned_idxs.push(notes.len());
+                                    notes.push(src);
+                                }
+                            }
+                            if !cloned_idxs.is_empty() {
+                                ui.sel_notes = cloned_idxs;
+                            }
+                        }
+                        if let Some(notes) = s.song.patterns[pat].notes.get(ch)
+                            && let Some(anchor_idx) = ui.sel_notes.last().copied().or(Some(idx))
+                            && let Some(anchor) = notes.get(anchor_idx)
+                        {
+                            let right_edge = x_of(anchor.tick + anchor.len);
+                            let kind = if p0.x > right_edge - 7.0 {
+                                DragKind::Resize
+                            } else {
+                                DragKind::Move
+                            };
+                            let orig = ui
+                                .sel_notes
+                                .iter()
+                                .filter_map(|&si| {
+                                    notes.get(si).map(|n| (si, n.tick, n.midi, n.len))
+                                })
+                                .collect();
+                            ui.drag = Some(NoteDragState {
+                                anchor_idx,
+                                kind,
+                                start_tick: t0,
+                                start_midi: m0,
+                                orig,
+                            });
+                        }
+                    }
                 }
+            } else if (mods.shift || mods.command) && ui.tool == PianoTool::Draw {
+                ui.marquee = Some((p0, p0));
+            } else if ui.tool == PianoTool::Paint {
+                let st = snap_pos(p0.x);
+                place_note(ui, s, ch, pat, st, scale_checked(ui, m0 as u8), cell_w);
+                ui.paint_last_tick = Some(st);
             }
         }
     }
+
     if resp.drag_stopped() {
-        if ui.drag.is_none()
+        if let Some((a, b)) = ui.marquee.take() {
+            let mr = egui::Rect::from_two_pos(a, b);
+            ui.sel_notes = notes_snapshot
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, n)| {
+                    if n.midi < midi_lo || n.midi > midi_hi || n.tick >= pat_ticks {
+                        return None;
+                    }
+                    let nr = egui::Rect::from_min_max(
+                        egui::pos2(x_of(n.tick), y_of(n.midi) + 1.0),
+                        egui::pos2(
+                            x_of((n.tick + n.len).min(pat_ticks)),
+                            y_of(n.midi) + cell_h - 1.0,
+                        ),
+                    );
+                    mr.intersects(nr).then_some(idx)
+                })
+                .collect();
+            ui.status = format!("selected {} notes", ui.sel_notes.len());
+        } else if ui.drag.is_none()
             && ui.tool == PianoTool::Draw
             && let Some((t0, m0)) = ui.press_cell
             && in_grid(t0, m0)
         {
-            let snap_t =
-                ((t0 / ui.snap.max(1) as i32) * ui.snap.max(1) as i32).clamp(0, max_tick) as u32;
-            place_note(ui, s, ch, pat, snap_t, scale_checked(ui, m0 as u8));
+            let snap_t = if mods.alt {
+                t0.clamp(0, max_tick) as u32
+            } else {
+                ui.snap_grid.snap_floor(t0 as f32, cell_w, pat_ticks)
+            };
+            place_note(ui, s, ch, pat, snap_t, scale_checked(ui, m0 as u8), cell_w);
         }
         ui.drag = None;
         ui.press_cell = None;
-    } else if resp.dragged()
-        && let Some((idx, kind, gt, gm)) = ui.drag
-        && let Some(pos) = resp.hover_pos()
-    {
-        let t = tick_at(pos.x);
-        let m = midi_at(pos.y);
-        if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
-            && let Some(n) = notes.get_mut(idx)
+        ui.paint_last_tick = None;
+    } else if resp.dragged() {
+        if let Some((a, _)) = ui.marquee
+            && let Some(pos) = resp.hover_pos()
         {
-            match kind {
-                DragKind::Move => {
-                    n.tick = (t - gt).clamp(0, max_tick) as u32;
-                    let target = (m - gm).clamp(21, 108) as u8;
-                    n.midi = if ui.snap_scale {
-                        ui.scale.snap_midi(target, ui.root)
-                    } else {
-                        target
-                    };
+            ui.marquee = Some((a, pos));
+        } else if let Some(d) = &ui.drag
+            && let Some(pos) = resp.hover_pos()
+        {
+            let t = tick_at(pos.x);
+            let m = midi_at(pos.y);
+            let dt = t - d.start_tick;
+            let dm = m - d.start_midi;
+            if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
+                for &(si, ot, om, ol) in &d.orig {
+                    if let Some(n) = notes.get_mut(si) {
+                        match d.kind {
+                            DragKind::Move => {
+                                n.tick = (ot as i32 + dt).clamp(0, max_tick) as u32;
+                                let target = (om as i32 + dm).clamp(21, 108) as u8;
+                                n.midi = scale_checked(ui, target);
+                            }
+                            DragKind::Resize => {
+                                n.len = (ol as i32 + dt).clamp(1, pat_ticks as i32) as u32;
+                            }
+                        }
+                    }
                 }
-                DragKind::Resize => {
-                    n.len = (t - n.tick as i32 + 1).clamp(1, pat_ticks as i32) as u32;
+                let _ = d.anchor_idx;
+            }
+        } else if ui.tool == PianoTool::Paint
+            && let Some(pos) = resp.hover_pos()
+        {
+            let t = tick_at(pos.x);
+            let m = midi_at(pos.y);
+            if in_grid(t, m) {
+                let st = snap_pos(pos.x);
+                if ui.paint_last_tick != Some(st) && hit_note(st as i32, m).is_none() {
+                    place_note(ui, s, ch, pat, st, scale_checked(ui, m as u8), cell_w);
+                    ui.paint_last_tick = Some(st);
+                }
+            }
+        } else if ui.tool == PianoTool::Slice
+            && let Some(pos) = resp.hover_pos()
+        {
+            let t = tick_at(pos.x);
+            let m = midi_at(pos.y);
+            if in_grid(t, m) && hit_note(t, m).is_some() {
+                let cut = snap_pos(pos.x);
+                if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
+                    tool_slice_at(notes, cut, Some(m as u8));
                 }
             }
         }
@@ -1697,13 +2190,15 @@ fn piano_canvas(
             && idx < notes.len()
         {
             notes.remove(idx);
-            ui.sel_note = None;
+            ui.sel_notes.clear();
         }
     }
+
     if resp.clicked()
         && !resp.drag_stopped()
         && let Some(pos) = resp.hover_pos()
     {
+        ui.focus = FocusPanel::PianoRoll;
         let t = tick_at(pos.x);
         let m = midi_at(pos.y);
         if pos.x < rect.min.x + KEY_W {
@@ -1712,14 +2207,47 @@ fn piano_canvas(
             }
         } else if in_grid(t, m) {
             match ui.tool {
-                PianoTool::Draw => {
+                PianoTool::Draw | PianoTool::Paint => {
                     if let Some(idx) = hit_note(t, m) {
-                        ui.sel_note = Some(idx);
+                        if mods.command {
+                            if let Some(pos) = ui.sel_notes.iter().position(|&x| x == idx) {
+                                ui.sel_notes.remove(pos);
+                            } else {
+                                ui.sel_notes.push(idx);
+                            }
+                        } else {
+                            ui.sel_notes = vec![idx];
+                        }
                     } else {
-                        let snap_t = ((t / ui.snap.max(1) as i32) * ui.snap.max(1) as i32)
-                            .clamp(0, max_tick) as u32;
+                        let snap_t = snap_pos(pos.x);
                         let mp = scale_checked(ui, m as u8);
-                        place_note(ui, s, ch, pat, snap_t, mp);
+                        place_note(ui, s, ch, pat, snap_t, mp, cell_w);
+                    }
+                }
+                PianoTool::Slice => {
+                    let cut = if mods.alt {
+                        tick_f_at(pos.x).round().clamp(0.0, max_tick as f32) as u32
+                    } else {
+                        snap_grid.snap_nearest(tick_f_at(pos.x), cell_w, pat_ticks)
+                    };
+                    if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                        && tool_slice_at(notes, cut, Some(m as u8))
+                    {
+                        ui.sel_notes.clear();
+                        ui.status = format!("sliced at tick {cut}");
+                    }
+                }
+                PianoTool::Mute => {
+                    if let Some(idx) = hit_note(t, m)
+                        && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                        && let Some(n) = notes.get_mut(idx)
+                    {
+                        n.mute = !n.mute;
+                        ui.status = if n.mute {
+                            "muted note".into()
+                        } else {
+                            "unmuted note".into()
+                        };
                     }
                 }
                 PianoTool::Erase => {
@@ -1728,15 +2256,14 @@ fn piano_canvas(
                         && idx < notes.len()
                     {
                         notes.remove(idx);
-                        ui.sel_note = None;
+                        ui.sel_notes.clear();
                     }
                 }
-                PianoTool::Hear => {
-                    s.live_note_ch(ch, m as u8);
-                }
+                PianoTool::Hear => s.live_note_ch(ch, m as u8),
             }
         }
     }
+
     if resp.clicked_by(egui::PointerButton::Secondary)
         && let Some(pos) = resp.hover_pos()
     {
@@ -1747,26 +2274,70 @@ fn piano_canvas(
             && idx < notes.len()
         {
             notes.remove(idx);
-            ui.sel_note = None;
+            ui.sel_notes.clear();
         }
     }
+
     if resp.double_clicked()
         && let Some(pos) = resp.hover_pos()
     {
         let t = tick_at(pos.x);
         let m = midi_at(pos.y);
         if in_grid(t, m) {
-            ui.prop_note = hit_note(t, m);
-            ui.sel_note = ui.prop_note;
+            if let Some(idx) = hit_note(t, m) {
+                ui.prop_note = Some(idx);
+                ui.sel_notes = vec![idx];
+            } else if ui.show_ghosts
+                && ui.editable_ghosts
+                && let Some(pdata) = s.song.patterns.get(pat)
+            {
+                for (ci, notes) in pdata.notes.iter().enumerate() {
+                    if ci != ch
+                        && let Some(gi) = notes.iter().position(|n| {
+                            t >= n.tick as i32 && t < (n.tick + n.len) as i32 && m == n.midi as i32
+                        })
+                    {
+                        ui.sel_ch = ci;
+                        ui.sel_notes = vec![gi];
+                        ui.status = format!("switched to {}", s.song.channels[ci].name);
+                        break;
+                    }
+                }
+            }
         }
     }
-    if u.ctx().input(|i| i.key_pressed(egui::Key::Delete))
-        && let Some(idx) = ui.sel_note.take()
-        && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
-        && idx < notes.len()
+
+    // Keyboard shortcuts while Piano Roll is focused or hovered.
+    if (ui.focus == FocusPanel::PianoRoll || resp.hovered()) && !u.ctx().egui_wants_keyboard_input()
     {
-        notes.remove(idx);
+        let (del, up, down, shift, alt_g) = u.ctx().input(|i| {
+            (
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.modifiers.shift,
+                i.modifiers.alt && i.key_pressed(egui::Key::G),
+            )
+        });
+        if alt_g {
+            ui.show_ghosts = !ui.show_ghosts;
+        }
+        if del {
+            delete_selected_notes(ui, s);
+        }
+        if (up || down)
+            && !ui.sel_notes.is_empty()
+            && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+        {
+            let step = if shift { 12i32 } else { 1i32 } * if up { 1 } else { -1 };
+            for &si in &ui.sel_notes {
+                if let Some(n) = notes.get_mut(si) {
+                    n.midi = (n.midi as i32 + step).clamp(21, 108) as u8;
+                }
+            }
+        }
     }
+
     rect
 }
 
@@ -1790,11 +2361,17 @@ fn note_dialog(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut 
                         && let Some(n) = notes.get_mut(idx)
                     {
                         w.label(format!("{} @ tick {}", note_label(n.midi), n.tick));
+                        w.horizontal(|w| {
+                            w.checkbox(&mut n.slide, "Slide");
+                            w.checkbox(&mut n.mute, "Mute");
+                        });
                         w.add(egui::Slider::new(&mut n.vel, 0.05..=1.0).text("Velocity"));
                         w.add(egui::Slider::new(&mut n.pan, -1.0..=1.0).text("Pan"));
                         w.add(
                             egui::Slider::new(&mut n.fine_pitch, -12.0..=12.0).text("Fine pitch"),
                         );
+                        w.add(egui::Slider::new(&mut n.cutoff, 0.0..=1.0).text("Cutoff"));
+                        w.add(egui::Slider::new(&mut n.release_bias, 0.0..=1.0).text("Release"));
                         let mut len = n.len;
                         w.add(egui::Slider::new(&mut len, 1..=pat_ticks).text("Length"));
                         n.len = len;
@@ -1816,7 +2393,7 @@ fn note_dialog(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut 
                 && idx < notes.len()
             {
                 notes.remove(idx);
-                ui.sel_note = None;
+                ui.sel_notes.clear();
             }
             if remove || close {
                 ui.prop_note = None;
@@ -1825,8 +2402,167 @@ fn note_dialog(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut 
     }
 }
 
-fn velocity_lane(s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
-    u.label("Velocity (drag bars)");
+fn piano_tool_modal(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
+    let Some(mut modal) = ui.modal.take() else {
+        return;
+    };
+    let title = match modal.kind {
+        PianoModalKind::Quantize => "Quantizer",
+        PianoModalKind::Strum => "Strumizer",
+        PianoModalKind::Flam => "Flam",
+        PianoModalKind::Arp => "Arpeggiator",
+        PianoModalKind::Randomize => "Randomizer",
+        PianoModalKind::Flip => "Flip",
+    };
+    let mut accept = false;
+    let mut cancel = false;
+    let mut changed = false;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .show(u.ctx(), |w| {
+            match modal.kind {
+                PianoModalKind::Quantize => {
+                    changed |= w
+                        .add(
+                            egui::Slider::new(&mut modal.quant.grid, 1.0..=16.0).text("Grid ticks"),
+                        )
+                        .changed();
+                    changed |= w
+                        .add(
+                            egui::Slider::new(&mut modal.quant.strength, 0.0..=1.0)
+                                .text("Strength"),
+                        )
+                        .changed();
+                    changed |= w
+                        .add(egui::Slider::new(&mut modal.quant.swing, 0.0..=0.75).text("Swing"))
+                        .changed();
+                }
+                PianoModalKind::Strum => {
+                    changed |= w
+                        .add(
+                            egui::DragValue::new(&mut modal.strum.amount)
+                                .range(0..=16)
+                                .prefix("Time: "),
+                        )
+                        .changed();
+                    changed |= w
+                        .add(
+                            egui::Slider::new(&mut modal.strum.vel_slope, -0.5..=0.5)
+                                .text("Vel tilt"),
+                        )
+                        .changed();
+                    changed |= w
+                        .checkbox(&mut modal.strum.preserve_end, "Preserve chord end")
+                        .changed();
+                }
+                PianoModalKind::Flam => {
+                    changed |= w
+                        .add(
+                            egui::DragValue::new(&mut modal.flam_gap)
+                                .range(1..=12)
+                                .prefix("Gap: "),
+                        )
+                        .changed();
+                    changed |= w
+                        .add(egui::Slider::new(&mut modal.flam_vel, 0.1..=1.0).text("Grace vel"))
+                        .changed();
+                }
+                PianoModalKind::Arp => {
+                    changed |= w
+                        .add(
+                            egui::DragValue::new(&mut modal.arp.step_ticks)
+                                .range(1..=16)
+                                .prefix("Step: "),
+                        )
+                        .changed();
+                    changed |= w
+                        .add(egui::Slider::new(&mut modal.arp.gate, 0.1..=1.0).text("Gate"))
+                        .changed();
+                    changed |= w
+                        .add(
+                            egui::DragValue::new(&mut modal.arp.octaves)
+                                .range(1..=4)
+                                .prefix("Octaves: "),
+                        )
+                        .changed();
+                    w.horizontal(|w| {
+                        for (d, label) in [
+                            (ArpDir::Up, "Up"),
+                            (ArpDir::Down, "Down"),
+                            (ArpDir::UpDown, "UpDown"),
+                        ] {
+                            changed |= w.selectable_value(&mut modal.arp.dir, d, label).changed();
+                        }
+                    });
+                }
+                PianoModalKind::Randomize => {
+                    changed |= w
+                        .add(
+                            egui::DragValue::new(&mut modal.rand.pitch_range)
+                                .range(0..=12)
+                                .prefix("Pitch st: "),
+                        )
+                        .changed();
+                    changed |= w
+                        .add(egui::Slider::new(&mut modal.rand.vel_amt, 0.0..=0.8).text("Vel amt"))
+                        .changed();
+                    changed |= w
+                        .add(egui::Slider::new(&mut modal.rand.pan_amt, 0.0..=1.0).text("Pan amt"))
+                        .changed();
+                    changed |= w
+                        .add(
+                            egui::DragValue::new(&mut modal.rand.seed)
+                                .range(1..=9999)
+                                .prefix("Seed: "),
+                        )
+                        .changed();
+                }
+                PianoModalKind::Flip => {
+                    changed |= w.checkbox(&mut modal.flip_h, "Flip horizontal").changed();
+                    changed |= w.checkbox(&mut modal.flip_v, "Flip vertical").changed();
+                }
+            }
+            w.horizontal(|w| {
+                if w.button("Accept").clicked() {
+                    accept = true;
+                }
+                if w.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if cancel {
+        if let Some(notes) = s
+            .song
+            .patterns
+            .get_mut(modal.pat)
+            .and_then(|p| p.notes.get_mut(modal.ch))
+        {
+            *notes = modal.backup;
+        }
+        ui.status = format!("{title} cancelled");
+    } else {
+        if changed {
+            apply_piano_modal_preview(s, &modal);
+        }
+        if accept {
+            ui.status = format!("{title} applied");
+        } else {
+            ui.modal = Some(modal);
+        }
+    }
+}
+
+fn note_property_lane(ui: &mut AppUi, s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
+    u.horizontal(|u| {
+        u.label("Note lane:");
+        for lane in NoteLane::ALL {
+            u.selectable_value(&mut ui.note_lane, lane, lane.name());
+        }
+        u.label("(drag bars)");
+    });
     let avail_w = u.available_width().max(300.0);
     let h = 56.0;
     let (rect, resp) = u.allocate_exact_size(egui::vec2(avail_w, h), egui::Sense::click_and_drag());
@@ -1840,29 +2576,53 @@ fn velocity_lane(s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
         .and_then(|p| p.notes.get(ch))
         .cloned()
         .unwrap_or_default();
-    for n in &notes {
+    for (idx, n) in notes.iter().enumerate() {
         if n.tick >= pat_ticks {
             continue;
         }
         let x =
             rect.min.x + KEY_W + (n.tick as f32 + 0.5) / pat_ticks as f32 * (rect.width() - KEY_W);
-        let bh = n.vel.clamp(0.0, 1.0) * (h - 6.0);
+        let (norm, col) = match ui.note_lane {
+            NoteLane::Velocity => (n.vel.clamp(0.0, 1.0), egui::Color32::from_rgb(90, 160, 120)),
+            NoteLane::Pan => (
+                (n.pan.clamp(-1.0, 1.0) + 1.0) * 0.5,
+                egui::Color32::from_rgb(100, 165, 220),
+            ),
+            NoteLane::Cutoff => (
+                n.cutoff.clamp(0.0, 1.0),
+                egui::Color32::from_rgb(200, 145, 85),
+            ),
+            NoteLane::FinePitch => (
+                (n.fine_pitch.clamp(-12.0, 12.0) + 12.0) / 24.0,
+                egui::Color32::from_rgb(180, 120, 220),
+            ),
+            NoteLane::Release => (
+                n.release_bias.clamp(0.0, 1.0),
+                egui::Color32::from_rgb(140, 190, 95),
+            ),
+        };
+        let col = if ui.sel_notes.contains(&idx) {
+            egui::Color32::YELLOW
+        } else {
+            col
+        };
+        let bh = norm * (h - 6.0);
         painter.rect_filled(
             egui::Rect::from_min_size(
                 egui::pos2(x - 3.0, rect.max.y - 3.0 - bh),
                 egui::vec2(6.0, bh),
             ),
             1.0,
-            egui::Color32::from_rgb(90, 160, 120),
+            col,
         );
     }
-    if resp.dragged()
+    if (resp.dragged() || resp.clicked())
         && let Some(pos) = resp.hover_pos()
     {
         let tick = (((pos.x - rect.min.x - KEY_W) / (rect.width() - KEY_W) * pat_ticks as f32)
             .round() as i32)
             .clamp(0, pat_ticks as i32 - 1);
-        let vel = (1.0 - (pos.y - rect.min.y) / h).clamp(0.05, 1.0);
+        let norm = (1.0 - (pos.y - rect.min.y) / h).clamp(0.0, 1.0);
         if let Some(notes) = s.song.patterns[pat].notes.get_mut(ch) {
             let mut best: Option<usize> = None;
             let mut best_d = 3i32;
@@ -1874,7 +2634,13 @@ fn velocity_lane(s: &mut AppState, ch: usize, pat: usize, u: &mut egui::Ui) {
                 }
             }
             if let Some(idx) = best {
-                notes[idx].vel = vel;
+                match ui.note_lane {
+                    NoteLane::Velocity => notes[idx].vel = norm.clamp(0.05, 1.0),
+                    NoteLane::Pan => notes[idx].pan = norm * 2.0 - 1.0,
+                    NoteLane::Cutoff => notes[idx].cutoff = norm,
+                    NoteLane::FinePitch => notes[idx].fine_pitch = (norm * 24.0 - 12.0).round(),
+                    NoteLane::Release => notes[idx].release_bias = norm,
+                }
             }
         }
     }
@@ -3373,5 +4139,78 @@ mod ui_tests {
         h.get_by_label("▶ Play").click();
         h.step();
         assert!(h.state().app.rt.playing, "Play must start transport");
+    }
+
+    #[test]
+    fn piano_marquee_select_legato_slice_and_mute() {
+        let mut state = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        state.app.song.patterns[0].notes[4].push(Note::new(0, 4, 60, 0.8));
+        state.app.song.patterns[0].notes[4].push(Note::new(16, 4, 64, 0.8));
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                let r = piano_canvas(&mut st.ui, &mut st.app, 4, 0, u);
+                st.rect = Some(r);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.step();
+
+        // Select all, legato extends note 0 to touch tick 16.
+        {
+            let st = h.state_mut();
+            select_all_notes(&mut st.ui, &st.app);
+            assert_eq!(st.ui.sel_notes, vec![0, 1]);
+            assert!(legato_selected_notes(&mut st.ui, &mut st.app));
+            assert_eq!(st.app.song.patterns[0].notes[4][0].len, 16);
+        }
+
+        // Slice tool splits note 0 at tick 8.
+        h.state_mut().ui.tool = PianoTool::Slice;
+        let cut_pos = cell_center(&h, 8, 60);
+        click_at(&mut h, cut_pos);
+        assert_eq!(h.state().app.song.patterns[0].notes[4].len(), 3);
+        assert_eq!(h.state().app.song.patterns[0].notes[4][0].len, 8);
+        assert_eq!(h.state().app.song.patterns[0].notes[4][1].tick, 8);
+
+        // Mute tool toggles mute on the second half.
+        h.state_mut().ui.tool = PianoTool::Mute;
+        let mute_pos = cell_center(&h, 9, 60);
+        click_at(&mut h, mute_pos);
+        assert!(h.state().app.song.patterns[0].notes[4][1].mute);
+    }
+
+    #[test]
+    fn piano_slide_and_property_lane_edit() {
+        let mut state = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        state.ui.next_slide = true;
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                let r = piano_canvas(&mut st.ui, &mut st.app, 4, 0, u);
+                st.rect = Some(r);
+                note_property_lane(&mut st.ui, &mut st.app, 4, 0, u);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.step();
+        let p = cell_center(&h, 4, 62);
+        click_at(&mut h, p);
+        assert!(h.state().app.song.patterns[0].notes[4][0].slide);
+
+        // Non-destructive modal preview & cancel restores backup.
+        {
+            let st = h.state_mut();
+            open_piano_modal(&mut st.ui, &mut st.app, 4, 0, PianoModalKind::Flip);
+            assert!(st.ui.modal.is_some());
+        }
     }
 }

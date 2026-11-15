@@ -111,6 +111,9 @@ pub fn export_midi(song: &Song, pattern_fallback: usize, path: &str) -> Result<S
             let cycle_base = cycle * pat_len;
             for notes in &pdata.notes {
                 for note in notes {
+                    if note.mute || note.slide {
+                        continue;
+                    }
                     let abs_pat = cycle_base + note.tick;
                     if abs_pat < clip.offset_ticks || abs_pat >= clip.offset_ticks + clip.len_ticks
                     {
@@ -133,6 +136,9 @@ pub fn export_midi(song: &Song, pattern_fallback: usize, path: &str) -> Result<S
         max_tick = pdata.len_ticks();
         for notes in &pdata.notes {
             for note in notes {
+                if note.mute || note.slide {
+                    continue;
+                }
                 let v = (note.vel.clamp(0.0, 1.0) * 100.0) as u8 + 10;
                 evs.push((note.tick, true, note.midi, v.min(127)));
                 evs.push((note.tick + note.len.max(1), false, note.midi, 64));

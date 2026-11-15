@@ -52,17 +52,41 @@ impl eframe::App for DawApp {
             self.state.set_playing(next);
         }
         if !ui.ctx().egui_wants_keyboard_input() {
-            let (command, shift, z, y, c, v, l) = ui.ctx().input(|i| {
-                (
-                    i.modifiers.command,
-                    i.modifiers.shift,
-                    i.key_pressed(eframe::egui::Key::Z),
-                    i.key_pressed(eframe::egui::Key::Y),
-                    i.key_pressed(eframe::egui::Key::C),
-                    i.key_pressed(eframe::egui::Key::V),
-                    i.key_pressed(eframe::egui::Key::L),
-                )
-            });
+            let (command, shift, z, y, c, v, l, a, i_key, b, f5, f6, f7, f8, f9) =
+                ui.ctx().input(|i| {
+                    (
+                        i.modifiers.command,
+                        i.modifiers.shift,
+                        i.key_pressed(eframe::egui::Key::Z),
+                        i.key_pressed(eframe::egui::Key::Y),
+                        i.key_pressed(eframe::egui::Key::C),
+                        i.key_pressed(eframe::egui::Key::V),
+                        i.key_pressed(eframe::egui::Key::L),
+                        i.key_pressed(eframe::egui::Key::A),
+                        i.key_pressed(eframe::egui::Key::I),
+                        i.key_pressed(eframe::egui::Key::B),
+                        i.key_pressed(eframe::egui::Key::F5),
+                        i.key_pressed(eframe::egui::Key::F6),
+                        i.key_pressed(eframe::egui::Key::F7),
+                        i.key_pressed(eframe::egui::Key::F8),
+                        i.key_pressed(eframe::egui::Key::F9),
+                    )
+                });
+            if f5 {
+                self.ui.show_playlist = !self.ui.show_playlist;
+            }
+            if f6 {
+                self.ui.show_rack = !self.ui.show_rack;
+            }
+            if f7 {
+                self.ui.show_piano = !self.ui.show_piano;
+            }
+            if f8 {
+                self.ui.show_browser = !self.ui.show_browser;
+            }
+            if f9 {
+                self.ui.show_mixer = !self.ui.show_mixer;
+            }
             if command && z && shift {
                 ui::redo(&mut self.ui, &mut self.state);
             } else if command && z {
@@ -73,10 +97,21 @@ impl eframe::App for DawApp {
                 ui::copy_notes(&mut self.ui, &self.state);
             } else if command && v {
                 ui::paste_notes(&mut self.ui, &mut self.state);
+            } else if command && a && self.ui.focus == ui::FocusPanel::PianoRoll {
+                ui::select_all_notes(&mut self.ui, &self.state);
+            } else if command && i_key && self.ui.focus == ui::FocusPanel::PianoRoll {
+                ui::invert_note_selection(&mut self.ui, &self.state);
+            } else if command && b && self.ui.focus == ui::FocusPanel::PianoRoll {
+                ui::duplicate_selected_notes(&mut self.ui, &mut self.state);
             } else if command && l {
-                ui::link_selected_channel_to_insert(&mut self.ui, &mut self.state);
+                if self.ui.focus == ui::FocusPanel::PianoRoll {
+                    ui::legato_selected_notes(&mut self.ui, &mut self.state);
+                } else {
+                    ui::link_selected_channel_to_insert(&mut self.ui, &mut self.state);
+                }
             }
         }
+        let pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
         eframe::egui::Panel::top("transport").show(ui, |u| {
             ui::transport(&mut self.ui, &mut self.state, u);
         });
@@ -96,27 +131,51 @@ impl eframe::App for DawApp {
             eframe::egui::ScrollArea::vertical().show(u, |u| {
                 ui::tutorial(&mut self.ui, &mut self.state, u);
                 if self.ui.show_rack {
-                    ui::channel_rack(&mut self.ui, &mut self.state, u);
+                    let r = u
+                        .scope(|u| ui::channel_rack(&mut self.ui, &mut self.state, u))
+                        .response;
+                    if pressed && r.hovered() {
+                        self.ui.focus = ui::FocusPanel::Rack;
+                    }
                     u.separator();
                 }
                 if self.ui.show_piano {
-                    ui::piano_roll(&mut self.ui, &mut self.state, u);
+                    let r = u
+                        .scope(|u| ui::piano_roll(&mut self.ui, &mut self.state, u))
+                        .response;
+                    if pressed && r.hovered() {
+                        self.ui.focus = ui::FocusPanel::PianoRoll;
+                    }
                     u.separator();
                 }
                 if self.ui.show_playlist || self.ui.show_mixer {
                     u.horizontal(|u| {
                         if self.ui.show_playlist {
-                            u.vertical(|u| {
-                                ui::playlist(&mut self.ui, &mut self.state, u);
-                            });
+                            let r = u
+                                .scope(|u| {
+                                    u.vertical(|u| {
+                                        ui::playlist(&mut self.ui, &mut self.state, u);
+                                    });
+                                })
+                                .response;
+                            if pressed && r.hovered() {
+                                self.ui.focus = ui::FocusPanel::Playlist;
+                            }
                         }
                         if self.ui.show_playlist && self.ui.show_mixer {
                             u.separator();
                         }
                         if self.ui.show_mixer {
-                            u.vertical(|u| {
-                                ui::mixer(&mut self.ui, &mut self.state, u);
-                            });
+                            let r = u
+                                .scope(|u| {
+                                    u.vertical(|u| {
+                                        ui::mixer(&mut self.ui, &mut self.state, u);
+                                    });
+                                })
+                                .response;
+                            if pressed && r.hovered() {
+                                self.ui.focus = ui::FocusPanel::Mixer;
+                            }
                         }
                     });
                     u.separator();

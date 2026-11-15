@@ -33,8 +33,44 @@ struct VoiceRt {
     cur_hz: f32,
     target_hz: f32,
     glide_rate: f32,
+    slide_rem: usize,
+    slide_tot: usize,
+    slide_start_hz: f32,
+    slide_vel_start: f32,
+    slide_vel_target: f32,
+    slide_pan_start: f32,
+    slide_pan_target: f32,
     off: usize,
     age: u64,
+}
+
+impl VoiceRt {
+    fn new(spec: VoiceSpec, base_hz: f32, cutoff_hz: f32, sr: f64) -> Self {
+        let pitch = shared(base_hz);
+        let gate = shared(0.0);
+        let cutoff = shared(cutoff_hz);
+        let unit = make_voice(spec, &pitch, &gate, &cutoff, sr);
+        Self {
+            unit,
+            pitch,
+            gate,
+            cutoff,
+            vel: 1.0,
+            pan: 0.0,
+            cur_hz: base_hz,
+            target_hz: base_hz,
+            glide_rate: 1.0,
+            slide_rem: 0,
+            slide_tot: 0,
+            slide_start_hz: base_hz,
+            slide_vel_start: 1.0,
+            slide_vel_target: 1.0,
+            slide_pan_start: 0.0,
+            slide_pan_target: 0.0,
+            off: 0,
+            age: 0,
+        }
+    }
 }
 
 const LIVE_VOICE_SPEC: VoiceSpec = VoiceSpec {
@@ -277,8 +313,14 @@ struct PlayHead {
     pos: f32,
     end_pos: Option<f32>,
     pitch_ratio: f32,
+    slide_start_ratio: f32,
+    slide_target_ratio: f32,
+    slide_rem: usize,
+    slide_tot: usize,
     gain: f32,
     pan: f32,
+    cutoff_mul: f32,
+    rel_mul: f32,
     fade_in_samples: usize,
     fade_out_samples: usize,
     lp_z: f32,
@@ -302,8 +344,14 @@ impl PlayHead {
             pos: 0.0,
             end_pos: None,
             pitch_ratio,
+            slide_start_ratio: pitch_ratio,
+            slide_target_ratio: pitch_ratio,
+            slide_rem: 0,
+            slide_tot: 0,
             gain,
             pan: 0.0,
+            cutoff_mul: 1.0,
+            rel_mul: 1.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
             lp_z: 0.0,
@@ -319,7 +367,7 @@ impl PlayHead {
         }
         let a_n = (a.max(0.001) * sr) as usize;
         let d_n = (d.max(0.001) * sr) as usize;
-        let r_n = (r.max(0.005) * sr) as usize;
+        let r_n = (r.max(0.005) * self.rel_mul * sr) as usize;
         let s = s.clamp(0.0, 1.0);
 
         if self.env_sample < self.gate_off {
@@ -352,24 +400,21 @@ struct MetroHead {
     pos: usize,
 }
 
+#[derive(Clone, Copy)]
 struct NoteTrigger {
     ch: usize,
     midi: u8,
     vel: f32,
     pan: f32,
     fine_pitch: f32,
+    cutoff: f32,
+    release_bias: f32,
     len_ticks: u32,
 }
 
 enum SongEvent {
-    NoteOn {
-        ch: usize,
-        midi: u8,
-        vel: f32,
-        pan: f32,
-        fine_pitch: f32,
-        len_ticks: u32,
-    },
+    NoteOn(NoteTrigger),
+    Slide(NoteTrigger),
     Click {
         accent: bool,
     },
@@ -509,22 +554,7 @@ pub struct EngineRt {
 
 impl EngineRt {
     pub fn new(sr: f32) -> Self {
-        let pitch = shared(midi_hz(69.0_f32));
-        let gate = shared(0.0);
-        let cutoff = shared(2600.0);
-        let live_voice = VoiceRt {
-            unit: make_voice(LIVE_VOICE_SPEC, &pitch, &gate, &cutoff, sr as f64),
-            pitch,
-            gate,
-            cutoff,
-            vel: 1.0,
-            pan: 0.0,
-            cur_hz: midi_hz(69.0_f32),
-            target_hz: midi_hz(69.0_f32),
-            glide_rate: 1.0,
-            off: 0,
-            age: 0,
-        };
+        let live_voice = VoiceRt::new(LIVE_VOICE_SPEC, midi_hz(69.0_f32), 2600.0, sr as f64);
         let mut reverb: Box<dyn AudioUnit + Send> = Box::new(reverb_stereo(10.0, 2.5, 0.5));
         reverb.set_sample_rate(sr as f64);
         reverb.allocate();
@@ -676,23 +706,7 @@ impl EngineRt {
             let base_hz = midi_hz(ch.midi_base as f32);
             let mut pool = Vec::with_capacity(VOICES_PER_CH);
             for _ in 0..VOICES_PER_CH {
-                let pitch = shared(base_hz);
-                let gate = shared(0.0);
-                let cutoff = shared(ch.cutoff);
-                let unit = make_voice(spec, &pitch, &gate, &cutoff, self.sr as f64);
-                pool.push(VoiceRt {
-                    unit,
-                    pitch,
-                    gate,
-                    cutoff,
-                    vel: 1.0,
-                    pan: 0.0,
-                    cur_hz: base_hz,
-                    target_hz: base_hz,
-                    glide_rate: 1.0,
-                    off: 0,
-                    age: 0,
-                });
+                pool.push(VoiceRt::new(spec, base_hz, ch.cutoff, self.sr as f64));
             }
             self.voices.push(pool);
             self.voice_specs.push(spec);
@@ -725,6 +739,7 @@ impl EngineRt {
         for v in self.voices[idx].iter_mut() {
             v.unit = make_voice(spec, &v.pitch, &v.gate, &v.cutoff, self.sr as f64);
             v.cutoff.set_value(cutoff_val);
+            v.slide_rem = 0;
             v.off = 0;
         }
         if idx < self.voice_specs.len() {
@@ -769,6 +784,7 @@ impl EngineRt {
         self.live_voice.pitch.set_value(hz);
         self.live_voice.cur_hz = hz;
         self.live_voice.target_hz = hz;
+        self.live_voice.slide_rem = 0;
         self.live_voice.gate.set_value(1.0);
         self.live_off = (self.sr * 0.4) as usize;
     }
@@ -790,6 +806,7 @@ impl EngineRt {
                     v.cur_hz = hz;
                     v.target_hz = hz;
                     v.glide_rate = 1.0;
+                    v.slide_rem = 0;
                     v.gate.set_value(1.0);
                     v.vel = vel.clamp(0.05, 1.0);
                     v.pan = 0.0;
@@ -982,23 +999,11 @@ impl EngineRt {
             let now = self.sample_pos + i as u64;
             while ei < self.pending.len() && self.pending[ei].0 <= now {
                 match self.pending[ei].1 {
-                    SongEvent::NoteOn {
-                        ch,
-                        midi,
-                        vel,
-                        pan,
-                        fine_pitch,
-                        len_ticks,
-                    } => {
-                        let trig = NoteTrigger {
-                            ch,
-                            midi,
-                            vel,
-                            pan,
-                            fine_pitch,
-                            len_ticks,
-                        };
+                    SongEvent::NoteOn(trig) => {
                         self.fire_note(song, &trig, spt);
+                    }
+                    SongEvent::Slide(trig) => {
+                        self.fire_slide(song, &trig, spt);
                     }
                     SongEvent::Click { accent } => {
                         if self.metro_heads.len() < 8 {
@@ -1135,23 +1140,28 @@ impl EngineRt {
                 }
             }
             if let Some(notes) = pdata.notes.get(ci) {
-                for note in notes.iter().filter(|nn| nn.tick == in_pat) {
+                for note in notes.iter().filter(|nn| nn.tick == in_pat && !nn.mute) {
                     let mut at = tick_at;
                     if in_pat % 8 == 4 {
                         at += (song.swing.clamp(0.0, 0.75) as f64 * 2.0 * spt) as u64;
                     }
                     if self.pending.len() < PENDING_CAP {
-                        self.pending.push((
-                            at,
-                            SongEvent::NoteOn {
-                                ch: ci,
-                                midi: note.midi,
-                                vel: note.vel,
-                                pan: note.pan,
-                                fine_pitch: note.fine_pitch,
-                                len_ticks: note.len.max(1),
-                            },
-                        ));
+                        let trig = NoteTrigger {
+                            ch: ci,
+                            midi: note.midi,
+                            vel: note.vel,
+                            pan: note.pan,
+                            fine_pitch: note.fine_pitch,
+                            cutoff: note.cutoff,
+                            release_bias: note.release_bias,
+                            len_ticks: note.len.max(1),
+                        };
+                        let ev = if note.slide {
+                            SongEvent::Slide(trig)
+                        } else {
+                            SongEvent::NoteOn(trig)
+                        };
+                        self.pending.push((at, ev));
                     }
                 }
             }
@@ -1161,7 +1171,16 @@ impl EngineRt {
     fn tick_gates(&mut self) {
         for pool in self.voices.iter_mut() {
             for v in pool.iter_mut() {
-                if (v.cur_hz - v.target_hz).abs() > 0.01 {
+                if v.slide_rem > 0 && v.slide_tot > 0 {
+                    v.slide_rem -= 1;
+                    let frac = 1.0 - (v.slide_rem as f32 / v.slide_tot as f32);
+                    let start = v.slide_start_hz.max(20.0);
+                    let hz = (start * (v.target_hz / start).powf(frac)).clamp(20.0, 20000.0);
+                    v.cur_hz = hz;
+                    v.pitch.set_value(hz);
+                    v.vel = v.slide_vel_start + (v.slide_vel_target - v.slide_vel_start) * frac;
+                    v.pan = v.slide_pan_start + (v.slide_pan_target - v.slide_pan_start) * frac;
+                } else if (v.cur_hz - v.target_hz).abs() > 0.01 {
                     v.cur_hz += (v.target_hz - v.cur_hz) * v.glide_rate;
                     v.pitch.set_value(v.cur_hz);
                 }
@@ -1182,6 +1201,8 @@ impl EngineRt {
             vel,
             pan,
             fine_pitch,
+            cutoff,
+            release_bias,
             len_ticks,
         } = *trig;
         let Some(channel) = song.channels.get(ch) else {
@@ -1203,6 +1224,7 @@ impl EngineRt {
                     if let Some(pool) = self.voices.get_mut(cj) {
                         for v in pool.iter_mut() {
                             v.gate.set_value(0.0);
+                            v.slide_rem = 0;
                             v.off = 0;
                         }
                     }
@@ -1217,6 +1239,13 @@ impl EngineRt {
 
         let off = ((len_ticks as f64 * spt) as usize).max(1);
         let pitch_midi = (midi as f32 + fine_pitch).clamp(0.0, 127.0);
+        let cutoff_mul = 2.0_f32.powf((cutoff.clamp(0.0, 1.0) - 0.5) * 4.0);
+        let rel_mul = 2.0_f32.powf((release_bias.clamp(0.0, 1.0) - 0.5) * 2.0);
+        let base_cut = self
+            .auto_cut
+            .get(ch)
+            .and_then(|x| *x)
+            .unwrap_or(channel.cutoff);
         let poly = channel.polyphony;
         let porta = channel.portamento;
         let base_midi = channel.midi_base;
@@ -1239,10 +1268,19 @@ impl EngineRt {
                         v.cur_hz = start_hz;
                         v.target_hz = target_hz;
                         v.glide_rate = glide;
+                        v.slide_rem = 0;
+                        v.slide_tot = 0;
+                        v.slide_start_hz = start_hz;
                         v.pitch.set_value(start_hz);
+                        v.cutoff
+                            .set_value((base_cut * cutoff_mul).clamp(40.0, 18000.0));
                         v.gate.set_value(1.0);
                         v.vel = vel.clamp(0.05, 1.0);
                         v.pan = pan.clamp(-1.0, 1.0);
+                        v.slide_vel_start = v.vel;
+                        v.slide_vel_target = v.vel;
+                        v.slide_pan_start = v.pan;
+                        v.slide_pan_target = v.pan;
                         v.off = off;
                     }
                     if ch < self.channel_last_hz.len() {
@@ -1255,6 +1293,8 @@ impl EngineRt {
                 let mut head =
                     PlayHead::new(PlayKind::Kit(piece), Some(ch), ratio, vel, usize::MAX);
                 head.pan = pan.clamp(-1.0, 1.0);
+                head.cutoff_mul = cutoff_mul;
+                head.rel_mul = rel_mul;
                 self.push_playhead(head);
             }
             ChannelKind::Sampler { sample } => {
@@ -1262,9 +1302,52 @@ impl EngineRt {
                     let ratio = 2.0_f32.powf((pitch_midi - base_midi as f32) / 12.0);
                     let mut head = PlayHead::new(PlayKind::Sample(idx), Some(ch), ratio, vel, off);
                     head.pan = pan.clamp(-1.0, 1.0);
+                    head.cutoff_mul = cutoff_mul;
+                    head.rel_mul = rel_mul;
                     self.push_playhead(head);
                 }
             }
+        }
+    }
+
+    fn fire_slide(&mut self, song: &Song, trig: &NoteTrigger, spt: f64) {
+        let Some(channel) = song.channels.get(trig.ch) else {
+            return;
+        };
+        let solo_any = song.channels.iter().any(|c| c.solo);
+        if (solo_any && !channel.solo) || (!solo_any && channel.mute) {
+            return;
+        }
+        let dur_samples = ((trig.len_ticks.max(1) as f64 * spt) as usize).max(1);
+        let pitch_midi = (trig.midi as f32 + trig.fine_pitch).clamp(0.0, 127.0);
+        match channel.kind {
+            ChannelKind::Synth { .. } => {
+                let target_hz = midi_hz(pitch_midi);
+                if let Some(pool) = self.voices.get_mut(trig.ch) {
+                    for v in pool.iter_mut().filter(|v| v.off > 0) {
+                        v.slide_start_hz = v.cur_hz.max(20.0);
+                        v.target_hz = target_hz;
+                        v.slide_vel_start = v.vel;
+                        v.slide_vel_target = trig.vel.clamp(0.05, 1.0);
+                        v.slide_pan_start = v.pan;
+                        v.slide_pan_target = trig.pan.clamp(-1.0, 1.0);
+                        v.slide_tot = dur_samples;
+                        v.slide_rem = dur_samples;
+                    }
+                }
+            }
+            ChannelKind::Sampler { .. } => {
+                let target_ratio = 2.0_f32.powf((pitch_midi - channel.midi_base as f32) / 12.0);
+                for h in self.playheads.iter_mut() {
+                    if h.ch == Some(trig.ch) && h.env_sample < h.gate_off {
+                        h.slide_start_ratio = h.pitch_ratio.max(0.05);
+                        h.slide_target_ratio = target_ratio;
+                        h.slide_tot = dur_samples;
+                        h.slide_rem = dur_samples;
+                    }
+                }
+            }
+            ChannelKind::Kit { .. } => {}
         }
     }
 
@@ -1327,6 +1410,12 @@ impl EngineRt {
                 if !sr_ok || (h.pos as usize) >= data.len() || past_end {
                     done = true;
                 } else {
+                    if h.slide_rem > 0 && h.slide_tot > 0 {
+                        h.slide_rem -= 1;
+                        let frac = 1.0 - (h.slide_rem as f32 / h.slide_tot as f32);
+                        let start = h.slide_start_ratio.max(0.05);
+                        h.pitch_ratio = start * (h.slide_target_ratio / start).powf(frac);
+                    }
                     let p0 = h.pos as usize;
                     let frac = h.pos - p0 as f32;
                     let v0 = data[p0];
@@ -1340,7 +1429,8 @@ impl EngineRt {
                             .auto_cut
                             .get(ci)
                             .and_then(|x| *x)
-                            .unwrap_or(channel.cutoff);
+                            .unwrap_or(channel.cutoff)
+                            * h.cutoff_mul;
                         let alpha = (2.0 * std::f32::consts::PI * cut.clamp(40.0, 18000.0) / sr)
                             .clamp(0.01, 0.99);
                         h.lp_z += alpha * (v - h.lp_z);
@@ -2449,5 +2539,46 @@ mod tests {
             rt.mix_peaks[1],
             rt.mix_peaks[5]
         );
+    }
+
+    #[test]
+    fn slide_note_glides_active_synth_pitch() {
+        let mut song = crate::song::new_empty();
+        // Sustain C4 (MIDI 60) for 16 ticks, and glide up to C5 (MIDI 72) over ticks 4..12.
+        song.patterns[0].notes[4].push(crate::song::Note::new(0, 16, 60, 0.9));
+        let mut slide = crate::song::Note::new(4, 8, 72, 0.9);
+        slide.slide = true;
+        song.patterns[0].notes[4].push(slide);
+        let mut rt = EngineRt::new(44100.0);
+        rt.playing = true;
+        // At 128 BPM (~1292 samples/tick), ticks 0..14 take ~18088 samples.
+        let mut l = vec![0.0; 18500];
+        let mut r = vec![0.0; 18500];
+        rt.process(&song, &mut l, &mut r);
+        let c5_hz = midi_hz(72.0);
+        let active_cur = rt.voices[4]
+            .iter()
+            .find(|v| v.off > 0)
+            .map(|v| v.cur_hz)
+            .expect("synth note should still be sustaining at tick 14");
+        assert!(
+            (active_cur - c5_hz).abs() < 5.0,
+            "expected glide to reach C5 ({c5_hz:.1} Hz), got {active_cur:.1} Hz"
+        );
+    }
+
+    #[test]
+    fn muted_note_produces_no_audio() {
+        let mut song = crate::song::new_empty();
+        let mut muted = crate::song::Note::new(0, 8, 60, 1.0);
+        muted.mute = true;
+        song.patterns[0].notes[4].push(muted);
+        let mut rt = EngineRt::new(44100.0);
+        rt.playing = true;
+        let mut l = vec![0.0; 4096];
+        let mut r = vec![0.0; 4096];
+        rt.process(&song, &mut l, &mut r);
+        let peak = l.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(peak < 1e-6, "muted note must emit zero audio, got {peak}");
     }
 }

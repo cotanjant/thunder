@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub const TICKS_PER_STEP: u32 = 4; // 64th-note resolution
-pub const STEPS: usize = 16;
 pub const TICKS_PATTERN: u32 = 64; // one 4/4 bar
 pub const N_PATTERNS: usize = 8;
 pub const DEFAULT_MIXER_INSERTS: usize = 16;
@@ -120,6 +119,10 @@ impl PartialEq for SampleRef {
     }
 }
 
+fn default_note_mid() -> f32 {
+    0.5
+}
+
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub tick: u32,
@@ -130,6 +133,14 @@ pub struct Note {
     pub pan: f32,
     #[serde(default)]
     pub fine_pitch: f32,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub slide: bool,
+    #[serde(default = "default_note_mid")]
+    pub cutoff: f32,
+    #[serde(default = "default_note_mid")]
+    pub release_bias: f32,
 }
 
 impl Note {
@@ -141,6 +152,10 @@ impl Note {
             vel: vel.clamp(0.05, 1.0),
             pan: 0.0,
             fine_pitch: 0.0,
+            mute: false,
+            slide: false,
+            cutoff: 0.5,
+            release_bias: 0.5,
         }
     }
 
@@ -1251,76 +1266,568 @@ pub fn eval_auto_clip(points: &[AutoClipPoint], t_local: f32) -> Option<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Note editing tools (pure functions, unit-testable)
+// Piano Roll scales, chords, snap grids, and note tools
 // ---------------------------------------------------------------------------
 
-pub fn tool_quantize_in(notes: &mut [Note], grid: u32, max_ticks: u32) {
-    let grid = grid.max(1);
-    for n in notes.iter_mut() {
-        n.tick = (n.tick + grid / 2) / grid * grid;
-        n.tick = n.tick.min(max_ticks.saturating_sub(1));
-    }
-    notes.sort_by_key(|n| n.tick);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScaleKind {
+    Chromatic,
+    Major,
+    Minor,
+    HarmonicMinor,
+    MelodicMinor,
+    Dorian,
+    Phrygian,
+    Lydian,
+    Mixolydian,
+    PentMaj,
+    PentMin,
+    Blues,
 }
 
-pub fn tool_humanize_in(notes: &mut [Note], seed: u64, max_ticks: u32) {
-    let mut x = seed | 1;
-    let mut rnd = move || {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(37);
-        (x >> 33) as u32
-    };
-    let cap = max_ticks.saturating_sub(1) as i32;
-    for n in notes.iter_mut() {
-        let dt = (rnd() % 5) as i32 - 2;
-        n.tick = (n.tick as i32 + dt).clamp(0, cap) as u32;
-        let dv = ((rnd() % 17) as f32 - 8.0) / 100.0;
-        n.vel = (n.vel + dv).clamp(0.05, 1.0);
-    }
-    notes.sort_by_key(|n| n.tick);
-}
+impl ScaleKind {
+    pub const ALL: [ScaleKind; 12] = [
+        ScaleKind::Chromatic,
+        ScaleKind::Major,
+        ScaleKind::Minor,
+        ScaleKind::HarmonicMinor,
+        ScaleKind::MelodicMinor,
+        ScaleKind::Dorian,
+        ScaleKind::Phrygian,
+        ScaleKind::Lydian,
+        ScaleKind::Mixolydian,
+        ScaleKind::PentMaj,
+        ScaleKind::PentMin,
+        ScaleKind::Blues,
+    ];
 
-/// Spread chord clusters (notes within 2 ticks) by `amount` ticks each.
-pub fn tool_strum_in(notes: &mut [Note], amount: u32, max_ticks: u32) {
-    notes.sort_by_key(|n| n.tick);
-    let mut i = 0;
-    let cap = max_ticks.saturating_sub(1);
-    while i < notes.len() {
-        let t = notes[i].tick;
-        let mut j = i;
-        while j < notes.len() && notes[j].tick.saturating_sub(t) <= 2 {
-            j += 1;
+    pub fn name(&self) -> &'static str {
+        match self {
+            ScaleKind::Chromatic => "Chromatic",
+            ScaleKind::Major => "Major",
+            ScaleKind::Minor => "Natural Minor",
+            ScaleKind::HarmonicMinor => "Harmonic Minor",
+            ScaleKind::MelodicMinor => "Melodic Minor",
+            ScaleKind::Dorian => "Dorian",
+            ScaleKind::Phrygian => "Phrygian",
+            ScaleKind::Lydian => "Lydian",
+            ScaleKind::Mixolydian => "Mixolydian",
+            ScaleKind::PentMaj => "Pent Maj",
+            ScaleKind::PentMin => "Pent Min",
+            ScaleKind::Blues => "Blues",
         }
-        for (k, n) in notes[i..j].iter_mut().enumerate() {
-            n.tick = (t + k as u32 * amount).min(cap);
+    }
+
+    pub fn contains(&self, pc: u8, root: u8) -> bool {
+        let rel = (12 + pc as i32 - (root % 12) as i32) % 12;
+        match self {
+            ScaleKind::Chromatic => true,
+            ScaleKind::Major => matches!(rel, 0 | 2 | 4 | 5 | 7 | 9 | 11),
+            ScaleKind::Minor => matches!(rel, 0 | 2 | 3 | 5 | 7 | 8 | 10),
+            ScaleKind::HarmonicMinor => matches!(rel, 0 | 2 | 3 | 5 | 7 | 8 | 11),
+            ScaleKind::MelodicMinor => matches!(rel, 0 | 2 | 3 | 5 | 7 | 9 | 11),
+            ScaleKind::Dorian => matches!(rel, 0 | 2 | 3 | 5 | 7 | 9 | 10),
+            ScaleKind::Phrygian => matches!(rel, 0 | 1 | 3 | 5 | 7 | 8 | 10),
+            ScaleKind::Lydian => matches!(rel, 0 | 2 | 4 | 6 | 7 | 9 | 11),
+            ScaleKind::Mixolydian => matches!(rel, 0 | 2 | 4 | 5 | 7 | 9 | 10),
+            ScaleKind::PentMaj => matches!(rel, 0 | 2 | 4 | 7 | 9),
+            ScaleKind::PentMin => matches!(rel, 0 | 3 | 5 | 7 | 10),
+            ScaleKind::Blues => matches!(rel, 0 | 3 | 5 | 6 | 7 | 10),
         }
-        i = j.max(i + 1);
+    }
+
+    pub fn snap_midi(&self, midi: u8, root: u8) -> u8 {
+        if *self == ScaleKind::Chromatic {
+            return midi;
+        }
+        let mut m = midi;
+        for _ in 0..12 {
+            if self.contains(m % 12, root) {
+                return m;
+            }
+            m = m.saturating_sub(1).max(21);
+        }
+        midi
     }
 }
 
-/// Rewrite notes as an ascending 16th-note arpeggio cycling their pitches.
-pub fn tool_arpeggiate(notes: &mut Vec<Note>) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChordKind {
+    Off,
+    Maj,
+    Min,
+    Dim,
+    Aug,
+    Sus2,
+    Sus4,
+    Maj7,
+    Min7,
+    Dom7,
+    Maj9,
+}
+
+impl ChordKind {
+    pub const ALL: [ChordKind; 11] = [
+        ChordKind::Off,
+        ChordKind::Maj,
+        ChordKind::Min,
+        ChordKind::Dim,
+        ChordKind::Aug,
+        ChordKind::Sus2,
+        ChordKind::Sus4,
+        ChordKind::Maj7,
+        ChordKind::Min7,
+        ChordKind::Dom7,
+        ChordKind::Maj9,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            ChordKind::Off => "Off",
+            ChordKind::Maj => "Maj",
+            ChordKind::Min => "Min",
+            ChordKind::Dim => "Dim",
+            ChordKind::Aug => "Aug",
+            ChordKind::Sus2 => "Sus2",
+            ChordKind::Sus4 => "Sus4",
+            ChordKind::Maj7 => "Maj7",
+            ChordKind::Min7 => "Min7",
+            ChordKind::Dom7 => "Dom7",
+            ChordKind::Maj9 => "Maj9",
+        }
+    }
+
+    pub fn intervals(&self) -> &'static [u8] {
+        match self {
+            ChordKind::Off => &[0],
+            ChordKind::Maj => &[0, 4, 7],
+            ChordKind::Min => &[0, 3, 7],
+            ChordKind::Dim => &[0, 3, 6],
+            ChordKind::Aug => &[0, 4, 8],
+            ChordKind::Sus2 => &[0, 2, 7],
+            ChordKind::Sus4 => &[0, 5, 7],
+            ChordKind::Maj7 => &[0, 4, 7, 11],
+            ChordKind::Min7 => &[0, 3, 7, 10],
+            ChordKind::Dom7 => &[0, 4, 7, 10],
+            ChordKind::Maj9 => &[0, 4, 7, 11, 14],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapGrid {
+    Line,
+    Cell,
+    S1_64,
+    S1_32,
+    S1_16,
+    S1_8,
+    S1_4,
+    TripletBeat,
+    TripletStep,
+    None,
+}
+
+impl SnapGrid {
+    pub const ALL: [SnapGrid; 10] = [
+        SnapGrid::Line,
+        SnapGrid::Cell,
+        SnapGrid::S1_64,
+        SnapGrid::S1_32,
+        SnapGrid::S1_16,
+        SnapGrid::S1_8,
+        SnapGrid::S1_4,
+        SnapGrid::TripletBeat,
+        SnapGrid::TripletStep,
+        SnapGrid::None,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            SnapGrid::Line => "Line",
+            SnapGrid::Cell => "Cell",
+            SnapGrid::S1_64 => "1/64 (1/4 step)",
+            SnapGrid::S1_32 => "1/32 (1/2 step)",
+            SnapGrid::S1_16 => "1/16 (Step)",
+            SnapGrid::S1_8 => "1/8 (1/2 beat)",
+            SnapGrid::S1_4 => "1/4 (Beat)",
+            SnapGrid::TripletBeat => "1/3 Beat",
+            SnapGrid::TripletStep => "1/3 Step",
+            SnapGrid::None => "(none)",
+        }
+    }
+
+    pub fn step_ticks(&self, cell_w: f32) -> f32 {
+        match self {
+            SnapGrid::Line => 4.0,
+            SnapGrid::Cell => {
+                if cell_w >= 26.0 {
+                    1.0
+                } else if cell_w >= 14.0 {
+                    2.0
+                } else {
+                    4.0
+                }
+            }
+            SnapGrid::S1_64 | SnapGrid::None => 1.0,
+            SnapGrid::S1_32 => 2.0,
+            SnapGrid::S1_16 => 4.0,
+            SnapGrid::S1_8 => 8.0,
+            SnapGrid::S1_4 => 16.0,
+            SnapGrid::TripletBeat => 16.0 / 3.0,
+            SnapGrid::TripletStep => 4.0 / 3.0,
+        }
+    }
+
+    pub fn snap_floor(&self, tick_f: f32, cell_w: f32, max_ticks: u32) -> u32 {
+        let cap = max_ticks.saturating_sub(1);
+        if *self == SnapGrid::None {
+            return (tick_f.floor() as i32).clamp(0, cap as i32) as u32;
+        }
+        let step = self.step_ticks(cell_w).max(1.0);
+        let q = ((tick_f / step).floor() * step).round() as i32;
+        q.clamp(0, cap as i32) as u32
+    }
+
+    pub fn snap_nearest(&self, tick_f: f32, cell_w: f32, max_ticks: u32) -> u32 {
+        let cap = max_ticks.saturating_sub(1);
+        if *self == SnapGrid::None {
+            return (tick_f.round() as i32).clamp(0, cap as i32) as u32;
+        }
+        let step = self.step_ticks(cell_w).max(1.0);
+        let q = ((tick_f / step).round() * step).round() as i32;
+        q.clamp(0, cap as i32) as u32
+    }
+
+    pub fn default_len(&self, cell_w: f32) -> u32 {
+        match self {
+            SnapGrid::None => TICKS_PER_STEP,
+            _ => (self.step_ticks(cell_w).round() as u32).max(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArpDir {
+    Up,
+    Down,
+    UpDown,
+}
+
+#[derive(Clone, Copy)]
+pub struct QuantizeCfg {
+    pub grid: f32,
+    pub strength: f32,
+    pub swing: f32,
+    pub max_ticks: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct StrumCfg {
+    pub amount: u32,
+    pub vel_slope: f32,
+    pub preserve_end: bool,
+    pub max_ticks: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct ArpCfg {
+    pub step_ticks: u32,
+    pub gate: f32,
+    pub octaves: u8,
+    pub dir: ArpDir,
+    pub max_ticks: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct RandCfg {
+    pub seed: u64,
+    pub pitch_range: i8,
+    pub vel_amt: f32,
+    pub pan_amt: f32,
+}
+
+fn target_mask(len: usize, sel: &[usize]) -> Vec<bool> {
+    if sel.is_empty() {
+        vec![true; len]
+    } else {
+        let mut mask = vec![false; len];
+        for &idx in sel {
+            if idx < len {
+                mask[idx] = true;
+            }
+        }
+        mask
+    }
+}
+
+pub fn tool_quantize_opts(notes: &mut [Note], sel: &[usize], cfg: &QuantizeCfg) {
+    let grid = cfg.grid.max(1.0);
+    let strength = cfg.strength.clamp(0.0, 1.0);
+    let swing = cfg.swing.clamp(0.0, 0.75);
+    let cap = cfg.max_ticks.saturating_sub(1);
+    let mask = target_mask(notes.len(), sel);
+    for (idx, n) in notes.iter_mut().enumerate() {
+        if !mask[idx] {
+            continue;
+        }
+        let step_idx = (n.tick as f32 / grid).round();
+        let mut target = step_idx * grid;
+        if (step_idx as i32).rem_euclid(2) == 1 {
+            target += swing * grid * 0.5;
+        }
+        let blended = n.tick as f32 + (target - n.tick as f32) * strength;
+        n.tick = (blended.round() as i32).clamp(0, cap as i32) as u32;
+    }
+}
+
+pub fn tool_strum_opts(notes: &mut [Note], sel: &[usize], cfg: &StrumCfg) {
+    let mask = target_mask(notes.len(), sel);
+    let mut order: Vec<usize> = (0..notes.len()).filter(|&i| mask[i]).collect();
+    order.sort_by_key(|&i| (notes[i].tick, notes[i].midi));
+    let cap = cfg.max_ticks.saturating_sub(1);
+    let mut pos = 0usize;
+    while pos < order.len() {
+        let t0 = notes[order[pos]].tick;
+        let mut end = pos;
+        while end < order.len() && notes[order[end]].tick.saturating_sub(t0) <= 2 {
+            end += 1;
+        }
+        let cluster = &order[pos..end];
+        let denom = (cluster.len().saturating_sub(1)).max(1) as f32;
+        for (k, &ni) in cluster.iter().enumerate() {
+            let n = &mut notes[ni];
+            let old_end = n.tick.saturating_add(n.len);
+            let new_t = (t0 + k as u32 * cfg.amount).min(cap);
+            n.tick = new_t;
+            if cfg.preserve_end {
+                n.len = old_end.saturating_sub(new_t).max(1);
+            }
+            let frac = k as f32 / denom;
+            n.vel = (n.vel + (frac - 0.5) * cfg.vel_slope * 0.5).clamp(0.05, 1.0);
+        }
+        pos = end.max(pos + 1);
+    }
+}
+
+pub fn tool_flam(notes: &mut Vec<Note>, sel: &[usize], lead_ticks: u32, vel_scale: f32) {
+    let lead = lead_ticks.max(1);
+    let scale = vel_scale.clamp(0.1, 1.0);
+    let mask = target_mask(notes.len(), sel);
+    let mut extra = Vec::new();
+    for (idx, n) in notes.iter().enumerate() {
+        if !mask[idx] {
+            continue;
+        }
+        let mut grace = *n;
+        grace.tick = n.tick.saturating_sub(lead);
+        grace.len = (n.tick - grace.tick).max(1).min(lead);
+        grace.vel = (n.vel * scale).clamp(0.05, 1.0);
+        if grace.tick < n.tick {
+            extra.push(grace);
+        }
+    }
+    notes.extend(extra);
+    notes.sort_by_key(|n| n.tick);
+}
+
+pub fn tool_riff_arp(notes: &mut Vec<Note>, cfg: &ArpCfg) {
     if notes.is_empty() {
         return;
     }
-    let mut pitches: Vec<u8> = notes.iter().map(|n| n.midi).collect();
-    pitches.sort_unstable();
-    pitches.dedup();
+    let mut base: Vec<u8> = notes.iter().map(|n| n.midi).collect();
+    base.sort_unstable();
+    base.dedup();
+    let octs = cfg.octaves.clamp(1, 3);
+    let mut seq = Vec::new();
+    for o in 0..octs {
+        for &m in &base {
+            let shifted = m.saturating_add(o * 12);
+            if shifted <= 108 {
+                seq.push(shifted);
+            }
+        }
+    }
+    if seq.is_empty() {
+        return;
+    }
+    match cfg.dir {
+        ArpDir::Up => {}
+        ArpDir::Down => seq.reverse(),
+        ArpDir::UpDown if seq.len() > 2 => {
+            let mut down = seq[1..seq.len() - 1].to_vec();
+            down.reverse();
+            seq.extend(down);
+        }
+        ArpDir::UpDown => {}
+    }
+    let step = cfg.step_ticks.max(1);
+    let gate_len = ((step as f32 * cfg.gate.clamp(0.1, 1.5)).round() as u32).max(1);
+    let max_t = cfg.max_ticks.max(step);
+    let count = (max_t / step).max(1) as usize;
     notes.clear();
-    for (i, p) in pitches.iter().cycle().take(STEPS).enumerate() {
-        notes.push(Note::new(
-            i as u32 * TICKS_PER_STEP,
-            TICKS_PER_STEP,
-            *p,
-            0.85,
-        ));
+    for (i, &midi) in seq.iter().cycle().take(count).enumerate() {
+        notes.push(Note::new(i as u32 * step, gate_len, midi, 0.85));
     }
 }
 
-pub fn tool_chord(tick: u32, root: u8, minor: bool) -> Vec<Note> {
-    let third = if minor { 3 } else { 4 };
-    [0, third, 7]
+pub fn tool_randomize(notes: &mut [Note], sel: &[usize], cfg: &RandCfg) {
+    let mut x = cfg.seed | 1;
+    let mut rnd_unit = move || {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(37);
+        ((x >> 33) as f32 / (u32::MAX as f32 * 0.5)) - 1.0
+    };
+    let mask = target_mask(notes.len(), sel);
+    for (idx, n) in notes.iter_mut().enumerate() {
+        if !mask[idx] {
+            continue;
+        }
+        if cfg.pitch_range > 0 {
+            let dp = (rnd_unit() * cfg.pitch_range as f32).round() as i32;
+            n.midi = (n.midi as i32 + dp).clamp(21, 108) as u8;
+        }
+        if cfg.vel_amt > 0.0 {
+            n.vel = (n.vel + rnd_unit() * cfg.vel_amt).clamp(0.05, 1.0);
+        }
+        if cfg.pan_amt > 0.0 {
+            n.pan = (n.pan + rnd_unit() * cfg.pan_amt).clamp(-1.0, 1.0);
+        }
+    }
+}
+
+pub fn tool_flip(notes: &mut [Note], sel: &[usize], horizontal: bool, vertical: bool) {
+    let mask = target_mask(notes.len(), sel);
+    let mut min_t = u32::MAX;
+    let mut max_end = 0u32;
+    let mut min_m = u8::MAX;
+    let mut max_m = 0u8;
+    for (idx, n) in notes.iter().enumerate() {
+        if mask[idx] {
+            min_t = min_t.min(n.tick);
+            max_end = max_end.max(n.tick.saturating_add(n.len));
+            min_m = min_m.min(n.midi);
+            max_m = max_m.max(n.midi);
+        }
+    }
+    if min_t == u32::MAX {
+        return;
+    }
+    for (idx, n) in notes.iter_mut().enumerate() {
+        if !mask[idx] {
+            continue;
+        }
+        if horizontal {
+            let end = n.tick.saturating_add(n.len);
+            n.tick = min_t + max_end.saturating_sub(end);
+        }
+        if vertical {
+            let flipped = min_m as i32 + max_m as i32 - n.midi as i32;
+            n.midi = flipped.clamp(21, 108) as u8;
+        }
+    }
+}
+
+/// FL Ctrl+L Quick Legato: extend each selected note to touch the next note start.
+pub fn tool_legato(notes: &mut [Note], sel: &[usize], max_ticks: u32) {
+    let mask = target_mask(notes.len(), sel);
+    let mut order: Vec<usize> = (0..notes.len()).filter(|&i| mask[i]).collect();
+    order.sort_by_key(|&i| notes[i].tick);
+    for w in order.windows(2) {
+        let cur = w[0];
+        let next_tick = notes[w[1]].tick;
+        if next_tick > notes[cur].tick {
+            notes[cur].len = (next_tick - notes[cur].tick).max(1);
+        }
+    }
+    if let Some(&last) = order.last()
+        && max_ticks > notes[last].tick
+    {
+        notes[last].len = notes[last].len.max(max_ticks - notes[last].tick);
+    }
+}
+
+/// Split note(s) crossing `tick` into two consecutive notes.
+pub fn tool_slice_at(notes: &mut Vec<Note>, tick: u32, midi_filter: Option<u8>) -> bool {
+    let mut added = Vec::new();
+    for n in notes.iter_mut() {
+        if let Some(m) = midi_filter
+            && n.midi != m
+        {
+            continue;
+        }
+        let end = n.tick.saturating_add(n.len);
+        if n.tick < tick && end > tick {
+            let left_len = tick - n.tick;
+            let right_len = end - tick;
+            n.len = left_len;
+            let mut right = *n;
+            right.tick = tick;
+            right.len = right_len;
+            added.push(right);
+        }
+    }
+    if added.is_empty() {
+        return false;
+    }
+    notes.extend(added);
+    notes.sort_by_key(|n| n.tick);
+    true
+}
+
+/// FL Ctrl+B: duplicate selected notes (or all notes) immediately after selection end.
+pub fn tool_duplicate_after(notes: &mut Vec<Note>, sel: &[usize], max_ticks: u32) -> Vec<usize> {
+    let mask = target_mask(notes.len(), sel);
+    let mut min_t = u32::MAX;
+    let mut max_end = 0u32;
+    for (idx, n) in notes.iter().enumerate() {
+        if mask[idx] {
+            min_t = min_t.min(n.tick);
+            max_end = max_end.max(n.tick.saturating_add(n.len));
+        }
+    }
+    if min_t == u32::MAX || max_end <= min_t {
+        return Vec::new();
+    }
+    let span = max_end - min_t;
+    let mut cloned = Vec::new();
+    for (idx, n) in notes.iter().enumerate() {
+        if mask[idx] {
+            let mut c = *n;
+            let nt = c.tick.saturating_add(span);
+            if nt < max_ticks {
+                c.tick = nt;
+                c.len = c.len.min(max_ticks - nt).max(1);
+                cloned.push(c);
+            }
+        }
+    }
+    let base = notes.len();
+    let count = cloned.len();
+    notes.extend(cloned);
+    (base..base + count).collect()
+}
+
+pub fn tool_chord_ext(
+    tick: u32,
+    root: u8,
+    kind: ChordKind,
+    inversion: u8,
+    len: u32,
+    max_ticks: u32,
+) -> Vec<Note> {
+    let mut pitches: Vec<u8> = kind
+        .intervals()
         .iter()
-        .map(|iv| Note::new(tick, TICKS_PER_STEP * 4, root.saturating_add(*iv), 0.85))
+        .map(|iv| root.saturating_add(*iv).min(108))
+        .collect();
+    let inv = (inversion as usize).min(pitches.len().saturating_sub(1));
+    for p in pitches.iter_mut().take(inv) {
+        *p = p.saturating_add(12).min(108);
+    }
+    pitches.sort_unstable();
+    pitches
+        .into_iter()
+        .map(|m| Note::new_in(tick, len.max(1), m, 0.85, max_ticks))
         .collect()
 }
 
@@ -1588,7 +2095,16 @@ mod tests {
     #[test]
     fn quantize_snaps_to_grid() {
         let mut notes = vec![Note::new(5, 4, 60, 0.9), Note::new(13, 4, 62, 0.9)];
-        tool_quantize_in(&mut notes, 4, TICKS_PATTERN);
+        tool_quantize_opts(
+            &mut notes,
+            &[],
+            &QuantizeCfg {
+                grid: 4.0,
+                strength: 1.0,
+                swing: 0.0,
+                max_ticks: TICKS_PATTERN,
+            },
+        );
         assert_eq!(notes[0].tick, 4);
         assert_eq!(notes[1].tick, 12);
     }
@@ -1729,8 +2245,17 @@ mod tests {
     #[test]
     fn arp_produces_16_steps() {
         let mut notes = vec![Note::new(0, 4, 60, 0.9), Note::new(16, 4, 67, 0.9)];
-        tool_arpeggiate(&mut notes);
-        assert_eq!(notes.len(), STEPS);
+        tool_riff_arp(
+            &mut notes,
+            &ArpCfg {
+                step_ticks: TICKS_PER_STEP,
+                gate: 0.9,
+                octaves: 1,
+                dir: ArpDir::Up,
+                max_ticks: TICKS_PATTERN,
+            },
+        );
+        assert_eq!(notes.len(), 16);
         assert!(notes.windows(2).all(|w| w[0].tick <= w[1].tick));
     }
 
@@ -1742,19 +2267,28 @@ mod tests {
             Note::new(8, 4, 67, 0.9),
             Note::new(24, 4, 69, 0.9),
         ];
-        tool_strum_in(&mut notes, 2, TICKS_PATTERN);
+        tool_strum_opts(
+            &mut notes,
+            &[],
+            &StrumCfg {
+                amount: 2,
+                vel_slope: 0.0,
+                preserve_end: false,
+                max_ticks: TICKS_PATTERN,
+            },
+        );
         let starts: Vec<u32> = notes.iter().map(|n| n.tick).collect();
         assert_eq!(starts, vec![8, 10, 12, 24]);
     }
 
     #[test]
     fn chord_builds_triad() {
-        let maj = tool_chord(0, 60, false);
+        let maj = tool_chord_ext(0, 60, ChordKind::Maj, 0, TICKS_PER_STEP, TICKS_PATTERN);
         assert_eq!(
             maj.iter().map(|n| n.midi).collect::<Vec<_>>(),
             vec![60, 64, 67]
         );
-        let min = tool_chord(0, 60, true);
+        let min = tool_chord_ext(0, 60, ChordKind::Min, 0, TICKS_PER_STEP, TICKS_PATTERN);
         assert_eq!(
             min.iter().map(|n| n.midi).collect::<Vec<_>>(),
             vec![60, 63, 67]
@@ -1764,7 +2298,16 @@ mod tests {
     #[test]
     fn humanize_keeps_shape() {
         let mut notes = vec![Note::new(16, 4, 60, 0.9), Note::new(32, 4, 64, 0.9)];
-        tool_humanize_in(&mut notes, 12345, TICKS_PATTERN);
+        tool_randomize(
+            &mut notes,
+            &[],
+            &RandCfg {
+                seed: 12345,
+                pitch_range: 0,
+                vel_amt: 0.15,
+                pan_amt: 0.1,
+            },
+        );
         assert_eq!(notes.len(), 2);
         for n in &notes {
             assert!(n.tick < TICKS_PATTERN);
@@ -1784,5 +2327,40 @@ mod tests {
 
         let copy = song.clone();
         assert!(Arc::ptr_eq(&song.samples[0].data, &copy.samples[0].data));
+    }
+
+    #[test]
+    fn piano_roll_tools_legato_slice_duplicate_flip_chord() {
+        let mut notes = vec![Note::new(0, 4, 60, 0.9), Note::new(16, 4, 64, 0.8)];
+        tool_legato(&mut notes, &[0, 1], 64);
+        assert_eq!(notes[0].len, 16);
+        assert_eq!(notes[1].len, 48);
+
+        assert!(tool_slice_at(&mut notes, 8, None));
+        assert_eq!(notes.len(), 3);
+        assert_eq!((notes[0].tick, notes[0].len), (0, 8));
+        assert_eq!((notes[1].tick, notes[1].len), (8, 8));
+
+        let dup_idx = tool_duplicate_after(&mut notes, &[0], 64);
+        assert_eq!(dup_idx, vec![3]);
+        assert_eq!(notes[3].tick, 8);
+
+        tool_flip(&mut notes, &[0, 2], true, true);
+        assert_eq!(notes[0].midi, 64);
+        assert_eq!(notes[2].midi, 60);
+
+        let inv = tool_chord_ext(0, 60, ChordKind::Maj7, 1, 8, 64);
+        assert_eq!(
+            inv.iter().map(|n| n.midi).collect::<Vec<_>>(),
+            vec![64, 67, 71, 72]
+        );
+        assert!(ScaleKind::Blues.contains(6, 0));
+        assert!(!ScaleKind::Dorian.contains(1, 0));
+
+        let mut fl = vec![Note::new(8, 4, 60, 0.9)];
+        tool_flam(&mut fl, &[], 2, 0.5);
+        assert_eq!(fl.len(), 2);
+        assert_eq!(fl[0].tick, 6);
+        assert!((fl[0].vel - 0.45).abs() < 1e-4);
     }
 }
