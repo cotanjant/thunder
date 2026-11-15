@@ -9,6 +9,7 @@ mod engine;
 mod export;
 mod fx;
 mod midi;
+mod project;
 mod song;
 mod synth;
 mod ui;
@@ -83,148 +84,47 @@ impl eframe::App for DawApp {
         }
         let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
         self.ui.record_song(&self.state.song, pointer_down);
-        // Space toggles transport, like FL. Not while typing in a text box.
-        if !ui.ctx().egui_wants_keyboard_input()
-            && ui.ctx().input(|i| i.key_pressed(eframe::egui::Key::Space))
-        {
-            let next = !self.state.rt.playing;
-            self.state.set_playing(next);
-        }
-        if !ui.ctx().egui_wants_keyboard_input() {
-            let (command, shift, z, y, c, v, l, a, i_key, b, f5, f6, f7, f8, f9) =
-                ui.ctx().input(|i| {
-                    (
-                        i.modifiers.command,
-                        i.modifiers.shift,
-                        i.key_pressed(eframe::egui::Key::Z),
-                        i.key_pressed(eframe::egui::Key::Y),
-                        i.key_pressed(eframe::egui::Key::C),
-                        i.key_pressed(eframe::egui::Key::V),
-                        i.key_pressed(eframe::egui::Key::L),
-                        i.key_pressed(eframe::egui::Key::A),
-                        i.key_pressed(eframe::egui::Key::I),
-                        i.key_pressed(eframe::egui::Key::B),
-                        i.key_pressed(eframe::egui::Key::F5),
-                        i.key_pressed(eframe::egui::Key::F6),
-                        i.key_pressed(eframe::egui::Key::F7),
-                        i.key_pressed(eframe::egui::Key::F8),
-                        i.key_pressed(eframe::egui::Key::F9),
-                    )
-                });
-            if f5 {
-                self.ui.show_playlist = !self.ui.show_playlist;
-            }
-            if f6 {
-                self.ui.show_rack = !self.ui.show_rack;
-            }
-            if f7 {
-                self.ui.show_piano = !self.ui.show_piano;
-            }
-            if f8 {
-                self.ui.show_browser = !self.ui.show_browser;
-            }
-            if f9 {
-                self.ui.show_mixer = !self.ui.show_mixer;
-            }
-            if command && z && shift {
-                ui::redo(&mut self.ui, &mut self.state);
-            } else if command && z {
-                ui::undo(&mut self.ui, &mut self.state);
-            } else if command && y {
-                ui::redo(&mut self.ui, &mut self.state);
-            } else if command && c {
-                ui::copy_notes(&mut self.ui, &self.state);
-            } else if command && v {
-                ui::paste_notes(&mut self.ui, &mut self.state);
-            } else if command && a && self.ui.focus == ui::FocusPanel::PianoRoll {
-                ui::select_all_notes(&mut self.ui, &self.state);
-            } else if command && i_key && self.ui.focus == ui::FocusPanel::PianoRoll {
-                ui::invert_note_selection(&mut self.ui, &self.state);
-            } else if command && b && self.ui.focus == ui::FocusPanel::PianoRoll {
-                ui::duplicate_selected_notes(&mut self.ui, &mut self.state);
-            } else if command && l {
-                if self.ui.focus == ui::FocusPanel::PianoRoll {
-                    ui::legato_selected_notes(&mut self.ui, &mut self.state);
-                } else {
-                    ui::link_selected_channel_to_insert(&mut self.ui, &mut self.state);
-                }
-            }
-        }
-        let pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
+        ui::process_typing_piano(&mut self.ui, &mut self.state, ui.ctx());
+        ui::handle_workspace_shortcuts(&mut self.ui, &mut self.state, ui.ctx());
+        ui::sync_dock_tabs(&mut self.ui);
         eframe::egui::Panel::top("transport").show(ui, |u| {
             ui::transport(&mut self.ui, &mut self.state, u);
         });
         if self.ui.show_browser {
-            eframe::egui::Panel::left("browser").show(ui, |u| {
-                eframe::egui::ScrollArea::vertical().show(u, |u| {
-                    ui::browser(&mut self.ui, &mut self.state, u);
+            eframe::egui::Panel::left("browser")
+                .default_size(240.0)
+                .show(ui, |u| {
+                    eframe::egui::ScrollArea::vertical().show(u, |u| {
+                        ui::browser(&mut self.ui, &mut self.state, u);
+                    });
                 });
-            });
         }
         eframe::egui::Panel::bottom("hint").show(ui, |u| {
             u.horizontal(|u| {
+                if self.ui.typing_piano {
+                    u.strong(format!("[Keys C{}]", self.ui.typing_octave));
+                    u.separator();
+                }
                 u.label(format!("status: {}", self.ui.status));
             });
         });
         eframe::egui::CentralPanel::default().show(ui, |u| {
-            eframe::egui::ScrollArea::vertical().show(u, |u| {
-                ui::tutorial(&mut self.ui, &mut self.state, u);
-                if self.ui.show_rack {
-                    let r = u
-                        .scope(|u| ui::channel_rack(&mut self.ui, &mut self.state, u))
-                        .response;
-                    if pressed && r.hovered() {
-                        self.ui.focus = ui::FocusPanel::Rack;
-                    }
-                    u.separator();
-                }
-                if self.ui.show_piano {
-                    let r = u
-                        .scope(|u| ui::piano_roll(&mut self.ui, &mut self.state, u))
-                        .response;
-                    if pressed && r.hovered() {
-                        self.ui.focus = ui::FocusPanel::PianoRoll;
-                    }
-                    u.separator();
-                }
-                if self.ui.show_playlist || self.ui.show_mixer {
-                    u.horizontal(|u| {
-                        if self.ui.show_playlist {
-                            let r = u
-                                .scope(|u| {
-                                    u.vertical(|u| {
-                                        ui::playlist(&mut self.ui, &mut self.state, u);
-                                    });
-                                })
-                                .response;
-                            if pressed && r.hovered() {
-                                self.ui.focus = ui::FocusPanel::Playlist;
-                            }
-                        }
-                        if self.ui.show_playlist && self.ui.show_mixer {
-                            u.separator();
-                        }
-                        if self.ui.show_mixer {
-                            let r = u
-                                .scope(|u| {
-                                    u.vertical(|u| {
-                                        ui::mixer(&mut self.ui, &mut self.state, u);
-                                    });
-                                })
-                                .response;
-                            if pressed && r.hovered() {
-                                self.ui.focus = ui::FocusPanel::Mixer;
-                            }
-                        }
-                    });
-                    u.separator();
-                }
-            });
+            ui::tutorial(&mut self.ui, &mut self.state, u);
+            ui::show_dock_area(&mut self.ui, &mut self.state, u);
         });
         ui::edison_window(&mut self.ui, &mut self.state, ui.ctx());
+        ui::export_window(&mut self.ui, &mut self.state, ui.ctx());
+        ui::recovery_window(&mut self.ui, &mut self.state, ui.ctx());
         let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
         self.ui.record_song(&self.state.song, pointer_down);
+        self.ui.maybe_autosave(&self.state.song);
         self.state.sync_audio();
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(d) = project::data_dir() {
+            project::clear_session_active(&d);
+        }
     }
 }
 
@@ -274,6 +174,13 @@ fn main() {
     app_ui.audio_in_ports = midi::list_audio_inputs();
     if let Some(tx) = state.audio.as_mut().and_then(|b| b.take_midi_rt_tx()) {
         app_ui.midi.set_audio_tx(tx);
+    }
+    if let Some(d) = project::data_dir() {
+        if project::has_crash_recovery(&d) {
+            app_ui.show_recovery_prompt = true;
+        } else {
+            project::mark_session_active(&d);
+        }
     }
     let options = eframe::NativeOptions::default();
     if let Err(e) = eframe::run_native(

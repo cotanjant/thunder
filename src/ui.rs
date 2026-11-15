@@ -1,10 +1,17 @@
 //! All egui panels: transport, channel rack, piano roll + automation,
 //! playlist, mixer, sample browser.
 
-use crate::engine::{AppState, load_sample_file, sample_into_song};
+use crate::engine::{AppState, sample_into_song};
+use crate::export::{ExportConfig, ExportFormat, TailMode};
 use crate::fx;
 use crate::midi::{
-    AudioInputHandle, MidiLearnState, MidiRecMode, MidiRecorder, MidiService, list_audio_inputs,
+    AudioInputHandle, MidiLearnState, MidiMsg, MidiRecCtx, MidiRecMode, MidiRecorder, MidiService,
+    list_audio_inputs,
+};
+use crate::project::{
+    BrowserPrefs, RecentProjects, TemplateKind, config_dir, data_dir, discard_recovery,
+    export_zip_package, import_zip_package, load_autosave, load_song_from_path, template_song,
+    write_autosave,
 };
 use crate::song::{
     ArpCfg, ArpDir, AutoClipPoint, AutoPoint, AutoTarget, Channel, ChannelKind, ChordKind,
@@ -12,25 +19,114 @@ use crate::song::{
     FmAlgo, FmSynthCfg, FxKind, KitPiece, MAX_FX_SLOTS, MapCurve, ModFxCfg, ModFxKind, ModTarget,
     Note, PeakController, QuantizeCfg, RandCfg, ReverbFxCfg, SatCfg, SatKind, ScaleKind, SnapGrid,
     Song, StereoShaperCfg, StretchMode, StrumCfg, SuperSynthCfg, TICKS_PER_STEP, TimeSig, WaveKind,
-    compute_sample_peaks, default_drum_pads, eval_auto, eval_auto_clip, palette_color,
-    tool_chord_ext, tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts,
-    tool_randomize, tool_riff_arp, tool_slice_at, tool_strum_opts,
+    default_drum_pads, eval_auto, eval_auto_clip, palette_color, tool_chord_ext,
+    tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts, tool_randomize,
+    tool_riff_arp, tool_slice_at, tool_strum_opts,
 };
 use crate::synth::{apply_preset_to_channel, factory_presets, load_preset_json, save_preset_json};
 use eframe::egui;
+use egui_dock::{DockState, NodeIndex, TabViewer};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // UI state (not part of the saved song)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum FocusPanel {
     #[default]
     Rack,
     PianoRoll,
     Playlist,
     Mixer,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DockTab {
+    Playlist,
+    ChannelRack,
+    PianoRoll,
+    Mixer,
+    MidiAudio,
+}
+
+impl DockTab {
+    pub fn title(&self) -> &'static str {
+        match self {
+            DockTab::Playlist => "Playlist (F5)",
+            DockTab::ChannelRack => "Channel Rack (F6)",
+            DockTab::PianoRoll => "Piano Roll (F7)",
+            DockTab::Mixer => "Mixer (F9)",
+            DockTab::MidiAudio => "MIDI / Audio",
+        }
+    }
+
+    pub fn focus_panel(&self) -> FocusPanel {
+        match self {
+            DockTab::Playlist => FocusPanel::Playlist,
+            DockTab::ChannelRack | DockTab::MidiAudio => FocusPanel::Rack,
+            DockTab::PianoRoll => FocusPanel::PianoRoll,
+            DockTab::Mixer => FocusPanel::Mixer,
+        }
+    }
+}
+
+pub fn default_dock_state() -> DockState<DockTab> {
+    let mut dock = DockState::new(vec![DockTab::Playlist, DockTab::PianoRoll]);
+    let tree = dock.main_surface_mut();
+    let [_left, _right] = tree.split_right(NodeIndex::root(), 0.56, vec![DockTab::ChannelRack]);
+    let _ = tree.split_below(NodeIndex::root(), 0.62, vec![DockTab::Mixer]);
+    dock
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum BrowserCategory {
+    #[default]
+    All,
+    Drums,
+    Bass,
+    Fx,
+    Presets,
+}
+
+impl BrowserCategory {
+    pub const ALL: [BrowserCategory; 5] = [
+        BrowserCategory::All,
+        BrowserCategory::Drums,
+        BrowserCategory::Bass,
+        BrowserCategory::Fx,
+        BrowserCategory::Presets,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            BrowserCategory::All => "All",
+            BrowserCategory::Drums => "Drums",
+            BrowserCategory::Bass => "Bass",
+            BrowserCategory::Fx => "FX",
+            BrowserCategory::Presets => "Presets",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum BrowserNode {
+    Dir {
+        name: String,
+        children: Vec<BrowserNode>,
+    },
+    File {
+        name: String,
+        path: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum BrowserDragPayload {
+    SamplePath(String),
+    PresetIdx(usize),
+    FxChoice(usize),
 }
 
 /// FL-style piano roll tools.
@@ -185,6 +281,10 @@ pub struct AppUi {
     pub sel_pat: usize,
     pub sel_insert: usize,
     pub focus: FocusPanel,
+    pub dock_state: DockState<DockTab>,
+    pub typing_piano: bool,
+    pub typing_octave: i8,
+    held_typing_keys: Vec<(egui::Key, u8)>,
     sel_track: usize,
     sel_clip: Option<u64>,
     clip_drag: Option<(u64, ClipDragKind, i32, u32)>,
@@ -198,7 +298,6 @@ pub struct AppUi {
     sel_pad: usize,
     sel_fx_slot: usize,
     add_fx_kind: usize,
-    preset_path: String,
     step_graph: StepGraphMode,
     route_target: usize,
     route_amount: f32,
@@ -247,13 +346,22 @@ pub struct AppUi {
     modal: Option<PianoModal>,
     auto_sel: AutoSel,
     auto_drag: Option<usize>,
-    save_path: String,
-    wav_path: String,
-    mid_path: String,
-    take_path: String,
-    sample_path: String,
+    pub save_path: Option<PathBuf>,
+    pub recent_projects: RecentProjects,
+    pub browser_prefs: BrowserPrefs,
     browser_dir: String,
-    browser_cache: Vec<String>,
+    browser_search: String,
+    browser_category: BrowserCategory,
+    browser_fav_only: bool,
+    browser_sync_preview: bool,
+    browser_tree: Vec<BrowserNode>,
+    browser_tree_dirty: bool,
+    pub show_export_modal: bool,
+    pub export_cfg: ExportConfig,
+    pub export_target_path: String,
+    pub show_recovery_prompt: bool,
+    last_autosave: Instant,
+    dirty_since_autosave: bool,
     note_clipboard: Vec<Note>,
     undo: Vec<Song>,
     redo: Vec<Song>,
@@ -288,11 +396,24 @@ fn set_tutorial_seen(seen: bool) {
 
 impl Default for AppUi {
     fn default() -> Self {
+        let cfg = config_dir();
+        let recent_projects = cfg
+            .as_deref()
+            .map(RecentProjects::load_from)
+            .unwrap_or_default();
+        let browser_prefs = cfg
+            .as_deref()
+            .map(BrowserPrefs::load_from)
+            .unwrap_or_default();
         Self {
             sel_ch: 4,
             sel_pat: 0,
             sel_insert: 1,
             focus: FocusPanel::Rack,
+            dock_state: default_dock_state(),
+            typing_piano: false,
+            typing_octave: 4,
+            held_typing_keys: Vec::new(),
             sel_track: 0,
             sel_clip: None,
             clip_drag: None,
@@ -306,7 +427,6 @@ impl Default for AppUi {
             sel_pad: 0,
             sel_fx_slot: 0,
             add_fx_kind: 0,
-            preset_path: "preset.json".into(),
             step_graph: StepGraphMode::Off,
             route_target: 0,
             route_amount: 1.0,
@@ -353,13 +473,22 @@ impl Default for AppUi {
             modal: None,
             auto_sel: AutoSel::Vol,
             auto_drag: None,
-            save_path: "thunder.json".into(),
-            wav_path: "mixdown.wav".into(),
-            mid_path: "song.mid".into(),
-            take_path: "take.wav".into(),
-            sample_path: String::new(),
-            browser_dir: "samples".into(),
-            browser_cache: Vec::new(),
+            save_path: None,
+            recent_projects,
+            browser_prefs,
+            browser_dir: home_music_dir(),
+            browser_search: String::new(),
+            browser_category: BrowserCategory::All,
+            browser_fav_only: false,
+            browser_sync_preview: false,
+            browser_tree: Vec::new(),
+            browser_tree_dirty: true,
+            show_export_modal: false,
+            export_cfg: ExportConfig::default(),
+            export_target_path: "mixdown.wav".into(),
+            show_recovery_prompt: false,
+            last_autosave: Instant::now(),
+            dirty_since_autosave: false,
             note_clipboard: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -381,6 +510,7 @@ impl AppUi {
             return;
         };
         if current != song {
+            self.dirty_since_autosave = true;
             if !pointer_down || !self.history_pending {
                 if self.undo.len() == HISTORY_LIMIT {
                     self.undo.remove(0);
@@ -396,11 +526,26 @@ impl AppUi {
         }
     }
 
+    pub fn maybe_autosave(&mut self, song: &Song) {
+        if !self.dirty_since_autosave
+            || self.last_autosave.elapsed() < std::time::Duration::from_secs(30)
+        {
+            return;
+        }
+        if let Some(dir) = data_dir()
+            && write_autosave(&dir, song).is_ok()
+        {
+            self.dirty_since_autosave = false;
+            self.last_autosave = Instant::now();
+        }
+    }
+
     pub fn reset_history(&mut self, song: &Song) {
         self.undo.clear();
         self.redo.clear();
         self.history_current = Some(song.clone());
         self.history_pending = false;
+        self.dirty_since_autosave = false;
     }
 
     fn undo_song(&mut self, song: &mut Song) -> bool {
@@ -651,26 +796,419 @@ fn color32(rgb: [u8; 3]) -> egui::Color32 {
 }
 
 // ---------------------------------------------------------------------------
-// Small helpers
+// Workspace docking, typing piano, shortcuts, and project helpers
 // ---------------------------------------------------------------------------
 
-fn sample_files(dir: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if let Some(ext) = p.extension().and_then(|x| x.to_str())
-                && matches!(
-                    ext.to_lowercase().as_str(),
-                    "wav" | "mp3" | "ogg" | "flac" | "aiff" | "aif"
-                )
-            {
-                out.push(p.to_string_lossy().into_owned());
-            }
+fn sync_one_tab(dock: &mut DockState<DockTab>, tab: DockTab, show: bool) {
+    let existing = dock.find_tab(&tab);
+    match (show, existing) {
+        (true, None) => dock.push_to_first_leaf(tab),
+        (false, Some(path)) => {
+            dock.remove_tab(path);
+        }
+        _ => {}
+    }
+}
+
+pub fn sync_dock_tabs(ui: &mut AppUi) {
+    sync_one_tab(&mut ui.dock_state, DockTab::Playlist, ui.show_playlist);
+    sync_one_tab(&mut ui.dock_state, DockTab::ChannelRack, ui.show_rack);
+    sync_one_tab(&mut ui.dock_state, DockTab::PianoRoll, ui.show_piano);
+    sync_one_tab(&mut ui.dock_state, DockTab::Mixer, ui.show_mixer);
+    sync_one_tab(&mut ui.dock_state, DockTab::MidiAudio, ui.show_io_panel);
+}
+
+pub fn show_dock_area(ui: &mut AppUi, state: &mut AppState, u: &mut egui::Ui) {
+    let mut dock = std::mem::replace(&mut ui.dock_state, DockState::new(vec![]));
+    egui_dock::DockArea::new(&mut dock).show_inside(u, &mut ThunderTabViewer { ui, state });
+    ui.dock_state = dock;
+    sync_dock_tabs(ui);
+}
+
+struct ThunderTabViewer<'a> {
+    ui: &'a mut AppUi,
+    state: &'a mut AppState,
+}
+
+impl TabViewer for ThunderTabViewer<'_> {
+    type Tab = DockTab;
+
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(*tab)
+    }
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        tab.title().into()
+    }
+
+    fn ui(&mut self, u: &mut egui::Ui, tab: &mut Self::Tab) {
+        let pressed = u.ctx().input(|i| i.pointer.primary_pressed());
+        let rect = u.available_rect_before_wrap();
+        if pressed
+            && u.ctx()
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| rect.contains(p))
+        {
+            self.ui.focus = tab.focus_panel();
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(("dock_tab_scroll", *tab))
+            .show(u, |u| match tab {
+                DockTab::Playlist => playlist(self.ui, self.state, u),
+                DockTab::ChannelRack => channel_rack(self.ui, self.state, u),
+                DockTab::PianoRoll => piano_roll(self.ui, self.state, u),
+                DockTab::Mixer => mixer(self.ui, self.state, u),
+                DockTab::MidiAudio => io_and_controllers_panel(self.ui, self.state, u),
+            });
+    }
+
+    fn on_close(&mut self, tab: &mut Self::Tab) -> egui_dock::tab_viewer::OnCloseResponse {
+        match tab {
+            DockTab::Playlist => self.ui.show_playlist = false,
+            DockTab::ChannelRack => self.ui.show_rack = false,
+            DockTab::PianoRoll => self.ui.show_piano = false,
+            DockTab::Mixer => self.ui.show_mixer = false,
+            DockTab::MidiAudio => self.ui.show_io_panel = false,
+        }
+        egui_dock::tab_viewer::OnCloseResponse::Close
+    }
+}
+
+/// FL Studio QWERTY two-octave keyboard mapping relative to `octave` (default C4 = 60).
+pub fn typing_key_to_midi(key: egui::Key, octave: i8) -> Option<u8> {
+    let offset: i16 = match key {
+        egui::Key::Z => 0,
+        egui::Key::S => 1,
+        egui::Key::X => 2,
+        egui::Key::D => 3,
+        egui::Key::C => 4,
+        egui::Key::V => 5,
+        egui::Key::G => 6,
+        egui::Key::B => 7,
+        egui::Key::H => 8,
+        egui::Key::N => 9,
+        egui::Key::J => 10,
+        egui::Key::M => 11,
+        egui::Key::Q => 12,
+        egui::Key::Num2 => 13,
+        egui::Key::W => 14,
+        egui::Key::Num3 => 15,
+        egui::Key::E => 16,
+        egui::Key::R => 17,
+        egui::Key::Num5 => 18,
+        egui::Key::T => 19,
+        egui::Key::Num6 => 20,
+        egui::Key::Y => 21,
+        egui::Key::Num7 => 22,
+        egui::Key::U => 23,
+        egui::Key::I => 24,
+        egui::Key::Num9 => 25,
+        egui::Key::O => 26,
+        egui::Key::Num0 => 27,
+        egui::Key::P => 28,
+        _ => return None,
+    };
+    let base = i16::from(octave.clamp(1, 7) + 1) * 12;
+    let note = base + offset;
+    (0..=127).contains(&note).then_some(note as u8)
+}
+
+const TYPING_PIANO_KEYS: [egui::Key; 29] = [
+    egui::Key::Z,
+    egui::Key::S,
+    egui::Key::X,
+    egui::Key::D,
+    egui::Key::C,
+    egui::Key::V,
+    egui::Key::G,
+    egui::Key::B,
+    egui::Key::H,
+    egui::Key::N,
+    egui::Key::J,
+    egui::Key::M,
+    egui::Key::Q,
+    egui::Key::Num2,
+    egui::Key::W,
+    egui::Key::Num3,
+    egui::Key::E,
+    egui::Key::R,
+    egui::Key::Num5,
+    egui::Key::T,
+    egui::Key::Num6,
+    egui::Key::Y,
+    egui::Key::Num7,
+    egui::Key::U,
+    egui::Key::I,
+    egui::Key::Num9,
+    egui::Key::O,
+    egui::Key::Num0,
+    egui::Key::P,
+];
+
+fn release_typing_keys(ui: &mut AppUi, s: &mut AppState) {
+    let target_ch = ui
+        .lock_midi_ch
+        .unwrap_or(ui.sel_ch)
+        .min(s.song.channels.len().saturating_sub(1));
+    let snap_ticks = ui.rec_snap_ticks();
+    for &(_, note) in &ui.held_typing_keys {
+        let msg = MidiMsg::NoteOff { ch: 0, note };
+        s.send_midi_msg(msg);
+        ui.midi_rec.handle_msg(
+            &mut s.song,
+            msg,
+            MidiRecCtx {
+                pat: ui.sel_pat,
+                ch: target_ch,
+                cur_tick: s.rt.cur_tick,
+                playing: s.rt.playing,
+                snap_grid: snap_ticks,
+            },
+        );
+    }
+    ui.held_typing_keys.clear();
+}
+
+pub fn process_typing_piano(ui: &mut AppUi, s: &mut AppState, ctx: &egui::Context) {
+    if !ui.typing_piano || ctx.egui_wants_keyboard_input() {
+        if !ui.held_typing_keys.is_empty() {
+            release_typing_keys(ui, s);
+        }
+        return;
+    }
+    let has_mod = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt);
+    let target_ch = ui
+        .lock_midi_ch
+        .unwrap_or(ui.sel_ch)
+        .min(s.song.channels.len().saturating_sub(1));
+    let snap_ticks = ui.rec_snap_ticks();
+
+    if !has_mod {
+        if ctx.input(|i| i.key_pressed(egui::Key::OpenBracket) || i.key_pressed(egui::Key::Minus)) {
+            ui.typing_octave = (ui.typing_octave - 1).max(1);
+            ui.status = format!("typing octave C{}", ui.typing_octave);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::CloseBracket) || i.key_pressed(egui::Key::Equals))
+        {
+            ui.typing_octave = (ui.typing_octave + 1).min(7);
+            ui.status = format!("typing octave C{}", ui.typing_octave);
         }
     }
-    out.sort();
-    out
+
+    for key in TYPING_PIANO_KEYS {
+        let pressed = ctx.input(|i| i.key_pressed(key));
+        let released = ctx.input(|i| i.key_released(key));
+        if pressed
+            && !has_mod
+            && !ui.held_typing_keys.iter().any(|&(k, _)| k == key)
+            && let Some(midi) = typing_key_to_midi(key, ui.typing_octave)
+        {
+            ui.held_typing_keys.push((key, midi));
+            let msg = MidiMsg::NoteOn {
+                ch: 0,
+                note: midi,
+                vel: 0.85,
+            };
+            s.send_midi_msg(msg);
+            ui.midi_rec.handle_msg(
+                &mut s.song,
+                msg,
+                MidiRecCtx {
+                    pat: ui.sel_pat,
+                    ch: target_ch,
+                    cur_tick: s.rt.cur_tick,
+                    playing: s.rt.playing,
+                    snap_grid: snap_ticks,
+                },
+            );
+        }
+        if released && let Some(pos) = ui.held_typing_keys.iter().position(|&(k, _)| k == key) {
+            let (_, midi) = ui.held_typing_keys.remove(pos);
+            let msg = MidiMsg::NoteOff { ch: 0, note: midi };
+            s.send_midi_msg(msg);
+            ui.midi_rec.handle_msg(
+                &mut s.song,
+                msg,
+                MidiRecCtx {
+                    pat: ui.sel_pat,
+                    ch: target_ch,
+                    cur_tick: s.rt.cur_tick,
+                    playing: s.rt.playing,
+                    snap_grid: snap_ticks,
+                },
+            );
+        }
+    }
+}
+
+pub fn handle_workspace_shortcuts(ui: &mut AppUi, s: &mut AppState, ctx: &egui::Context) {
+    if ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    let (space, cmd, shift, z, y, c, v, l, a, i_k, b, t, s_k, del, f5, f6, f7, f8, f9) =
+        ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.modifiers.command || i.modifiers.ctrl,
+                i.modifiers.shift,
+                i.key_pressed(egui::Key::Z),
+                i.key_pressed(egui::Key::Y),
+                i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::V),
+                i.key_pressed(egui::Key::L),
+                i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::I),
+                i.key_pressed(egui::Key::B),
+                i.key_pressed(egui::Key::T),
+                i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                i.key_pressed(egui::Key::F5),
+                i.key_pressed(egui::Key::F6),
+                i.key_pressed(egui::Key::F7),
+                i.key_pressed(egui::Key::F8),
+                i.key_pressed(egui::Key::F9),
+            )
+        });
+
+    if space {
+        let next = !s.rt.playing;
+        s.set_playing(next);
+    }
+    if f5 {
+        ui.show_playlist = !ui.show_playlist;
+        if ui.show_playlist {
+            ui.focus = FocusPanel::Playlist;
+        }
+    }
+    if f6 {
+        ui.show_rack = !ui.show_rack;
+        if ui.show_rack {
+            ui.focus = FocusPanel::Rack;
+        }
+    }
+    if f7 {
+        ui.show_piano = !ui.show_piano;
+        if ui.show_piano {
+            ui.focus = FocusPanel::PianoRoll;
+        }
+    }
+    if f8 {
+        ui.show_browser = !ui.show_browser;
+    }
+    if f9 {
+        ui.show_mixer = !ui.show_mixer;
+        if ui.show_mixer {
+            ui.focus = FocusPanel::Mixer;
+        }
+    }
+
+    if cmd && t {
+        ui.typing_piano = !ui.typing_piano;
+        if !ui.typing_piano {
+            release_typing_keys(ui, s);
+        }
+        ui.status = if ui.typing_piano {
+            format!("typing keyboard piano ON (C{})", ui.typing_octave)
+        } else {
+            "typing keyboard piano OFF".into()
+        };
+    } else if cmd && s_k {
+        save_current_project(ui, s);
+    } else if cmd && z && shift {
+        redo(ui, s);
+    } else if cmd && z {
+        undo(ui, s);
+    } else if cmd && y {
+        redo(ui, s);
+    } else if cmd && c {
+        copy_notes(ui, s);
+    } else if cmd && v {
+        paste_notes(ui, s);
+    } else if cmd && a && ui.focus == FocusPanel::PianoRoll {
+        select_all_notes(ui, s);
+    } else if cmd && i_k && ui.focus == FocusPanel::PianoRoll {
+        invert_note_selection(ui, s);
+    } else if cmd && b && ui.focus == FocusPanel::PianoRoll {
+        duplicate_selected_notes(ui, s);
+    } else if cmd && l {
+        if ui.focus == FocusPanel::PianoRoll {
+            legato_selected_notes(ui, s);
+        } else {
+            link_selected_channel_to_insert(ui, s);
+        }
+    } else if del {
+        if ui.focus == FocusPanel::PianoRoll {
+            if delete_selected_notes(ui, s) {
+                ui.status = "deleted selected notes".into();
+            }
+        } else if ui.focus == FocusPanel::Playlist
+            && let Some(cid) = ui.sel_clip.take()
+            && s.song.remove_clip(cid)
+        {
+            ui.status = "deleted clip".into();
+        }
+    }
+    sync_dock_tabs(ui);
+}
+
+fn apply_loaded_song_to_ui(ui: &mut AppUi, s: &mut AppState, song: Song, path: Option<PathBuf>) {
+    ui.sel_ch = ui.sel_ch.min(song.channels.len().saturating_sub(1));
+    ui.sel_pat = ui.sel_pat.min(song.patterns.len().saturating_sub(1));
+    ui.sel_insert = ui.sel_insert.min(song.mixer_tracks.len().saturating_sub(1));
+    s.set_inspect_insert(ui.sel_insert);
+    s.apply_loaded_song(song);
+    s.set_pattern(ui.sel_pat);
+    ui.reset_history(&s.song);
+    ui.save_path = path.clone();
+    if let Some(p) = path {
+        ui.recent_projects.push(&p.to_string_lossy());
+        if let Some(cfg) = config_dir() {
+            ui.recent_projects.save_to(&cfg);
+        }
+    }
+}
+
+fn save_project_to_path(ui: &mut AppUi, s: &AppState, path: &Path) {
+    let pstr = path.to_string_lossy().into_owned();
+    match s.song.save(&pstr) {
+        Ok(()) => {
+            ui.save_path = Some(path.to_path_buf());
+            ui.dirty_since_autosave = false;
+            ui.recent_projects.push(&pstr);
+            if let Some(cfg) = config_dir() {
+                ui.recent_projects.save_to(&cfg);
+            }
+            ui.status = format!("saved {pstr}");
+        }
+        Err(e) => ui.status = format!("save failed: {e}"),
+    }
+}
+
+fn save_current_project(ui: &mut AppUi, s: &AppState) {
+    if let Some(p) = ui.save_path.clone() {
+        save_project_to_path(ui, s, &p);
+    } else if let Some(p) = rfd::FileDialog::new()
+        .add_filter("Thunder Project", &["json"])
+        .set_file_name("song.json")
+        .save_file()
+    {
+        save_project_to_path(ui, s, &p);
+    }
+}
+
+fn open_project_file(ui: &mut AppUi, s: &mut AppState, path: &Path) {
+    match load_song_from_path(path) {
+        Ok((song, missing)) => {
+            let pstr = path.to_string_lossy().into_owned();
+            apply_loaded_song_to_ui(ui, s, song, Some(path.to_path_buf()));
+            ui.status = if missing == 0 {
+                format!("loaded {pstr}")
+            } else {
+                format!("loaded {pstr} ({missing} samples missing)")
+            };
+        }
+        Err(e) => ui.status = format!("load failed: {e}"),
+    }
 }
 
 fn home_music_dir() -> String {
@@ -713,11 +1251,13 @@ fn apply_param_ctx(ui: &mut AppUi, s: &mut AppState, act: ParamCtxAction) {
             let cid = s.song.add_auto_clip(track, 0, len, target);
             ui.sel_clip = Some(cid);
             ui.show_playlist = true;
+            sync_dock_tabs(ui);
             ui.status = format!("created automation clip: {}", target.label());
         }
         ParamCtxAction::MidiLearn(target) => {
             ui.midi_learn.armed_target = Some(target);
             ui.show_io_panel = true;
+            sync_dock_tabs(ui);
             ui.status = format!("MIDI Learn armed for {}", target.label());
         }
     }
@@ -743,6 +1283,147 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     }
 
     u.horizontal(|u| {
+        u.menu_button("File", |u| {
+            if u.button("New Empty").clicked() {
+                apply_loaded_song_to_ui(ui, s, crate::song::new_empty(), None);
+                ui.status = "new empty project".into();
+                u.close();
+            }
+            u.menu_button("New from Template", |u| {
+                for tpl in TemplateKind::ALL {
+                    if u.button(tpl.name()).clicked() {
+                        apply_loaded_song_to_ui(ui, s, template_song(tpl), None);
+                        ui.status = format!("created {}", tpl.name());
+                        u.close();
+                    }
+                }
+            });
+            u.separator();
+            if u.button("Open Project...").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Thunder / ZIP", &["json", "zip"])
+                    .pick_file()
+                {
+                    open_project_file(ui, s, &p);
+                }
+                u.close();
+            }
+            u.menu_button("Recent Projects", |u| {
+                let paths = ui.recent_projects.paths.clone();
+                if paths.is_empty() {
+                    u.label("(none)");
+                }
+                for pstr in paths {
+                    let lbl = Path::new(&pstr)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&pstr);
+                    if u.button(lbl).on_hover_text(&pstr).clicked() {
+                        open_project_file(ui, s, Path::new(&pstr));
+                        u.close();
+                    }
+                }
+            });
+            if u.button("Save (Ctrl+S)").clicked() {
+                save_current_project(ui, s);
+                u.close();
+            }
+            if u.button("Save As...").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Thunder Project", &["json"])
+                    .set_file_name("song.json")
+                    .save_file()
+                {
+                    save_project_to_path(ui, s, &p);
+                }
+                u.close();
+            }
+            u.separator();
+            if u.button("Export ZIP Package...").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Zipped Loop Package", &["zip"])
+                    .set_file_name("project_bundle.zip")
+                    .save_file()
+                {
+                    match export_zip_package(&s.song, &p) {
+                        Ok(m) => ui.status = m,
+                        Err(e) => ui.status = format!("zip export failed: {e}"),
+                    }
+                }
+                u.close();
+            }
+            if u.button("Import ZIP Package...").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Zipped Loop Package", &["zip"])
+                    .pick_file()
+                {
+                    let work = data_dir()
+                        .unwrap_or_else(std::env::temp_dir)
+                        .join("zip_work");
+                    match import_zip_package(&p, &work) {
+                        Ok(song) => {
+                            apply_loaded_song_to_ui(ui, s, song, None);
+                            ui.status = format!("imported {}", p.display());
+                        }
+                        Err(e) => ui.status = format!("zip import failed: {e}"),
+                    }
+                }
+                u.close();
+            }
+            u.separator();
+            if u.button("Export Audio...").clicked() {
+                ui.show_export_modal = true;
+                u.close();
+            }
+            if u.button("Import MIDI...").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Standard MIDI", &["mid", "midi"])
+                    .pick_file()
+                {
+                    let pat = ui.sel_pat;
+                    match crate::export::import_midi_into_song(
+                        &mut s.song,
+                        pat,
+                        &p.to_string_lossy(),
+                    ) {
+                        Ok(n) => {
+                            s.rt.ensure_channels(&s.song);
+                            ui.status = format!("imported {n} MIDI notes");
+                        }
+                        Err(e) => ui.status = format!("midi import failed: {e}"),
+                    }
+                }
+                u.close();
+            }
+            if u.button("Export MIDI...").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Standard MIDI", &["mid", "midi"])
+                    .set_file_name("song.mid")
+                    .save_file()
+                {
+                    match crate::export::export_midi(&s.song, ui.sel_pat, &p.to_string_lossy()) {
+                        Ok(m) => ui.status = m,
+                        Err(e) => ui.status = format!("midi export failed: {e}"),
+                    }
+                }
+                u.close();
+            }
+            if u.button("Save Take WAV...").clicked() {
+                if !s.has_take() {
+                    ui.status = "nothing recorded yet".into();
+                } else if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("WAV Audio", &["wav"])
+                    .set_file_name("take.wav")
+                    .save_file()
+                {
+                    match s.save_take(&p.to_string_lossy()) {
+                        Ok(n) => ui.status = format!("saved take ({n} samples)"),
+                        Err(e) => ui.status = format!("take save failed: {e}"),
+                    }
+                }
+                u.close();
+            }
+        });
         // FL window toggles: browser, rack, piano, playlist, mixer.
         let mut v = ui.show_browser;
         if u.toggle_value(&mut v, "Files")
@@ -757,6 +1438,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             .changed()
         {
             ui.show_rack = v;
+            sync_dock_tabs(ui);
         }
         let mut v = ui.show_piano;
         if u.toggle_value(&mut v, "Piano")
@@ -764,6 +1446,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             .changed()
         {
             ui.show_piano = v;
+            sync_dock_tabs(ui);
         }
         let mut v = ui.show_playlist;
         if u.toggle_value(&mut v, "List")
@@ -771,6 +1454,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             .changed()
         {
             ui.show_playlist = v;
+            sync_dock_tabs(ui);
         }
         let mut v = ui.show_mixer;
         if u.toggle_value(&mut v, "Mix")
@@ -778,9 +1462,37 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             .changed()
         {
             ui.show_mixer = v;
+            sync_dock_tabs(ui);
         }
-        u.toggle_value(&mut ui.show_io_panel, "MIDI/Audio")
-            .on_hover_text("Hardware MIDI, MIDI Learn, Audio Input & Peak Controllers");
+        if u.toggle_value(&mut ui.show_io_panel, "MIDI/Audio")
+            .on_hover_text("Hardware MIDI, MIDI Learn, Audio Input & Peak Controllers")
+            .changed()
+        {
+            sync_dock_tabs(ui);
+        }
+        if u.toggle_value(&mut ui.typing_piano, "Keys")
+            .on_hover_text("Typing Keyboard to Piano (Ctrl+T)")
+            .changed()
+            && !ui.typing_piano
+        {
+            release_typing_keys(ui, s);
+        }
+        if ui.typing_piano {
+            let mut oct = ui.typing_octave;
+            u.add(egui::DragValue::new(&mut oct).range(1..=7).prefix("Oct "));
+            ui.typing_octave = oct;
+        }
+        if u.button("Layout")
+            .on_hover_text("Reset docked panels to default FL layout")
+            .clicked()
+        {
+            ui.show_rack = true;
+            ui.show_piano = true;
+            ui.show_playlist = true;
+            ui.show_mixer = true;
+            ui.dock_state = default_dock_state();
+            sync_dock_tabs(ui);
+        }
         u.separator();
         let playing = s.rt.playing;
         if u.button(if playing { "⏹ Stop" } else { "▶ Play" })
@@ -1016,71 +1728,28 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 u.selectable_value(&mut s.song.count_in_bars, 2, "2 Bars");
             });
         u.separator();
-        u.label("Project:");
-        u.add(egui::TextEdit::singleline(&mut ui.save_path).desired_width(120.0));
-        if u.button("Save").clicked() {
-            match s.song.save(&ui.save_path.clone()) {
-                Ok(()) => ui.status = format!("saved {}", ui.save_path),
-                Err(e) => ui.status = format!("save failed: {e}"),
-            }
+        let proj_lbl = ui
+            .save_path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unsaved");
+        u.label(format!("Project: {proj_lbl}"));
+        if u.button("Export...").clicked() {
+            ui.show_export_modal = true;
         }
-        if u.button("Load").clicked() {
-            match Song::load(&ui.save_path.clone()) {
-                Ok(mut song) => {
-                    let mut missing = 0;
-                    for smp in song.samples.iter_mut() {
-                        match load_sample_file(&smp.path) {
-                            Ok((data, data_r, sr)) => {
-                                smp.data = data.into();
-                                smp.data_r = data_r.into();
-                                smp.sr = sr;
-                                smp.peaks = compute_sample_peaks(&smp.data, &smp.data_r);
-                            }
-                            Err(_) => missing += 1,
-                        }
-                    }
-                    ui.sel_ch = ui.sel_ch.min(song.channels.len().saturating_sub(1));
-                    ui.sel_pat = ui.sel_pat.min(song.patterns.len().saturating_sub(1));
-                    ui.sel_insert = ui.sel_insert.min(song.mixer_tracks.len().saturating_sub(1));
-                    s.set_inspect_insert(ui.sel_insert);
-                    s.apply_loaded_song(song);
-                    s.set_pattern(ui.sel_pat);
-                    ui.reset_history(&s.song);
-                    ui.status = if missing == 0 {
-                        format!("loaded {}", ui.save_path)
-                    } else {
-                        format!("loaded {} ({missing} samples missing)", ui.save_path)
-                    };
-                }
-                Err(e) => ui.status = format!("load failed: {e}"),
-            }
-        }
-        u.label("WAV:");
-        u.add(egui::TextEdit::singleline(&mut ui.wav_path).desired_width(90.0));
-        if u.button("Export").clicked() {
-            match crate::export::export_wav(&s.song, &ui.wav_path.clone()) {
-                Ok(m) => ui.status = m,
-                Err(e) => ui.status = format!("wav export failed: {e}"),
-            }
-        }
-        u.label("MIDI:");
-        u.add(egui::TextEdit::singleline(&mut ui.mid_path).desired_width(80.0));
-        if u.button("Export").clicked() {
-            match crate::export::export_midi(&s.song, ui.sel_pat, &ui.mid_path.clone()) {
-                Ok(m) => ui.status = m,
-                Err(e) => ui.status = format!("midi export failed: {e}"),
-            }
-        }
-        u.label("Take:");
-        u.add(egui::TextEdit::singleline(&mut ui.take_path).desired_width(80.0));
-        if u.button("Save").clicked() {
-            if !s.has_take() {
-                ui.status = "nothing recorded yet".into();
-            } else {
-                match s.save_take(&ui.take_path.clone()) {
-                    Ok(n) => ui.status = format!("saved take ({n} samples)"),
-                    Err(e) => ui.status = format!("take save failed: {e}"),
-                }
+        if s.has_take()
+            && u.button("Save Take...")
+                .on_hover_text("Save recorded take as WAV via native dialog")
+                .clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .add_filter("WAV Audio", &["wav"])
+                .set_file_name("take.wav")
+                .save_file()
+        {
+            match s.save_take(&p.to_string_lossy()) {
+                Ok(n) => ui.status = format!("saved take ({n} samples)"),
+                Err(e) => ui.status = format!("take save failed: {e}"),
             }
         }
         if u.button("→ Clip")
@@ -1091,15 +1760,13 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 Ok(cid) => {
                     ui.sel_clip = Some(cid);
                     ui.show_playlist = true;
+                    sync_dock_tabs(ui);
                     ui.status = "committed audio take to Playlist".into();
                 }
                 Err(e) => ui.status = format!("take commit failed: {e}"),
             }
         }
     });
-    if ui.show_io_panel {
-        io_and_controllers_panel(ui, s, u);
-    }
 }
 
 pub fn io_and_controllers_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
@@ -1502,9 +2169,10 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
 
     let mut action: Option<(&'static str, usize)> = None;
     let n = s.song.channels.len();
+    let mut drop_row: Option<(Option<usize>, BrowserDragPayload)> = None;
     for i in 0..n {
         let ch_color = color32(s.song.channels[i].color);
-        u.horizontal(|u| {
+        let row_resp = u.horizontal(|u| {
             let (swatch, swatch_resp) =
                 u.allocate_exact_size(egui::vec2(8.0, 22.0), egui::Sense::click());
             u.painter_at(swatch).rect_filled(swatch, 2.0, ch_color);
@@ -1655,6 +2323,23 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     });
                 });
         });
+        if let Some(payload) = row_resp
+            .response
+            .dnd_release_payload::<BrowserDragPayload>()
+        {
+            drop_row = Some((Some(i), (*payload).clone()));
+        }
+    }
+
+    let (_, drop_zone_payload) =
+        u.dnd_drop_zone::<BrowserDragPayload, _>(egui::Frame::group(u.style()), |u| {
+            u.small("+ Drop sample or preset from Browser here to create a new channel");
+        });
+    if let Some(payload) = drop_zone_payload {
+        drop_row = Some((None, (*payload).clone()));
+    }
+    if let Some((target_ch, payload)) = drop_row {
+        drop_browser_onto_channel(ui, s, target_ch, &payload);
     }
 
     if let Some((op, i)) = action {
@@ -1791,15 +2476,24 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                         }
                     }
                 });
-            u.add(egui::TextEdit::singleline(&mut ui.preset_path).desired_width(110.0));
-            if u.button("Save Preset").clicked() {
-                match save_preset_json(c, &ui.preset_path) {
-                    Ok(()) => ui.status = format!("saved preset {}", ui.preset_path),
+            if u.button("Save Preset...").clicked()
+                && let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Thunder Preset", &["json"])
+                    .set_file_name(format!("{}.json", c.name))
+                    .save_file()
+            {
+                let pstr = p.to_string_lossy();
+                match save_preset_json(c, &pstr) {
+                    Ok(()) => ui.status = format!("saved preset {pstr}"),
                     Err(e) => ui.status = format!("preset save failed: {e}"),
                 }
             }
-            if u.button("Load Preset").clicked() {
-                match load_preset_json(&ui.preset_path) {
+            if u.button("Load Preset...").clicked()
+                && let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Thunder Preset", &["json"])
+                    .pick_file()
+            {
+                match load_preset_json(&p.to_string_lossy()) {
                     Ok(preset) => {
                         apply_preset_to_channel(c, &preset);
                         need_rebuild = true;
@@ -4176,6 +4870,18 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
             ui.status = "removed clip".into();
         }
+
+        if let Some(payload) = resp.dnd_release_payload::<BrowserDragPayload>()
+            && let Some(pos) = u.ctx().pointer_latest_pos()
+            && lane_rect.contains(pos)
+        {
+            let tr = ((pos.y - lane_rect.min.y) / TRACK_ROW_H)
+                .floor()
+                .clamp(0.0, (ntracks.saturating_sub(1)) as f32) as usize;
+            let raw_t = ((pos.x - lane_rect.min.x) / tick_w).max(0.0) as u32;
+            let snapped = (raw_t / snap_ticks) * snap_ticks;
+            drop_browser_onto_playlist(ui, s, tr, snapped, &payload);
+        }
     }
 
     // Selected clip inspector + Automation Clip curve editor.
@@ -4731,7 +5437,7 @@ pub fn fx_rack_panel(
     let Some(track) = s.song.mixer_tracks.get_mut(ins) else {
         return;
     };
-    u.group(|u| {
+    let fx_drop = u.group(|u| {
         u.horizontal(|u| {
             u.strong(format!(
                 "Insert FX Rack ({}/{})",
@@ -4757,7 +5463,7 @@ pub fn fx_rack_panel(
             }
         });
         if track.fx.is_empty() {
-            u.label("No insert effects loaded. Pick a module and click + FX.");
+            u.label("No insert effects loaded. Pick a module, drag from Browser, or click + FX.");
             return;
         }
         ui.sel_fx_slot = ui.sel_fx_slot.min(track.fx.len() - 1);
@@ -4821,6 +5527,9 @@ pub fn fx_rack_panel(
             }
         });
     });
+    if let Some(payload) = fx_drop.response.dnd_release_payload::<BrowserDragPayload>() {
+        drop_browser_onto_fx(ui, s, ins, &payload);
+    }
     if let Some(act) = ctx_act {
         apply_param_ctx(ui, s, act);
     }
@@ -5093,80 +5802,499 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
 // Sample browser
 // ---------------------------------------------------------------------------
 
-pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
-    u.heading("Browser / sampler");
-    u.horizontal(|u| {
-        u.label("Dir:");
-        if u.add(egui::TextEdit::singleline(&mut ui.browser_dir).desired_width(200.0))
-            .changed()
-        {
-            ui.browser_cache = sample_files(&ui.browser_dir);
+fn is_audio_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "wav" | "flac" | "mp3" | "ogg" | "aiff" | "aif"
+        )
+    })
+}
+
+pub fn build_browser_tree(dir: &Path, depth: u8) -> Vec<BrowserNode> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs_out = Vec::new();
+    let mut files_out = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
         }
-        if u.button("↻").clicked() {
-            ui.browser_cache = sample_files(&ui.browser_dir);
+        if p.is_dir() && depth < 3 {
+            let children = build_browser_tree(&p, depth + 1);
+            if !children.is_empty() {
+                dirs_out.push(BrowserNode::Dir {
+                    name: name.to_string(),
+                    children,
+                });
+            }
+        } else if p.is_file() && is_audio_file(&p) {
+            files_out.push(BrowserNode::File {
+                name: name.to_string(),
+                path: p.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    dirs_out.sort_by(|a, b| match (a, b) {
+        (BrowserNode::Dir { name: a, .. }, BrowserNode::Dir { name: b, .. }) => a.cmp(b),
+        _ => std::cmp::Ordering::Equal,
+    });
+    files_out.sort_by(|a, b| match (a, b) {
+        (BrowserNode::File { name: a, .. }, BrowserNode::File { name: b, .. }) => a.cmp(b),
+        _ => std::cmp::Ordering::Equal,
+    });
+    dirs_out.extend(files_out);
+    dirs_out
+}
+
+pub fn matches_browser_filter(
+    name: &str,
+    path: &str,
+    search: &str,
+    cat: BrowserCategory,
+    fav_only: bool,
+    prefs: &BrowserPrefs,
+) -> bool {
+    if fav_only && !prefs.favorites.iter().any(|f| f == path) {
+        return false;
+    }
+    let q = search.trim().to_ascii_lowercase();
+    let low_name = name.to_ascii_lowercase();
+    let low_path = path.to_ascii_lowercase();
+    if !q.is_empty() && !low_name.contains(&q) && !low_path.contains(&q) {
+        return false;
+    }
+    let contains_any = |keys: &[&str]| {
+        keys.iter()
+            .any(|k| low_name.contains(k) || low_path.contains(k))
+    };
+    match cat {
+        BrowserCategory::All => true,
+        BrowserCategory::Drums => contains_any(&[
+            "kick", "snare", "clap", "hat", "drum", "perc", "808", "rim", "crash", "tom",
+        ]),
+        BrowserCategory::Bass => contains_any(&["bass", "sub", "808", "low"]),
+        BrowserCategory::Fx => contains_any(&[
+            "fx", "riser", "sweep", "impact", "verb", "delay", "eq", "comp", "sat", "mod",
+        ]),
+        BrowserCategory::Presets => low_path.starts_with("preset:") || low_path.ends_with(".json"),
+    }
+}
+
+pub fn drop_browser_onto_channel(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    target_ch: Option<usize>,
+    payload: &BrowserDragPayload,
+) -> Option<usize> {
+    match payload {
+        BrowserDragPayload::SamplePath(path) => match sample_into_song(s, path) {
+            Ok(s_idx) => {
+                let s_name = s.song.samples[s_idx].name.clone();
+                if let Some(ch) = target_ch
+                    && let Some(c) = s.song.channels.get_mut(ch)
+                {
+                    c.kind = ChannelKind::Sampler {
+                        sample: Some(s_idx),
+                    };
+                    if c.name.starts_with("Sampler") {
+                        c.name = s_name.clone();
+                    }
+                    ui.sel_ch = ch;
+                    ui.status = format!("loaded {s_name} into {}", c.name);
+                    return Some(ch);
+                }
+                let idx = s.song.channels.len();
+                let ins = (idx + 1).min(s.song.mixer_tracks.len().saturating_sub(1));
+                let c = Channel {
+                    name: s_name.clone(),
+                    kind: ChannelKind::Sampler {
+                        sample: Some(s_idx),
+                    },
+                    color: palette_color(idx),
+                    cutoff: 12000.0,
+                    mixer_insert: ins,
+                    ..Default::default()
+                };
+                let ch = s.song.add_channel(c);
+                ui.sel_ch = ch;
+                ui.status = format!("created Sampler {s_name}");
+                Some(ch)
+            }
+            Err(e) => {
+                ui.status = format!("drop load failed: {e}");
+                None
+            }
+        },
+        BrowserDragPayload::PresetIdx(p_idx) => {
+            let presets = factory_presets();
+            let preset = presets.get(*p_idx)?;
+            if let Some(ch) = target_ch
+                && let Some(c) = s.song.channels.get_mut(ch)
+            {
+                apply_preset_to_channel(c, preset);
+                let cname = c.name.clone();
+                s.rebuild_channel(ch);
+                ui.sel_ch = ch;
+                ui.status = format!("loaded preset {} onto {cname}", preset.name);
+                return Some(ch);
+            }
+            let idx = s.song.channels.len();
+            let ins = (idx + 1).min(s.song.mixer_tracks.len().saturating_sub(1));
+            let mut c = Channel {
+                color: palette_color(idx),
+                mixer_insert: ins,
+                ..Default::default()
+            };
+            apply_preset_to_channel(&mut c, preset);
+            let ch = s.song.add_channel(c);
+            s.rebuild_channel(ch);
+            ui.sel_ch = ch;
+            ui.status = format!("added channel {}", preset.name);
+            Some(ch)
+        }
+        BrowserDragPayload::FxChoice(_) => {
+            ui.status = "drop FX modules onto Mixer FX Rack".into();
+            None
+        }
+    }
+}
+
+pub fn drop_browser_onto_playlist(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    track: usize,
+    tick: u32,
+    payload: &BrowserDragPayload,
+) -> Option<u64> {
+    let BrowserDragPayload::SamplePath(path) = payload else {
+        ui.status = "drop audio samples onto Playlist".into();
+        return None;
+    };
+    match sample_into_song(s, path) {
+        Ok(s_idx) => {
+            let smp_len = s.song.samples[s_idx].data.len();
+            let smp_sr = s.song.samples[s_idx].sr.max(1.0);
+            let cid = s.song.add_audio_clip(track, tick, s_idx, 1.0);
+            let spt = (smp_sr * 60.0 / s.song.bpm.max(30.0) / 16.0).max(1.0);
+            let ticks = ((smp_len as f32) / spt).ceil().max(4.0) as u32;
+            if let Some(c) = s.song.clips.iter_mut().find(|c| c.id == cid) {
+                c.len_ticks = ticks;
+            }
+            ui.sel_clip = Some(cid);
+            ui.sel_track = track;
+            ui.status = format!("dropped {} onto Playlist", s.song.samples[s_idx].name);
+            Some(cid)
+        }
+        Err(e) => {
+            ui.status = format!("drop failed: {e}");
+            None
+        }
+    }
+}
+
+pub fn drop_browser_onto_fx(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    ins: usize,
+    payload: &BrowserDragPayload,
+) -> bool {
+    let BrowserDragPayload::FxChoice(choice) = payload else {
+        ui.status = "drop FX modules onto Mixer FX Rack".into();
+        return false;
+    };
+    let Some(track) = s.song.mixer_tracks.get_mut(ins) else {
+        return false;
+    };
+    let kind = fx_kind_from_choice(*choice);
+    let nm = kind.default_name().to_string();
+    if track.add_fx(EffectSlot::new(kind)) {
+        ui.sel_fx_slot = track.fx.len().saturating_sub(1);
+        ui.status = format!("added {nm} to {}", track.name);
+        true
+    } else {
+        ui.status = "FX rack full".into();
+        false
+    }
+}
+
+fn preview_browser_sample(ui: &mut AppUi, s: &mut AppState, path: &str) {
+    match sample_into_song(s, path) {
+        Ok(idx) => {
+            if ui.browser_sync_preview {
+                s.live_sample_synced(idx);
+                ui.status = format!("synced preview {path}");
+            } else {
+                s.live_sample(idx);
+                ui.status = format!("preview {path}");
+            }
+        }
+        Err(e) => ui.status = format!("preview failed: {e}"),
+    }
+}
+
+fn toggle_browser_fav(ui: &mut AppUi, path: &str) {
+    if let Some(pos) = ui.browser_prefs.favorites.iter().position(|f| f == path) {
+        ui.browser_prefs.favorites.remove(pos);
+    } else {
+        ui.browser_prefs.favorites.push(path.to_string());
+    }
+    if let Some(cfg) = config_dir() {
+        ui.browser_prefs.save_to(&cfg);
+    }
+}
+
+fn render_browser_nodes(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui, nodes: &[BrowserNode]) {
+    for node in nodes {
+        match node {
+            BrowserNode::Dir { name, children } => {
+                egui::CollapsingHeader::new(format!("📁 {name}"))
+                    .id_salt(("bdir", name))
+                    .show(u, |u| render_browser_nodes(ui, s, u, children));
+            }
+            BrowserNode::File { name, path } => {
+                if !matches_browser_filter(
+                    name,
+                    path,
+                    &ui.browser_search,
+                    ui.browser_category,
+                    ui.browser_fav_only,
+                    &ui.browser_prefs,
+                ) {
+                    continue;
+                }
+                u.horizontal(|u| {
+                    let fav = ui.browser_prefs.favorites.iter().any(|f| f == path);
+                    if u.small_button(if fav { "★" } else { "☆" })
+                        .on_hover_text("Toggle favorite")
+                        .clicked()
+                    {
+                        toggle_browser_fav(ui, path);
+                    }
+                    let item = u.add(egui::Label::new(name).sense(egui::Sense::click_and_drag()));
+                    if item.dragged() {
+                        item.dnd_set_drag_payload(BrowserDragPayload::SamplePath(path.clone()));
+                    }
+                    if item.double_clicked() {
+                        preview_browser_sample(ui, s, path);
+                    }
+                    item.on_hover_text("Drag to Channel Rack or Playlist; double-click to preview");
+                    if u.small_button("▶").on_hover_text("Preview").clicked() {
+                        preview_browser_sample(ui, s, path);
+                    }
+                    if u.small_button("→ Ch")
+                        .on_hover_text("Load into selected channel")
+                        .clicked()
+                    {
+                        let ch = ui.sel_ch;
+                        drop_browser_onto_channel(
+                            ui,
+                            s,
+                            Some(ch),
+                            &BrowserDragPayload::SamplePath(path.clone()),
+                        );
+                    }
+                });
+            }
+        }
+    }
+}
+
+pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
+    u.heading("Browser");
+    u.horizontal_wrapped(|u| {
+        if u.button("Folder...").clicked()
+            && let Some(p) = rfd::FileDialog::new().pick_folder()
+        {
+            ui.browser_dir = p.to_string_lossy().into_owned();
+            ui.browser_tree_dirty = true;
+        }
+        if u.button("↻").on_hover_text("Rescan folder").clicked() {
+            ui.browser_tree_dirty = true;
+        }
+        if u.button("+ Pin")
+            .on_hover_text("Pin active folder")
+            .clicked()
+        {
+            let dir = ui.browser_dir.clone();
+            if !dir.is_empty() && !ui.browser_prefs.pinned_dirs.contains(&dir) {
+                ui.browser_prefs.pinned_dirs.push(dir);
+                if let Some(cfg) = config_dir() {
+                    ui.browser_prefs.save_to(&cfg);
+                }
+            }
         }
         if u.button("~/Music").clicked() {
             ui.browser_dir = home_music_dir();
-            ui.browser_cache = sample_files(&ui.browser_dir);
+            ui.browser_tree_dirty = true;
         }
     });
-    if ui.browser_cache.is_empty() {
-        ui.browser_cache = sample_files(&ui.browser_dir);
-    }
-    for path in ui.browser_cache.clone() {
-        u.horizontal(|u| {
-            let name = std::path::Path::new(&path)
-                .file_name()
-                .map(|x| x.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            u.label(name);
-            if u.button("▶").on_hover_text("Preview").clicked() {
-                match sample_into_song(s, &path) {
-                    Ok(idx) => {
-                        s.live_sample(idx);
-                        ui.status = format!("preview {path}");
-                    }
-                    Err(e) => ui.status = format!("preview failed: {e}"),
+
+    if !ui.browser_prefs.pinned_dirs.is_empty() {
+        let pins = ui.browser_prefs.pinned_dirs.clone();
+        let mut rm_pin: Option<String> = None;
+        u.horizontal_wrapped(|u| {
+            u.label("Pins:");
+            for pdir in pins {
+                let lbl = Path::new(&pdir)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&pdir);
+                if u.selectable_label(ui.browser_dir == pdir, lbl)
+                    .on_hover_text(&pdir)
+                    .clicked()
+                {
+                    ui.browser_dir = pdir.clone();
+                    ui.browser_tree_dirty = true;
                 }
-            }
-            if u.button("→ Ch")
-                .on_hover_text("Load into selected channel")
-                .clicked()
-            {
-                match sample_into_song(s, &path) {
-                    Ok(idx) => {
-                        s.song.channels[ui.sel_ch].kind =
-                            crate::song::ChannelKind::Sampler { sample: Some(idx) };
-                        ui.status = format!("loaded to channel: {path}");
-                    }
-                    Err(e) => ui.status = format!("load failed: {e}"),
+                if u.small_button("×").on_hover_text("Unpin").clicked() {
+                    rm_pin = Some(pdir);
                 }
             }
         });
-    }
-    u.horizontal(|u| {
-        u.label("Path:");
-        u.add(egui::TextEdit::singleline(&mut ui.sample_path).desired_width(220.0));
-        if u.button("Load → Ch").clicked() {
-            let path = ui.sample_path.clone();
-            match sample_into_song(s, &path) {
-                Ok(idx) => {
-                    s.song.channels[ui.sel_ch].kind =
-                        crate::song::ChannelKind::Sampler { sample: Some(idx) };
-                    ui.status = format!("loaded to channel: {path}");
-                }
-                Err(e) => ui.status = format!("load failed: {e}"),
+        if let Some(p) = rm_pin {
+            ui.browser_prefs.pinned_dirs.retain(|d| d != &p);
+            if let Some(cfg) = config_dir() {
+                ui.browser_prefs.save_to(&cfg);
             }
         }
-    });
+    }
+
     u.horizontal(|u| {
-        u.label(format!("{} samples in project", s.song.samples.len()));
+        u.label("Search:");
+        u.add(egui::TextEdit::singleline(&mut ui.browser_search).desired_width(135.0));
+        u.toggle_value(&mut ui.browser_fav_only, "★")
+            .on_hover_text("Favorites only");
+        u.toggle_value(&mut ui.browser_sync_preview, "Sync")
+            .on_hover_text("Tempo-synced loop preview");
+    });
+
+    u.horizontal_wrapped(|u| {
+        for cat in BrowserCategory::ALL {
+            u.selectable_value(&mut ui.browser_category, cat, cat.name());
+        }
+    });
+
+    if ui.browser_tree_dirty {
+        ui.browser_tree = build_browser_tree(Path::new(&ui.browser_dir), 0);
+        ui.browser_tree_dirty = false;
+    }
+
+    let tree = ui.browser_tree.clone();
+    if !tree.is_empty() {
+        render_browser_nodes(ui, s, u, &tree);
+    } else if ui.browser_category != BrowserCategory::Presets
+        && ui.browser_category != BrowserCategory::Fx
+    {
+        u.small(format!("No audio files in {}", ui.browser_dir));
+    }
+
+    if matches!(
+        ui.browser_category,
+        BrowserCategory::All | BrowserCategory::Presets
+    ) {
+        let presets = factory_presets();
+        egui::CollapsingHeader::new("Factory Presets")
+            .default_open(ui.browser_category == BrowserCategory::Presets)
+            .show(u, |u| {
+                for (pi, preset) in presets.iter().enumerate() {
+                    let key = format!("preset:{}", preset.name);
+                    if !matches_browser_filter(
+                        &preset.name,
+                        &key,
+                        &ui.browser_search,
+                        ui.browser_category,
+                        ui.browser_fav_only,
+                        &ui.browser_prefs,
+                    ) {
+                        continue;
+                    }
+                    u.horizontal(|u| {
+                        let fav = ui.browser_prefs.favorites.iter().any(|f| f == &key);
+                        if u.small_button(if fav { "★" } else { "☆" }).clicked() {
+                            toggle_browser_fav(ui, &key);
+                        }
+                        let resp = u.add(
+                            egui::Label::new(&preset.name).sense(egui::Sense::click_and_drag()),
+                        );
+                        if resp.dragged() {
+                            resp.dnd_set_drag_payload(BrowserDragPayload::PresetIdx(pi));
+                        }
+                        if resp.double_clicked() {
+                            let ch = ui.sel_ch;
+                            drop_browser_onto_channel(
+                                ui,
+                                s,
+                                Some(ch),
+                                &BrowserDragPayload::PresetIdx(pi),
+                            );
+                        }
+                    });
+                }
+            });
+    }
+
+    if matches!(
+        ui.browser_category,
+        BrowserCategory::All | BrowserCategory::Fx
+    ) {
+        egui::CollapsingHeader::new("FX Modules")
+            .default_open(ui.browser_category == BrowserCategory::Fx)
+            .show(u, |u| {
+                for (fi, &name) in FX_CHOICE_NAMES.iter().enumerate() {
+                    let key = format!("fx:{name}");
+                    if !matches_browser_filter(
+                        name,
+                        &key,
+                        &ui.browser_search,
+                        ui.browser_category,
+                        ui.browser_fav_only,
+                        &ui.browser_prefs,
+                    ) {
+                        continue;
+                    }
+                    u.horizontal(|u| {
+                        let resp =
+                            u.add(egui::Label::new(name).sense(egui::Sense::click_and_drag()));
+                        if resp.dragged() {
+                            resp.dnd_set_drag_payload(BrowserDragPayload::FxChoice(fi));
+                        }
+                        if resp.double_clicked() {
+                            let ins = ui.sel_insert;
+                            drop_browser_onto_fx(ui, s, ins, &BrowserDragPayload::FxChoice(fi));
+                        }
+                    });
+                }
+            });
+    }
+
+    u.separator();
+    u.horizontal_wrapped(|u| {
+        if u.button("Open Sample...").clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "aiff"])
+                .pick_file()
+        {
+            let ch = ui.sel_ch;
+            drop_browser_onto_channel(
+                ui,
+                s,
+                Some(ch),
+                &BrowserDragPayload::SamplePath(p.to_string_lossy().into_owned()),
+            );
+        }
         if !s.song.samples.is_empty() && u.button("Edison Editor").clicked() {
             let idx = ui.clip_sample.min(s.song.samples.len() - 1);
             ui.edison_sample = Some(idx);
             ui.edison_sel = (0.0, 1.0);
             ui.edison_slices.clear();
         }
+        u.small(format!("{} samples loaded", s.song.samples.len()));
     });
 }
 
@@ -5408,6 +6536,7 @@ pub fn edison_editor_ui(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 }
                 ui.sel_clip = Some(cid);
                 ui.show_playlist = true;
+                sync_dock_tabs(ui);
                 ui.status = "placed sample on Playlist".into();
             }
             "channel" => {
@@ -5438,6 +6567,136 @@ pub fn edison_window(ui: &mut AppUi, s: &mut AppState, ctx: &egui::Context) {
     if !open {
         ui.edison_sample = None;
     }
+}
+
+pub fn export_modal_ui(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
+    u.horizontal_wrapped(|u| {
+        u.label("Format:");
+        for fmt in ExportFormat::ALL {
+            if u.selectable_label(ui.export_cfg.format == fmt, fmt.name())
+                .clicked()
+            {
+                ui.export_cfg.format = fmt;
+                let base = Path::new(&ui.export_target_path)
+                    .file_stem()
+                    .and_then(|st| st.to_str())
+                    .filter(|st| !st.is_empty())
+                    .unwrap_or("mixdown");
+                ui.export_target_path = format!("{base}.{}", fmt.ext());
+            }
+        }
+    });
+    u.horizontal_wrapped(|u| {
+        u.label("Sample rate:");
+        for (sr, lbl) in [(44100u32, "44.1 kHz"), (48000, "48 kHz"), (96000, "96 kHz")] {
+            if u.selectable_label(ui.export_cfg.sample_rate == sr, lbl)
+                .clicked()
+            {
+                ui.export_cfg.sample_rate = sr;
+            }
+        }
+    });
+    u.horizontal_wrapped(|u| {
+        u.label("Oversample:");
+        for (os, lbl) in [(1u8, "1x"), (2, "2x"), (4, "4x")] {
+            if u.selectable_label(ui.export_cfg.oversample == os, lbl)
+                .clicked()
+            {
+                ui.export_cfg.oversample = os;
+            }
+        }
+    });
+    u.horizontal_wrapped(|u| {
+        u.label("Tail:");
+        for tail in TailMode::ALL {
+            if u.selectable_label(ui.export_cfg.tail_mode == tail, tail.name())
+                .clicked()
+            {
+                ui.export_cfg.tail_mode = tail;
+            }
+        }
+    });
+    u.checkbox(
+        &mut ui.export_cfg.split_mixer_tracks,
+        "Split Mixer Tracks (Stem Export)",
+    );
+    u.separator();
+    u.horizontal(|u| {
+        if u.button("Export via Dialog...").clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .add_filter(ui.export_cfg.format.name(), &[ui.export_cfg.format.ext()])
+                .set_file_name(&ui.export_target_path)
+                .save_file()
+        {
+            match crate::export::export_audio(&s.song, &p.to_string_lossy(), &ui.export_cfg) {
+                Ok(m) => {
+                    ui.status = m;
+                    ui.show_export_modal = false;
+                }
+                Err(e) => ui.status = format!("export failed: {e}"),
+            }
+        }
+        if u.button("Close").clicked() {
+            ui.show_export_modal = false;
+        }
+    });
+}
+
+pub fn export_window(ui: &mut AppUi, s: &mut AppState, ctx: &egui::Context) {
+    if !ui.show_export_modal {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Export Audio / Stems")
+        .open(&mut open)
+        .default_width(480.0)
+        .show(ctx, |u| {
+            export_modal_ui(ui, s, u);
+        });
+    if !open {
+        ui.show_export_modal = false;
+    }
+}
+
+pub fn recovery_modal_ui(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
+    u.label("An autosaved session from an unexpected exit was found.");
+    u.horizontal(|u| {
+        if u.button("Restore Autosave").clicked() {
+            if let Some(dir) = data_dir() {
+                match load_autosave(&dir) {
+                    Ok((song, missing)) => {
+                        apply_loaded_song_to_ui(ui, s, song, None);
+                        ui.status = if missing == 0 {
+                            "restored autosaved project".into()
+                        } else {
+                            format!("restored autosave ({missing} missing samples)")
+                        };
+                    }
+                    Err(e) => ui.status = format!("autosave restore failed: {e}"),
+                }
+            }
+            ui.show_recovery_prompt = false;
+        }
+        if u.button("Discard Autosave").clicked() {
+            if let Some(dir) = data_dir() {
+                discard_recovery(&dir);
+            }
+            ui.show_recovery_prompt = false;
+            ui.status = "discarded autosave".into();
+        }
+    });
+}
+
+pub fn recovery_window(ui: &mut AppUi, s: &mut AppState, ctx: &egui::Context) {
+    if !ui.show_recovery_prompt {
+        return;
+    }
+    egui::Window::new("Crash Recovery")
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |u| {
+            recovery_modal_ui(ui, s, u);
+        });
 }
 
 #[cfg(test)]
@@ -6017,5 +7276,206 @@ mod ui_tests {
         assert!(ui.midi_learn.process_cc(&mut s.song, 0, 74, 127));
         assert_eq!(s.song.midi_mappings.len(), 1);
         assert!((s.song.channels[0].cutoff - 16000.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn typing_piano_maps_two_octaves_and_routes_midi_notes() {
+        assert_eq!(typing_key_to_midi(egui::Key::Z, 4), Some(60));
+        assert_eq!(typing_key_to_midi(egui::Key::Q, 4), Some(72));
+        assert_eq!(typing_key_to_midi(egui::Key::P, 4), Some(88));
+        assert_eq!(typing_key_to_midi(egui::Key::F1, 4), None);
+
+        let mut st = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        st.ui.typing_piano = true;
+        st.ui.sel_ch = 4;
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                process_typing_piano(&mut st.ui, &mut st.app, u.ctx());
+            },
+            st,
+        );
+        h.step();
+        h.event(egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        assert_eq!(h.state().ui.held_typing_keys.len(), 1);
+        assert_eq!(h.state().ui.held_typing_keys[0].1, 60);
+        h.event(egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        assert!(h.state().ui.held_typing_keys.is_empty());
+    }
+
+    #[test]
+    fn workspace_shortcuts_respect_panel_focus_and_toggle_dock() {
+        let mut st = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        st.app.song.patterns[0].notes[4].push(Note::new(0, 4, 60, 0.9));
+        st.app.song.patterns[0].notes[4].push(Note::new(16, 4, 64, 0.9));
+        st.ui.sel_ch = 4;
+        st.ui.sel_insert = 3;
+        st.ui.focus = FocusPanel::PianoRoll;
+
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                handle_workspace_shortcuts(&mut st.ui, &mut st.app, u.ctx());
+            },
+            st,
+        );
+        h.step();
+
+        // Ctrl+L in PianoRoll triggers legato (extends note 0 up to tick 16).
+        h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::L);
+        h.step();
+        assert_eq!(h.state().app.song.patterns[0].notes[4][0].len, 16);
+
+        // Switch focus to Rack: Ctrl+L links selected channel to selected insert.
+        h.state_mut().ui.focus = FocusPanel::Rack;
+        h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::L);
+        h.step();
+        assert_eq!(h.state().app.song.channels[4].mixer_insert, 3);
+
+        // Ctrl+T toggles typing piano; F9 toggles Mixer dock tab.
+        let before_mix = h.state().ui.show_mixer;
+        h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::T);
+        h.key_press(egui::Key::F9);
+        h.step();
+        assert!(h.state().ui.typing_piano);
+        assert_ne!(h.state().ui.show_mixer, before_mix);
+        assert_eq!(
+            h.state().ui.dock_state.find_tab(&DockTab::Mixer).is_some(),
+            h.state().ui.show_mixer
+        );
+    }
+
+    #[test]
+    fn browser_filter_search_favs_and_dnd_helpers() {
+        let mut prefs = BrowserPrefs::default();
+        prefs.favorites.push("/tmp/kick_808.wav".into());
+        assert!(matches_browser_filter(
+            "kick_808.wav",
+            "/tmp/kick_808.wav",
+            "808",
+            BrowserCategory::Drums,
+            true,
+            &prefs
+        ));
+        assert!(!matches_browser_filter(
+            "pad_warm.wav",
+            "/tmp/pad_warm.wav",
+            "",
+            BrowserCategory::Drums,
+            false,
+            &prefs
+        ));
+        assert!(!matches_browser_filter(
+            "snare.wav",
+            "/tmp/snare.wav",
+            "",
+            BrowserCategory::All,
+            true,
+            &prefs
+        ));
+
+        // Create temporary tiny WAV file for real DnD payload drop checks.
+        let dir = std::env::temp_dir().join("thunder_ui_dnd_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav_path = dir.join("drop_kick.wav");
+        crate::export::write_wav_file(
+            &wav_path.to_string_lossy(),
+            &vec![0.3; 512],
+            &vec![0.3; 512],
+            44100.0,
+        )
+        .unwrap();
+
+        let mut ui = AppUi::default();
+        let mut app = AppState::new();
+        let sample_payload =
+            BrowserDragPayload::SamplePath(wav_path.to_string_lossy().into_owned());
+
+        // Drop onto new channel & existing Playlist track.
+        let old_ch_len = app.song.channels.len();
+        assert!(drop_browser_onto_channel(&mut ui, &mut app, None, &sample_payload).is_some());
+        assert_eq!(app.song.channels.len(), old_ch_len + 1);
+        assert!(drop_browser_onto_playlist(&mut ui, &mut app, 0, 16, &sample_payload).is_some());
+        assert!(
+            app.song
+                .clips
+                .iter()
+                .any(|c| matches!(c.kind, ClipKind::Audio { .. }))
+        );
+
+        // Drop Factory Preset onto channel 0 & Stock FX onto Mixer insert 1.
+        assert!(
+            drop_browser_onto_channel(
+                &mut ui,
+                &mut app,
+                Some(0),
+                &BrowserDragPayload::PresetIdx(0)
+            )
+            .is_some()
+        );
+        assert!(drop_browser_onto_fx(
+            &mut ui,
+            &mut app,
+            1,
+            &BrowserDragPayload::FxChoice(0)
+        ));
+        assert_eq!(app.song.mixer_tracks[1].fx.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_modal_and_recovery_prompt_work() {
+        let mut st = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        st.ui.show_export_modal = true;
+        st.ui.show_recovery_prompt = true;
+
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                export_modal_ui(&mut st.ui, &mut st.app, u);
+                u.separator();
+                recovery_modal_ui(&mut st.ui, &mut st.app, u);
+            },
+            st,
+        );
+        h.set_size(egui::vec2(720.0, 560.0));
+        h.step();
+
+        h.get_by_label("FLAC 16-bit").click();
+        h.get_by_label("Wrap remainder").click();
+        h.get_by_label("48 kHz").click();
+        h.get_by_label("2x").click();
+        h.get_by_label("Discard Autosave").click();
+        h.step();
+
+        assert_eq!(h.state().ui.export_cfg.format, ExportFormat::Flac16);
+        assert_eq!(h.state().ui.export_cfg.tail_mode, TailMode::Wrap);
+        assert_eq!(h.state().ui.export_cfg.sample_rate, 48000);
+        assert_eq!(h.state().ui.export_cfg.oversample, 2);
+        assert!(!h.state().ui.show_recovery_prompt);
     }
 }

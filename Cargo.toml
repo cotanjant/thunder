@@ -25,6 +25,13 @@ hound = "3"
 dirs = "6"
 rtrb = "0.3"
 midir = "0.11"
+egui_dock = "0.21"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+flacenc = { version = "0.5", default-features = false }
+rusty_mp3 = "1"
+oxideav-vorbis = "0.0.13"
+oxideav-ogg = "0.1"
 
 [dev-dependencies]
 egui_kittest = "0.36"
@@ -32,6 +39,18 @@ egui_kittest = "0.36"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[profile.dev.package.oxideav-vorbis]
+opt-level = 2
+
+[profile.dev.package.flacenc]
+opt-level = 2
+
+[profile.dev.package.rusty_mp3]
+opt-level = 2
+
+[profile.dev.package.fundsp]
+opt-level = 2
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"

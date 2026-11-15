@@ -1270,10 +1270,14 @@ impl EngineRt {
     }
 
     pub fn live_sample(&mut self, idx: usize) {
+        self.live_sample_rate(idx, 1.0);
+    }
+
+    pub fn live_sample_rate(&mut self, idx: usize, rate: f32) {
         self.push_playhead(PlayHead::new(
             PlayKind::Sample(idx),
             None,
-            1.0,
+            rate.clamp(0.25, 4.0),
             0.9,
             usize::MAX,
         ));
@@ -2568,6 +2572,7 @@ enum AudioCmd {
     LiveNote { ch: usize, midi: u8, vel: f32 },
     LiveKit(KitPiece),
     LiveSample(usize),
+    LiveSampleRate(usize, f32),
     Midi(MidiMsg),
     SetMidiTarget(usize),
     SetInputMonitor { enabled: bool, insert: usize },
@@ -2777,6 +2782,7 @@ impl AudioWorker {
                 }
                 AudioCmd::LiveKit(p) => self.rt.live_kit(p),
                 AudioCmd::LiveSample(idx) => self.rt.live_sample(idx),
+                AudioCmd::LiveSampleRate(idx, rate) => self.rt.live_sample_rate(idx, rate),
                 AudioCmd::Midi(msg) => self.rt.handle_midi_msg(&self.song, msg),
                 AudioCmd::SetMidiTarget(ch) => self.rt.midi_target_ch = ch,
                 AudioCmd::SetInputMonitor { enabled, insert } => {
@@ -3112,6 +3118,29 @@ impl AppState {
         self.rt.live_sample(idx);
         if let Some(b) = &mut self.audio {
             b.send(AudioCmd::LiveSample(idx));
+        }
+    }
+
+    pub fn live_sample_synced(&mut self, idx: usize) {
+        let rate = self
+            .song
+            .samples
+            .get(idx)
+            .map(|smp| {
+                let secs = smp.data.len() as f32 / smp.sr.max(1.0);
+                let beat_secs = 60.0 / self.song.bpm.max(30.0);
+                let beats_raw = secs / beat_secs;
+                let snap_beats = [0.5_f32, 1.0, 2.0, 4.0, 8.0, 16.0]
+                    .into_iter()
+                    .min_by(|a, b| (beats_raw - *a).abs().total_cmp(&(beats_raw - *b).abs()))
+                    .unwrap_or(1.0);
+                let target_secs = snap_beats * beat_secs;
+                (secs / target_secs.max(0.05)).clamp(0.25, 4.0)
+            })
+            .unwrap_or(1.0);
+        self.rt.live_sample_rate(idx, rate);
+        if let Some(b) = &mut self.audio {
+            b.send(AudioCmd::LiveSampleRate(idx, rate));
         }
     }
 

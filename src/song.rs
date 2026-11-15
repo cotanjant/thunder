@@ -769,7 +769,7 @@ impl EffectSlot {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct TimeSig {
     pub num: u8,
     pub den: u8,
@@ -1051,7 +1051,7 @@ fn default_note_mid() -> f32 {
     0.5
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Note {
     pub tick: u32,
     pub len: u32,
