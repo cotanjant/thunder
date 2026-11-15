@@ -126,6 +126,8 @@ pub fn render_to_stereo_cfg(song: &Song, cfg: &ExportConfig) -> (Vec<f32>, Vec<f
 
     let mut rt = EngineRt::new(render_sr);
     rt.ensure_channels(song);
+    let (_clap_mains, clap_nodes) = crate::clap_host::mount_all_for_offline(song, render_sr);
+    rt.clap_nodes = clap_nodes;
     rt.song_mode = true;
     rt.ignore_loop = true;
     rt.playing = true;
@@ -142,6 +144,8 @@ pub fn render_to_stereo_cfg(song: &Song, cfg: &ExportConfig) -> (Vec<f32>, Vec<f
         rt.process(song, &mut raw_l[done..done + n], &mut raw_r[done..done + n]);
         done += n;
     }
+    drop(rt);
+    drop(_clap_mains);
 
     let mut l = downsample_by(&raw_l, os);
     let mut r = downsample_by(&raw_r, os);

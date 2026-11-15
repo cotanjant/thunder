@@ -375,6 +375,45 @@ impl Default for FmSynthCfg {
     }
 }
 
+static CLAP_RT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn next_clap_rt_id() -> u64 {
+    CLAP_RT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClapPluginCfg {
+    #[serde(skip, default = "next_clap_rt_id")]
+    pub rt_id: u64,
+    pub path: String,
+    pub plugin_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub state_b64: String,
+    #[serde(default)]
+    pub params: Vec<(u32, f64)>,
+    #[serde(default)]
+    pub reported_latency: usize,
+}
+
+impl ClapPluginCfg {
+    pub fn new(
+        path: impl Into<String>,
+        plugin_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            rt_id: next_clap_rt_id(),
+            path: path.into(),
+            plugin_id: plugin_id.into(),
+            name: name.into(),
+            state_b64: String::new(),
+            params: Vec::new(),
+            reported_latency: 0,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChannelKind {
     Synth { wave: WaveKind },
@@ -383,6 +422,7 @@ pub enum ChannelKind {
     SuperSynth(SuperSynthCfg),
     FmSynth(FmSynthCfg),
     DrumRack { pads: Vec<DrumPad> },
+    ClapPlugin(ClapPluginCfg),
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -718,6 +758,7 @@ pub enum FxKind {
     Modulator(ModFxCfg),
     Saturator(SatCfg),
     StereoShaper(StereoShaperCfg),
+    ClapPlugin(ClapPluginCfg),
 }
 
 impl FxKind {
@@ -736,6 +777,7 @@ impl FxKind {
             FxKind::Modulator(m) => m.mode.name(),
             FxKind::Saturator(_) => "Saturator",
             FxKind::StereoShaper(_) => "Stereo Shaper",
+            FxKind::ClapPlugin(_) => "CLAP Plugin",
         }
     }
 }
@@ -750,8 +792,12 @@ pub struct EffectSlot {
 
 impl EffectSlot {
     pub fn new(kind: FxKind) -> Self {
+        let name = match &kind {
+            FxKind::ClapPlugin(c) if !c.name.is_empty() => c.name.clone(),
+            _ => kind.default_name().into(),
+        };
         Self {
-            name: kind.default_name().into(),
+            name,
             bypass: false,
             mix: 1.0,
             kind,
@@ -764,6 +810,7 @@ impl EffectSlot {
         }
         match &self.kind {
             FxKind::Compressor(c) if c.limiter => c.lookahead_samples.min(256),
+            FxKind::ClapPlugin(c) => c.reported_latency,
             _ => 0,
         }
     }
@@ -1575,6 +1622,7 @@ impl MixerTrack {
 
 pub struct PdcPlan {
     pub order: Vec<usize>,
+    pub ch_delay: Vec<usize>,
     pub direct_delay: Vec<usize>,
     pub route_delay: Vec<Vec<(usize, usize)>>,
     pub total_out: Vec<usize>,
@@ -1730,6 +1778,9 @@ impl Song {
         let orig = self.channels.get(idx)?.clone();
         let mut copy = orig;
         copy.name = format!("{} copy", copy.name);
+        if let ChannelKind::ClapPlugin(cfg) = &mut copy.kind {
+            cfg.rt_id = next_clap_rt_id();
+        }
         let new_idx = self.channels.len();
         self.channels.push(copy);
         for p in &mut self.patterns {
@@ -2160,7 +2211,7 @@ impl Song {
         order
     }
 
-    /// Automatic Plugin Delay Compensation across parallel routed mixer paths.
+    /// Automatic Plugin Delay Compensation across channels and parallel routed mixer paths.
     pub fn compute_pdc(&self) -> PdcPlan {
         let n = self.mixer_tracks.len();
         let order = self.mixer_topo_order();
@@ -2172,6 +2223,32 @@ impl Song {
                 }
             }
         }
+        let mut ch_lat = vec![0usize; n];
+        for ch in &self.channels {
+            let lat = match &ch.kind {
+                ChannelKind::ClapPlugin(c) => c.reported_latency,
+                _ => 0,
+            };
+            if ch.mixer_insert < n {
+                ch_lat[ch.mixer_insert] = ch_lat[ch.mixer_insert].max(lat);
+            }
+        }
+        let ch_delay = self
+            .channels
+            .iter()
+            .map(|ch| {
+                let lat = match &ch.kind {
+                    ChannelKind::ClapPlugin(c) => c.reported_latency,
+                    _ => 0,
+                };
+                if ch.mixer_insert < n {
+                    ch_lat[ch.mixer_insert].saturating_sub(lat)
+                } else {
+                    0
+                }
+            })
+            .collect();
+
         let mut direct_delay = vec![0usize; n];
         let mut total_out = vec![0usize; n];
         let mut route_delay: Vec<Vec<(usize, usize)>> = self
@@ -2186,15 +2263,18 @@ impl Song {
                 .map(|&(u, _)| total_out[u])
                 .max()
                 .unwrap_or(0);
-            direct_delay[v] = max_in;
+            let aligned_in = max_in.max(ch_lat[v]);
+            direct_delay[v] = aligned_in.saturating_sub(ch_lat[v]);
             for &(u, ri) in &incoming_non_sc[v] {
-                route_delay[u][ri].1 = max_in.saturating_sub(total_out[u]);
+                route_delay[u][ri].1 = aligned_in.saturating_sub(total_out[u]);
             }
-            total_out[v] = max_in.saturating_add(self.mixer_tracks[v].effective_latency_samples());
+            total_out[v] =
+                aligned_in.saturating_add(self.mixer_tracks[v].effective_latency_samples());
         }
 
         PdcPlan {
             order,
+            ch_delay,
             direct_delay,
             route_delay,
             total_out,
@@ -3726,5 +3806,56 @@ mod tests {
         smp.fade_out_range_in_place(0.5, 1.0);
         smp.trim_range_in_place(0.05, 0.6);
         assert_eq!(smp.data.len(), 1100);
+    }
+
+    #[test]
+    fn phase7_clap_serde_and_pdc_alignment() {
+        let mut song = new_empty();
+        let zero_ch = song.add_channel(Channel {
+            name: "ZeroSynth".into(),
+            kind: ChannelKind::Synth {
+                wave: WaveKind::Saw,
+            },
+            mixer_insert: 1,
+            ..Default::default()
+        });
+        let clap_ch = song.add_channel(Channel {
+            name: "Stub Synth".into(),
+            kind: ChannelKind::ClapPlugin(ClapPluginCfg {
+                path: "/tmp/stub.clap".into(),
+                plugin_id: "org.cotanjant.thunder.test_stub".into(),
+                name: "Stub Synth".into(),
+                reported_latency: 32,
+                state_b64: "AAAA".into(),
+                params: vec![(1, 0.75)],
+                rt_id: next_clap_rt_id(),
+            }),
+            mixer_insert: 1,
+            ..Default::default()
+        });
+        assert!(
+            song.mixer_tracks[1].add_fx(EffectSlot::new(FxKind::ClapPlugin(ClapPluginCfg {
+                path: "/tmp/stub.clap".into(),
+                plugin_id: "org.cotanjant.thunder.test_stub".into(),
+                name: "Stub FX".into(),
+                reported_latency: 16,
+                state_b64: String::new(),
+                params: Vec::new(),
+                rt_id: next_clap_rt_id(),
+            })))
+        );
+
+        let json = serde_json::to_string(&song).unwrap();
+        let back = Song::from_json_str(&json).unwrap();
+        assert!(
+            matches!(back.channels[clap_ch].kind, ChannelKind::ClapPlugin(ref c) if c.reported_latency == 32 && c.params == vec![(1, 0.75)])
+        );
+        assert!(
+            matches!(back.mixer_tracks[1].fx[0].kind, FxKind::ClapPlugin(ref c) if c.reported_latency == 16)
+        );
+
+        let pdc = back.compute_pdc();
+        assert_eq!(pdc.ch_delay[clap_ch], 0);
+        assert_eq!(pdc.ch_delay[zero_ch], 32);
     }
 }

@@ -5,6 +5,7 @@
     windows_subsystem = "windows"
 )]
 
+mod clap_host;
 mod engine;
 mod export;
 mod fx;
@@ -15,12 +16,13 @@ mod synth;
 mod ui;
 
 use engine::{AppState, start_audio};
+use raw_window_handle::HasWindowHandle;
 use ui::AppUi;
 
 struct DawApp {
+    _stream: Option<cpal::Stream>,
     state: AppState,
     ui: AppUi,
-    _stream: Option<cpal::Stream>,
 }
 
 /// FL Studio look: near-black blue-gray, green LEDs and selections.
@@ -42,10 +44,12 @@ fn fl_visuals() -> eframe::egui::Visuals {
 }
 
 impl eframe::App for DawApp {
-    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
+        self.ui.parent_window = frame.window_handle().ok().map(|h| h.as_raw());
         self.state.sync_audio();
+        ui::sync_clap_plugins(&mut self.ui, &mut self.state);
         let target_ch = self
             .ui
             .lock_midi_ch
@@ -129,6 +133,14 @@ impl eframe::App for DawApp {
 }
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--scan-clap"
+            && let Some(path) = args.next()
+        {
+            std::process::exit(clap_host::run_scan_cli(&path));
+        }
+    }
     if std::env::args().any(|a| a == "--offline-test") {
         let mut st = AppState::new();
         // The default project is blank; the self-test needs sound to find.

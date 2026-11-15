@@ -2,7 +2,8 @@
 //! PCM kit + pitched sampler playback routed through per-channel DSP,
 //! delay/reverb sends, sample-clock scheduler, and disk-streaming take recorder.
 
-use crate::fx::{FFT_BINS, MixerInsertRt, compute_fft_bins};
+use crate::clap_host::{ClapAudioNode, ClapBlockNote};
+use crate::fx::{FFT_BINS, FxProcCtx, MixerInsertRt, compute_fft_bins};
 use crate::midi::MidiMsg;
 use crate::song::{
     AutoTarget, ChannelKind, ClipKind, KitPiece, MAX_FX_SLOTS, SampleRef, Song, StretchMode,
@@ -14,6 +15,7 @@ use fundsp::prelude::{
     AudioUnit, Shared, Wave, adsr_live, dc, highpass_hz, lowpass, midi_hz, pan, reverb_stereo, saw,
     shared, sine, square, triangle, var, white,
 };
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -558,6 +560,14 @@ fn mixer_graph_sig(song: &Song) -> u64 {
             h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         }
     }
+    for (ci, ch) in song.channels.iter().enumerate() {
+        let lat = match &ch.kind {
+            ChannelKind::ClapPlugin(c) => c.reported_latency as u64,
+            _ => 0,
+        };
+        h ^= (lat << 24) ^ ((ch.mixer_insert as u64) << 8) ^ (ci as u64);
+        h = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
     h
 }
 
@@ -623,7 +633,9 @@ pub struct EngineRt {
     track_lat_delay: Vec<RingDelay>,
     direct_pdc_delay: Vec<RingDelay>,
     route_pdc_delay: Vec<Vec<RingDelay>>,
+    ch_pdc_delay: Vec<RingDelay>,
     pdc_order: Vec<usize>,
+    pdc_ch_delay: Vec<usize>,
     pdc_direct_delay: Vec<usize>,
     pdc_route_delay: Vec<Vec<(usize, usize)>>,
     mixer_sig: u64,
@@ -648,6 +660,10 @@ pub struct EngineRt {
     pub take_in_r: Vec<f32>,
     pub count_in_rem_samples: usize,
     count_in_tick_samples: usize,
+    pub clap_nodes: HashMap<u64, ClapAudioNode>,
+    clap_inst_buf: Vec<Vec<(f32, f32)>>,
+    clap_block_notes: Vec<ClapBlockNote>,
+    clap_sample_idx: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -723,7 +739,9 @@ impl EngineRt {
             track_lat_delay: Vec::new(),
             direct_pdc_delay: Vec::new(),
             route_pdc_delay: Vec::new(),
+            ch_pdc_delay: Vec::new(),
             pdc_order: Vec::new(),
+            pdc_ch_delay: Vec::new(),
             pdc_direct_delay: Vec::new(),
             pdc_route_delay: Vec::new(),
             mixer_sig: u64::MAX,
@@ -748,6 +766,10 @@ impl EngineRt {
             take_in_r: Vec::new(),
             count_in_rem_samples: 0,
             count_in_tick_samples: 0,
+            clap_nodes: HashMap::new(),
+            clap_inst_buf: Vec::new(),
+            clap_block_notes: Vec::with_capacity(128),
+            clap_sample_idx: usize::MAX,
         };
         rt.render_kit();
         rt
@@ -783,12 +805,16 @@ impl EngineRt {
     fn ensure_mixer_graph(&mut self, song: &Song) {
         let sig = mixer_graph_sig(song);
         let nmix = song.mixer_tracks.len();
-        if self.mixer_sig == sig && self.mix_direct_in.len() == nmix {
+        if self.mixer_sig == sig
+            && self.mix_direct_in.len() == nmix
+            && self.ch_pdc_delay.len() == song.channels.len()
+        {
             return;
         }
         self.mixer_sig = sig;
         let pdc = song.compute_pdc();
         self.pdc_order = pdc.order;
+        self.pdc_ch_delay = pdc.ch_delay;
         self.pdc_direct_delay = pdc.direct_delay;
         self.pdc_route_delay = pdc.route_delay;
 
@@ -812,6 +838,11 @@ impl EngineRt {
                 dly: t.delay_send,
                 rev: t.reverb_send,
             });
+        }
+        self.ch_pdc_delay
+            .resize_with(song.channels.len(), RingDelay::default);
+        for (ci, cd) in self.ch_pdc_delay.iter_mut().enumerate() {
+            cd.reserve(self.pdc_ch_delay.get(ci).copied().unwrap_or(0));
         }
         self.track_lat_delay.resize_with(nmix, RingDelay::default);
         self.direct_pdc_delay.resize_with(nmix, RingDelay::default);
@@ -842,6 +873,10 @@ impl EngineRt {
         }
         if self.voices.len() == song.channels.len() && self.adv_voices.len() == song.channels.len()
         {
+            if self.clap_inst_buf.len() != song.channels.len() {
+                self.clap_inst_buf
+                    .resize_with(song.channels.len(), Vec::new);
+            }
             for i in 0..song.channels.len() {
                 let spec = song.channels[i].voice_spec();
                 if self.voice_specs.get(i) != Some(&spec) {
@@ -879,6 +914,7 @@ impl EngineRt {
         self.ch_peaks = vec![0.0; song.channels.len()];
         self.ch_accum = vec![(0.0, 0.0); song.channels.len()];
         self.channel_last_hz = vec![None; song.channels.len()];
+        self.clap_inst_buf = vec![Vec::new(); song.channels.len()];
     }
 
     /// Rebuild one channel's pool (wave / Q / ADSR changed).
@@ -1173,10 +1209,19 @@ impl EngineRt {
                     );
                 }
             }
+            ChannelKind::ClapPlugin(cfg) => {
+                if let Some(node) = self.clap_nodes.get_mut(&cfg.rt_id) {
+                    if midi_tag.is_some() {
+                        node.queue_live_note_on(midi, vel);
+                    } else {
+                        node.queue_live_preview(midi, vel, off);
+                    }
+                }
+            }
         }
     }
 
-    fn release_live_midi_note(&mut self, midi: u8) {
+    fn release_live_midi_note(&mut self, song: &Song, midi: u8) {
         for pool in self.voices.iter_mut() {
             for v in pool.iter_mut() {
                 if v.live_midi == Some(midi) {
@@ -1191,6 +1236,13 @@ impl EngineRt {
                 if v.live_midi == Some(midi) {
                     v.release_note();
                 }
+            }
+        }
+        for ch in &song.channels {
+            if let ChannelKind::ClapPlugin(cfg) = &ch.kind
+                && let Some(node) = self.clap_nodes.get_mut(&cfg.rt_id)
+            {
+                node.queue_live_note_off(midi);
             }
         }
     }
@@ -1211,7 +1263,7 @@ impl EngineRt {
                 if self.midi_sustain {
                     self.midi_sustain_pending[idx] = true;
                 } else {
-                    self.release_live_midi_note(note);
+                    self.release_live_midi_note(song, note);
                 }
             }
             MidiMsg::Cc { cc: 64, val, .. } => {
@@ -1220,7 +1272,7 @@ impl EngineRt {
                     for n in 0..128 {
                         if self.midi_sustain_pending[n] {
                             self.midi_sustain_pending[n] = false;
-                            self.release_live_midi_note(n as u8);
+                            self.release_live_midi_note(song, n as u8);
                         }
                     }
                 }
@@ -1310,6 +1362,7 @@ impl EngineRt {
 
         // Pre-roll count-in metronome before starting sequencer clock or audio take capture.
         if self.playing && self.count_in_rem_samples > 0 {
+            self.clap_sample_idx = usize::MAX;
             let beat_s = self.count_in_tick_samples.max(1);
             let bar_s =
                 ((song.time_sig.ticks_per_bar().max(1) as f64 * spt).round() as usize).max(beat_s);
@@ -1465,6 +1518,8 @@ impl EngineRt {
             self.pending.sort_by_key(|(at, _)| *at);
         }
 
+        self.render_clap_instrument_blocks(song, n, spt);
+
         let mut ei = 0;
         for i in 0..n {
             let now = self.sample_pos + i as u64;
@@ -1545,10 +1600,12 @@ impl EngineRt {
                     self.live_voice.gate.set_value(0.0);
                 }
             }
+            self.clap_sample_idx = i;
             let (l, r) = self.render_sample(song);
             out_l[i] = l;
             out_r[i] = r;
         }
+        self.clap_sample_idx = usize::MAX;
         self.pending.drain(..ei.min(self.pending.len()));
         if self.playing {
             self.sample_pos += n as u64;
@@ -1876,6 +1933,62 @@ impl EngineRt {
                     );
                 }
             }
+            ChannelKind::ClapPlugin(_) => {}
+        }
+    }
+
+    fn render_clap_instrument_blocks(&mut self, song: &Song, n: usize, spt: f64) {
+        let block_end = self.sample_pos + n as u64;
+        let solo_ch_any = song.channels.iter().any(|c| c.solo);
+        for (ci, channel) in song.channels.iter().enumerate() {
+            let ChannelKind::ClapPlugin(cfg) = &channel.kind else {
+                continue;
+            };
+            if ci >= self.clap_inst_buf.len() {
+                continue;
+            }
+            if self.clap_inst_buf[ci].len() < n {
+                self.clap_inst_buf[ci].resize(n, (0.0, 0.0));
+            }
+            let Some(node) = self.clap_nodes.get_mut(&cfg.rt_id) else {
+                self.clap_inst_buf[ci][..n].fill((0.0, 0.0));
+                continue;
+            };
+            self.clap_block_notes.clear();
+            let muted = (solo_ch_any && !channel.solo) || (!solo_ch_any && channel.mute);
+            if self.playing && !muted {
+                for (at, ev) in &self.pending {
+                    if *at >= self.sample_pos
+                        && *at < block_end
+                        && let SongEvent::NoteOn(t) = ev
+                        && t.ch == ci
+                    {
+                        self.clap_block_notes.push(ClapBlockNote {
+                            sample_offset: (*at - self.sample_pos) as u32,
+                            key: t.midi,
+                            vel: t.vel,
+                            pan: t.pan,
+                            fine_pitch: t.fine_pitch,
+                            dur_samples: (t.len_ticks.max(1) as f64 * spt).round().max(1.0)
+                                as usize,
+                        });
+                    }
+                }
+            }
+            node.process_instrument_block(
+                n,
+                song.bpm,
+                self.playing,
+                self.sample_pos,
+                self.tick_pos,
+                &self.clap_block_notes,
+            );
+            for (dst, (&ol, &or)) in self.clap_inst_buf[ci][..n]
+                .iter_mut()
+                .zip(node.out_l[..n].iter().zip(node.out_r[..n].iter()))
+            {
+                *dst = (ol, or);
+            }
         }
     }
 
@@ -1931,7 +2044,8 @@ impl EngineRt {
                     }
                 }
             }
-            ChannelKind::Kit { .. } | ChannelKind::DrumRack { .. } => {}
+            ChannelKind::Kit { .. } | ChannelKind::DrumRack { .. } | ChannelKind::ClapPlugin(_) => {
+            }
         }
     }
 
@@ -1996,6 +2110,21 @@ impl EngineRt {
             if let Some(acc) = self.ch_accum.get_mut(ci) {
                 acc.0 += vl_sum;
                 acc.1 += vr_sum;
+            }
+        }
+        if self.clap_sample_idx < usize::MAX {
+            for (ci, ch) in song.channels.iter().enumerate() {
+                if matches!(ch.kind, ChannelKind::ClapPlugin(_))
+                    && let Some((cl, cr)) = self
+                        .clap_inst_buf
+                        .get(ci)
+                        .and_then(|b| b.get(self.clap_sample_idx))
+                        .copied()
+                    && let Some(acc) = self.ch_accum.get_mut(ci)
+                {
+                    acc.0 += cl;
+                    acc.1 += cr;
+                }
             }
         }
 
@@ -2225,7 +2354,13 @@ impl EngineRt {
         // Smooth channel controls, pan, feed mixer inserts, meter, and accumulate sends.
         let smooth_k = (220.0 / sr).clamp(0.001, 0.25);
         for (ci, channel) in song.channels.iter().enumerate() {
-            let (raw_l, raw_r) = self.ch_accum.get(ci).copied().unwrap_or((0.0, 0.0));
+            let raw = self.ch_accum.get(ci).copied().unwrap_or((0.0, 0.0));
+            let ch_d = self.pdc_ch_delay.get(ci).copied().unwrap_or(0);
+            let (raw_l, raw_r) = if let Some(cd) = self.ch_pdc_delay.get_mut(ci) {
+                cd.push_pop(raw, ch_d)
+            } else {
+                raw
+            };
             let sm = self.smooth.get_mut(ci);
             let (vol_s, pan_s, dly_s, rev_s) = if let Some(s) = sm {
                 s.vol += (channel.volume - s.vol) * smooth_k;
@@ -2312,14 +2447,15 @@ impl EngineRt {
             );
             let post_lat = self.track_lat_delay[t].push_pop(pre, track.latency_samples);
             let post_fx = if t < self.mix_fx.len() {
-                self.mix_fx[t].process_insert_fx(
-                    track,
+                let mut fx_ctx = FxProcCtx {
                     sr,
-                    song.bpm,
-                    post_lat.0,
-                    post_lat.1,
-                    &self.mix_sc_bus,
-                )
+                    bpm: song.bpm,
+                    playing: self.playing,
+                    mix_override: None,
+                    sc_bus: &self.mix_sc_bus,
+                    clap_nodes: &mut self.clap_nodes,
+                };
+                self.mix_fx[t].process_insert_fx(track, post_lat.0, post_lat.1, &mut fx_ctx)
             } else {
                 post_lat
             };
@@ -2525,6 +2661,12 @@ impl EngineRt {
         self.mix_sc_bus.fill((0.0, 0.0));
         self.peak_ctrl_env.fill(0.0);
         self.peak_ctrl_lfo.fill(0.0);
+        for node in self.clap_nodes.values_mut() {
+            node.reset();
+        }
+        for d in self.ch_pdc_delay.iter_mut() {
+            d.clear();
+        }
         for m in self.mix_fx.iter_mut() {
             m.reset();
         }
@@ -2569,15 +2711,29 @@ enum AudioCmd {
     SetChannelCutoff(usize, f32),
     SetInspectInsert(usize),
     ClearMixClips,
-    LiveNote { ch: usize, midi: u8, vel: f32 },
+    LiveNote {
+        ch: usize,
+        midi: u8,
+        vel: f32,
+    },
     LiveKit(KitPiece),
     LiveSample(usize),
     LiveSampleRate(usize, f32),
     Midi(MidiMsg),
     SetMidiTarget(usize),
-    SetInputMonitor { enabled: bool, insert: usize },
+    SetInputMonitor {
+        enabled: bool,
+        insert: usize,
+    },
     SetInputRecOnly(bool),
     SetInputRx(Option<Box<rtrb::Consumer<f32>>>),
+    MountClap(u64, Box<ClapAudioNode>),
+    UnmountClap(u64),
+    ClapParam {
+        rt_id: u64,
+        param_id: u32,
+        value: f64,
+    },
 }
 
 struct AudioTelemetry {
@@ -2791,6 +2947,21 @@ impl AudioWorker {
                 }
                 AudioCmd::SetInputRecOnly(v) => self.rt.input_rec_only = v,
                 AudioCmd::SetInputRx(rx) => self.rt.input_rx = rx.map(|b| *b),
+                AudioCmd::MountClap(id, node) => {
+                    self.rt.clap_nodes.insert(id, *node);
+                }
+                AudioCmd::UnmountClap(id) => {
+                    self.rt.clap_nodes.remove(&id);
+                }
+                AudioCmd::ClapParam {
+                    rt_id,
+                    param_id,
+                    value,
+                } => {
+                    if let Some(node) = self.rt.clap_nodes.get_mut(&rt_id) {
+                        node.queue_param(param_id, value);
+                    }
+                }
             }
             self.telemetry.ack_seq.fetch_add(1, Ordering::Release);
         }
@@ -3089,6 +3260,34 @@ impl AppState {
         }
     }
 
+    pub fn mount_clap(&mut self, rt_id: u64, node: ClapAudioNode) {
+        if let Some(b) = &mut self.audio {
+            b.send(AudioCmd::MountClap(rt_id, Box::new(node)));
+        } else {
+            self.rt.clap_nodes.insert(rt_id, node);
+        }
+    }
+
+    pub fn unmount_clap(&mut self, rt_id: u64) {
+        self.rt.clap_nodes.remove(&rt_id);
+        if let Some(b) = &mut self.audio {
+            b.send(AudioCmd::UnmountClap(rt_id));
+        }
+    }
+
+    pub fn set_clap_param(&mut self, rt_id: u64, param_id: u32, value: f64) {
+        if let Some(node) = self.rt.clap_nodes.get_mut(&rt_id) {
+            node.queue_param(param_id, value);
+        }
+        if let Some(b) = &mut self.audio {
+            b.send(AudioCmd::ClapParam {
+                rt_id,
+                param_id,
+                value,
+            });
+        }
+    }
+
     pub fn set_channel_cutoff(&mut self, ch: usize, v: f32) {
         self.rt.set_channel_cutoff(ch, v);
         if let Some(b) = &mut self.audio {
@@ -3269,6 +3468,7 @@ pub fn start_audio(state: &mut AppState) -> Option<cpal::Stream> {
 
     let mut worker_rt = EngineRt::new(sr);
     worker_rt.take_tx = Some(take_tx);
+    worker_rt.clap_nodes = std::mem::take(&mut state.rt.clap_nodes);
     worker_rt.ensure_channels(&state.song);
 
     let mut worker = AudioWorker {
@@ -3878,5 +4078,93 @@ mod tests {
             "expected punch-gated take length, got {}",
             rt.take_in_l.len()
         );
+    }
+
+    #[test]
+    fn phase7_clap_instrument_fx_param_and_pdc() {
+        let entry_inst = unsafe {
+            clack_host::entry::PluginEntry::load_from_raw(
+                &crate::clap_host::test_stub::STUB_ENTRY,
+                c"/tmp/stub_inst.clap",
+            )
+        }
+        .unwrap();
+        let entry_fx = unsafe {
+            clack_host::entry::PluginEntry::load_from_raw(
+                &crate::clap_host::test_stub::STUB_ENTRY,
+                c"/tmp/stub_fx.clap",
+            )
+        }
+        .unwrap();
+        let (inst_main, inst_node) = crate::clap_host::ClapMainInstance::instantiate_from_entry(
+            entry_inst,
+            "org.cotanjant.thunder.test_stub",
+            "",
+            &[],
+            44100.0,
+        )
+        .unwrap();
+        let (fx_main, fx_node) = crate::clap_host::ClapMainInstance::instantiate_from_entry(
+            entry_fx,
+            "org.cotanjant.thunder.test_stub",
+            "",
+            &[],
+            44100.0,
+        )
+        .unwrap();
+
+        let mut song = crate::song::new_empty();
+        // Put 0-latency synth channel 0 and CLAP instrument channel on insert 1 to verify PDC alignment.
+        song.channels[0].mixer_insert = 1;
+        let clap_ch = song.add_channel(crate::song::Channel {
+            name: "Stub CLAP".into(),
+            kind: ChannelKind::ClapPlugin(crate::song::ClapPluginCfg {
+                path: "/tmp/stub_inst.clap".into(),
+                plugin_id: "org.cotanjant.thunder.test_stub".into(),
+                name: "Stub CLAP".into(),
+                reported_latency: inst_main.latency_samples,
+                state_b64: String::new(),
+                params: Vec::new(),
+                rt_id: 1001,
+            }),
+            mixer_insert: 1,
+            ..Default::default()
+        });
+        assert!(song.mixer_tracks[1].add_fx(crate::song::EffectSlot::new(
+            crate::song::FxKind::ClapPlugin(crate::song::ClapPluginCfg {
+                path: "/tmp/stub_fx.clap".into(),
+                plugin_id: "org.cotanjant.thunder.test_stub".into(),
+                name: "Stub FX".into(),
+                reported_latency: fx_main.latency_samples,
+                state_b64: String::new(),
+                params: Vec::new(),
+                rt_id: 1002,
+            })
+        )));
+        song.patterns[0].notes[clap_ch].push(crate::song::Note::new(0, 8, 60, 1.0));
+
+        let mut rt = EngineRt::new(44100.0);
+        rt.clap_nodes.insert(1001, inst_node);
+        rt.clap_nodes.insert(1002, fx_node);
+        rt.clap_nodes.get_mut(&1001).unwrap().queue_param(1, 0.8);
+        rt.clap_nodes.get_mut(&1002).unwrap().queue_param(1, 0.5);
+        rt.playing = true;
+
+        let mut l = vec![0.0; 512];
+        let mut r = vec![0.0; 512];
+        rt.process(&song, &mut l, &mut r);
+
+        assert!(l.iter().chain(r.iter()).all(|x| x.is_finite()));
+        assert!(
+            l[0] > 0.04 && l[0] < 0.06,
+            "expected ~0.0448 CLAP instrument+FX output, got {}",
+            l[0]
+        );
+        assert_eq!(rt.pdc_ch_delay[0], 32);
+        assert_eq!(rt.pdc_ch_delay[clap_ch], 0);
+
+        drop(rt);
+        drop(inst_main);
+        drop(fx_main);
     }
 }

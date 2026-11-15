@@ -2,10 +2,12 @@
 //! brickwall Limiter w/ sidechain, Tempo-Synced Delay, Algorithmic Reverb,
 //! Chorus/Flanger/Phaser, Saturator, M/S Stereo Shaper) and dB helpers.
 
+use crate::clap_host::ClapAudioNode;
 use crate::song::{
     CompCfg, DelayFxCfg, EqBand, EqBandType, EqCfg, FxKind, MAX_FX_SLOTS, MixerTrack, ModFxCfg,
     ModFxKind, ReverbFxCfg, SatCfg, SatKind, StereoShaperCfg,
 };
+use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
 
 pub const FFT_N: usize = 256;
@@ -788,7 +790,7 @@ impl FxSlotRt {
     pub fn process_sample(
         &mut self,
         slot: &crate::song::EffectSlot,
-        ctx: &FxProcCtx<'_>,
+        ctx: &mut FxProcCtx<'_>,
         in_l: f32,
         in_r: f32,
     ) -> (f32, f32) {
@@ -813,6 +815,13 @@ impl FxSlotRt {
             FxKind::Modulator(cfg) => self.mod_fx.process(cfg, ctx.sr, in_l, in_r),
             FxKind::Saturator(cfg) => self.sat.process(cfg, ctx.sr, in_l, in_r),
             FxKind::StereoShaper(cfg) => self.shaper.process(cfg, ctx.sr, in_l, in_r),
+            FxKind::ClapPlugin(cfg) => {
+                if let Some(node) = ctx.clap_nodes.get_mut(&cfg.rt_id) {
+                    node.process_fx_frame(in_l, in_r, ctx.bpm, ctx.playing)
+                } else {
+                    (in_l, in_r)
+                }
+            }
         };
         (in_l + (wet_l - in_l) * mix, in_r + (wet_r - in_r) * mix)
     }
@@ -821,8 +830,10 @@ impl FxSlotRt {
 pub struct FxProcCtx<'a> {
     pub sr: f32,
     pub bpm: f32,
+    pub playing: bool,
     pub mix_override: Option<f32>,
     pub sc_bus: &'a [(f32, f32)],
+    pub clap_nodes: &'a mut HashMap<u64, ClapAudioNode>,
 }
 
 #[derive(Clone)]
@@ -861,20 +872,13 @@ impl MixerInsertRt {
     pub fn process_insert_fx(
         &mut self,
         track: &MixerTrack,
-        sr: f32,
-        bpm: f32,
         mut l: f32,
         mut r: f32,
-        sc_bus: &[(f32, f32)],
+        ctx: &mut FxProcCtx<'_>,
     ) -> (f32, f32) {
         for (si, (slot, rt)) in track.fx.iter().zip(self.slots.iter_mut()).enumerate() {
-            let ctx = FxProcCtx {
-                sr,
-                bpm,
-                mix_override: self.mix_override.get(si).copied().flatten(),
-                sc_bus,
-            };
-            (l, r) = rt.process_sample(slot, &ctx, l, r);
+            ctx.mix_override = self.mix_override.get(si).copied().flatten();
+            (l, r) = rt.process_sample(slot, ctx, l, r);
         }
         if track.polarity_inv {
             l = -l;
@@ -1077,16 +1081,19 @@ mod tests {
         ];
         for slot in &slots {
             let mut rt = FxSlotRt::new(sr);
+            let mut clap_nodes = std::collections::HashMap::new();
             let mut energy = 0.0f32;
             for i in 0..22050 {
                 let x = if i < 64 { 0.5 } else { 0.0 };
-                let ctx = FxProcCtx {
+                let mut ctx = FxProcCtx {
                     sr,
                     bpm: 128.0,
+                    playing: false,
                     mix_override: None,
                     sc_bus: &[],
+                    clap_nodes: &mut clap_nodes,
                 };
-                let (l, r) = rt.process_sample(slot, &ctx, x, x);
+                let (l, r) = rt.process_sample(slot, &mut ctx, x, x);
                 assert!(l.is_finite() && r.is_finite());
                 energy += l * l + r * r;
             }

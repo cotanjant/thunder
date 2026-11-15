@@ -32,9 +32,13 @@ flacenc = { version = "0.5", default-features = false }
 rusty_mp3 = "1"
 oxideav-vorbis = "0.0.13"
 oxideav-ogg = "0.1"
+clack-host = { version = "0.2", features = ["libloading"] }
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "note-ports", "params", "state", "latency", "gui", "raw-window-handle_06"] }
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 egui_kittest = "0.36"
+clap-sys = "0.5"
 
 [profile.dist]
 inherits = "release"

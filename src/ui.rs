@@ -1,6 +1,10 @@
 //! All egui panels: transport, channel rack, piano roll + automation,
 //! playlist, mixer, sample browser.
 
+use crate::clap_host::{
+    ClapAudioNode, ClapCatalog, ClapManager, ClapPluginDesc, default_clap_dirs,
+    load_cached_catalog, save_cached_catalog, scan_clap_dirs, scan_clap_file_isolated,
+};
 use crate::engine::{AppState, sample_into_song};
 use crate::export::{ExportConfig, ExportFormat, TailMode};
 use crate::fx;
@@ -15,17 +19,18 @@ use crate::project::{
 };
 use crate::song::{
     ArpCfg, ArpDir, AutoClipPoint, AutoPoint, AutoTarget, Channel, ChannelKind, ChordKind,
-    ClipKind, CompCfg, CurveMode, DelayFxCfg, DelaySync, EffectSlot, EqBandType, EqCfg, FilterMode,
-    FmAlgo, FmSynthCfg, FxKind, KitPiece, MAX_FX_SLOTS, MapCurve, ModFxCfg, ModFxKind, ModTarget,
-    Note, PeakController, QuantizeCfg, RandCfg, ReverbFxCfg, SatCfg, SatKind, ScaleKind, SnapGrid,
-    Song, StereoShaperCfg, StretchMode, StrumCfg, SuperSynthCfg, TICKS_PER_STEP, TimeSig, WaveKind,
-    default_drum_pads, eval_auto, eval_auto_clip, palette_color, tool_chord_ext,
-    tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts, tool_randomize,
-    tool_riff_arp, tool_slice_at, tool_strum_opts,
+    ClapPluginCfg, ClipKind, CompCfg, CurveMode, DelayFxCfg, DelaySync, EffectSlot, EqBandType,
+    EqCfg, FilterMode, FmAlgo, FmSynthCfg, FxKind, KitPiece, MAX_FX_SLOTS, MapCurve, ModFxCfg,
+    ModFxKind, ModTarget, Note, PeakController, QuantizeCfg, RandCfg, ReverbFxCfg, SatCfg, SatKind,
+    ScaleKind, SnapGrid, Song, StereoShaperCfg, StretchMode, StrumCfg, SuperSynthCfg,
+    TICKS_PER_STEP, TimeSig, WaveKind, default_drum_pads, eval_auto, eval_auto_clip, palette_color,
+    tool_chord_ext, tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts,
+    tool_randomize, tool_riff_arp, tool_slice_at, tool_strum_opts,
 };
 use crate::synth::{apply_preset_to_channel, factory_presets, load_preset_json, save_preset_json};
 use eframe::egui;
 use egui_dock::{DockState, NodeIndex, TabViewer};
+use raw_window_handle::RawWindowHandle;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -88,15 +93,17 @@ pub enum BrowserCategory {
     Bass,
     Fx,
     Presets,
+    Plugins,
 }
 
 impl BrowserCategory {
-    pub const ALL: [BrowserCategory; 5] = [
+    pub const ALL: [BrowserCategory; 6] = [
         BrowserCategory::All,
         BrowserCategory::Drums,
         BrowserCategory::Bass,
         BrowserCategory::Fx,
         BrowserCategory::Presets,
+        BrowserCategory::Plugins,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -106,6 +113,7 @@ impl BrowserCategory {
             BrowserCategory::Bass => "Bass",
             BrowserCategory::Fx => "FX",
             BrowserCategory::Presets => "Presets",
+            BrowserCategory::Plugins => "Plugins",
         }
     }
 }
@@ -127,6 +135,7 @@ pub enum BrowserDragPayload {
     SamplePath(String),
     PresetIdx(usize),
     FxChoice(usize),
+    ClapPlugin(usize),
 }
 
 /// FL-style piano roll tools.
@@ -370,6 +379,10 @@ pub struct AppUi {
     pub status: String,
     taps: Vec<Instant>,
     show_tutorial: bool,
+    pub clap: ClapManager,
+    pub clap_catalog: ClapCatalog,
+    pub clap_param_filter: String,
+    pub parent_window: Option<RawWindowHandle>,
 }
 
 /// Marker file: first run shows the tutorial, afterwards it stays hidden.
@@ -497,6 +510,10 @@ impl Default for AppUi {
             status: "press Play or open the Tutorial".into(),
             taps: Vec::new(),
             show_tutorial: !tutorial_seen(),
+            clap: ClapManager::default(),
+            clap_catalog: load_cached_catalog(),
+            clap_param_filter: String::new(),
+            parent_window: None,
         }
     }
 }
@@ -2150,6 +2167,63 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.sel_ch = s.song.add_channel(c);
             ui.status = format!("added Sampler {}", idx + 1);
         }
+        let mut pick_clap: Option<ClapPluginDesc> = None;
+        let mut scan_clap = false;
+        let mut browse_clap = false;
+        egui::ComboBox::from_id_salt("add_clap_ch_combo")
+            .selected_text("+ CLAP")
+            .width(74.0)
+            .show_ui(u, |u| {
+                let mut shown = 0usize;
+                for desc in ui.clap_catalog.plugins.iter().filter(|d| d.is_instrument) {
+                    if u.button(&desc.name).clicked() {
+                        pick_clap = Some(desc.clone());
+                    }
+                    shown += 1;
+                }
+                if shown == 0 {
+                    for desc in &ui.clap_catalog.plugins {
+                        if u.button(&desc.name).clicked() {
+                            pick_clap = Some(desc.clone());
+                        }
+                    }
+                }
+                if !ui.clap_catalog.plugins.is_empty() {
+                    u.separator();
+                }
+                if u.button("Scan CLAP folders").clicked() {
+                    scan_clap = true;
+                }
+                if u.button("Load .clap file...").clicked() {
+                    browse_clap = true;
+                }
+            });
+        if scan_clap {
+            scan_all_clap_plugins(ui);
+        }
+        if browse_clap
+            && let Some(p) = rfd::FileDialog::new()
+                .add_filter("CLAP Plugin", &["clap"])
+                .pick_file()
+        {
+            match register_clap_file_into_catalog(ui, &p) {
+                Ok(descs) => {
+                    if let Some(d) = descs
+                        .iter()
+                        .find(|d| d.is_instrument)
+                        .or_else(|| descs.first())
+                    {
+                        add_clap_channel_from_desc(ui, s, d);
+                    } else {
+                        ui.status = "no CLAP plugins in selected file".into();
+                    }
+                }
+                Err(e) => ui.status = format!("CLAP scan failed: {e}"),
+            }
+        }
+        if let Some(desc) = pick_clap {
+            add_clap_channel_from_desc(ui, s, &desc);
+        }
         u.toggle_value(&mut ui.show_ch_settings, "Settings");
         u.label("Graph:");
         u.selectable_value(&mut ui.step_graph, StepGraphMode::Off, "Off");
@@ -2264,6 +2338,17 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                         .map(|x| x.name.clone())
                         .unwrap_or_else(|| "(empty)".into());
                     u.label(txt);
+                }
+                ChannelKind::ClapPlugin(cfg) => {
+                    let label = if cfg.name.is_empty() {
+                        "CLAP".to_string()
+                    } else {
+                        format!("CLAP: {}", cfg.name)
+                    };
+                    if u.button(label).clicked() {
+                        ui.sel_ch = i;
+                        ui.show_ch_settings = true;
+                    }
                 }
             }
             if u.button("♪").on_hover_text("Preview").clicked() {
@@ -2388,13 +2473,335 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     }
 }
 
+#[derive(Default)]
+struct ClapUiOutput {
+    param_updates: Vec<(u32, f64)>,
+    reloaded: Option<ClapAudioNode>,
+    graph_dirty: bool,
+    status: Option<String>,
+}
+
+fn clap_cfg_from_desc(desc: &ClapPluginDesc) -> ClapPluginCfg {
+    ClapPluginCfg::new(desc.path.clone(), desc.id.clone(), desc.name.clone())
+}
+
+fn scan_all_clap_plugins(ui: &mut AppUi) {
+    ui.clap_catalog = scan_clap_dirs(&default_clap_dirs());
+    save_cached_catalog(&ui.clap_catalog);
+    ui.status = format!(
+        "scanned {} CLAP plugins ({} errors)",
+        ui.clap_catalog.plugins.len(),
+        ui.clap_catalog.last_errors.len()
+    );
+}
+
+fn register_clap_file_into_catalog(
+    ui: &mut AppUi,
+    path: &Path,
+) -> Result<Vec<ClapPluginDesc>, String> {
+    let descs = scan_clap_file_isolated(path)?;
+    for d in &descs {
+        ui.clap_catalog
+            .plugins
+            .retain(|x| !(x.path == d.path && x.id == d.id));
+        ui.clap_catalog.plugins.push(d.clone());
+    }
+    ui.clap_catalog
+        .plugins
+        .sort_by_key(|a| a.name.to_lowercase());
+    save_cached_catalog(&ui.clap_catalog);
+    Ok(descs)
+}
+
+fn add_clap_channel_from_desc(ui: &mut AppUi, s: &mut AppState, desc: &ClapPluginDesc) -> usize {
+    let idx = s.song.channels.len();
+    let ins = (idx + 1).min(s.song.mixer_tracks.len().saturating_sub(1));
+    let c = Channel {
+        name: desc.name.clone(),
+        kind: ChannelKind::ClapPlugin(clap_cfg_from_desc(desc)),
+        color: palette_color(idx),
+        cutoff: 12000.0,
+        mixer_insert: ins,
+        ..Default::default()
+    };
+    let ch = s.song.add_channel(c);
+    sync_clap_plugins(ui, s);
+    ui.sel_ch = ch;
+    ui.show_ch_settings = true;
+    ui.status = format!("added CLAP {}", desc.name);
+    ch
+}
+
+fn add_clap_fx_from_desc(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    ins: usize,
+    desc: &ClapPluginDesc,
+) -> bool {
+    let slot = EffectSlot::new(FxKind::ClapPlugin(clap_cfg_from_desc(desc)));
+    let added = if let Some(track) = s.song.mixer_tracks.get_mut(ins) {
+        if track.add_fx(slot) {
+            ui.sel_fx_slot = track.fx.len().saturating_sub(1);
+            ui.status = format!("added CLAP {} to {}", desc.name, track.name);
+            true
+        } else {
+            ui.status = "FX rack full".into();
+            false
+        }
+    } else {
+        false
+    };
+    if added {
+        sync_clap_plugins(ui, s);
+    }
+    added
+}
+
+fn sync_clap_slot(
+    cfg: &mut ClapPluginCfg,
+    clap: &mut ClapManager,
+    sr: f32,
+    active: &mut Vec<u64>,
+    to_mount: &mut Vec<(u64, ClapAudioNode)>,
+    graph_dirty: &mut bool,
+) {
+    active.push(cfg.rt_id);
+    let prev_lat = cfg.reported_latency;
+    if let Some(node) = clap.ensure_slot(cfg, sr) {
+        to_mount.push((cfg.rt_id, node));
+        *graph_dirty = true;
+    }
+    if let Some(slot) = clap.slots.get_mut(&cfg.rt_id)
+        && let Some(main) = slot.main.as_mut()
+    {
+        let (dirty, changed) = main.poll_callbacks();
+        if dirty && let Ok(b64) = main.save_state_b64() {
+            cfg.state_b64 = b64;
+        }
+        if changed {
+            for (pid, pv) in &mut cfg.params {
+                if let Some(info) = main.params.iter().find(|p| p.id == *pid) {
+                    *pv = info.value;
+                }
+            }
+            if cfg.reported_latency != main.latency_samples {
+                cfg.reported_latency = main.latency_samples;
+                *graph_dirty = true;
+            }
+        }
+    }
+    if cfg.reported_latency != prev_lat {
+        *graph_dirty = true;
+    }
+}
+
+pub fn sync_clap_plugins(ui: &mut AppUi, s: &mut AppState) {
+    let sr = s.rt.sr;
+    let mut active = Vec::new();
+    let mut to_mount = Vec::new();
+    let mut graph_dirty = false;
+
+    for ch in &mut s.song.channels {
+        if let ChannelKind::ClapPlugin(cfg) = &mut ch.kind {
+            sync_clap_slot(
+                cfg,
+                &mut ui.clap,
+                sr,
+                &mut active,
+                &mut to_mount,
+                &mut graph_dirty,
+            );
+        }
+    }
+    for track in &mut s.song.mixer_tracks {
+        for slot in &mut track.fx {
+            if let FxKind::ClapPlugin(cfg) = &mut slot.kind {
+                sync_clap_slot(
+                    cfg,
+                    &mut ui.clap,
+                    sr,
+                    &mut active,
+                    &mut to_mount,
+                    &mut graph_dirty,
+                );
+            }
+        }
+    }
+
+    let stale: Vec<u64> = ui
+        .clap
+        .slots
+        .keys()
+        .copied()
+        .filter(|id| !active.contains(id))
+        .collect();
+    for id in stale {
+        s.unmount_clap(id);
+        ui.clap.slots.remove(&id);
+        graph_dirty = true;
+    }
+    for (id, node) in to_mount {
+        s.mount_clap(id, node);
+    }
+    if graph_dirty {
+        s.rt.ensure_channels(&s.song);
+    }
+}
+
+fn render_clap_editor_ui(
+    cfg: &mut ClapPluginCfg,
+    clap: &mut ClapManager,
+    parent: Option<RawWindowHandle>,
+    filter: &mut String,
+    sr: f32,
+    u: &mut egui::Ui,
+) -> ClapUiOutput {
+    let mut out = ClapUiOutput::default();
+    let mut want_reload = false;
+    let mut load_err: Option<String> = None;
+
+    u.separator();
+    u.horizontal_wrapped(|u| {
+        u.strong(format!("CLAP: {} ({})", cfg.name, cfg.plugin_id));
+        u.small(format!("Latency: {} smp", cfg.reported_latency));
+        if let Some(slot) = clap.slots.get_mut(&cfg.rt_id) {
+            if let Some(main) = slot.main.as_mut() {
+                let gui_lbl = if main.gui_open {
+                    "Hide GUI"
+                } else {
+                    "Open GUI"
+                };
+                if u.button(gui_lbl).clicked() {
+                    if main.gui_open {
+                        main.close_gui();
+                    } else if let Err(e) = main.open_gui(parent, &cfg.name) {
+                        main.gui_error = Some(e);
+                    }
+                }
+                if u.button("Save State").clicked() {
+                    match main.save_state_b64() {
+                        Ok(b64) => {
+                            cfg.state_b64 = b64;
+                            out.status = Some(format!("saved CLAP state for {}", cfg.name));
+                        }
+                        Err(e) => {
+                            out.status = Some(format!("save state failed: {e}"));
+                        }
+                    }
+                }
+                if u.button("Reload").clicked() {
+                    want_reload = true;
+                }
+                if let Some(err) = &main.gui_error {
+                    u.colored_label(egui::Color32::from_rgb(230, 140, 80), format!("GUI: {err}"));
+                }
+            } else if let Some(err) = &slot.load_error {
+                load_err = Some(err.clone());
+            }
+        } else {
+            u.small("CLAP slot pending sync...");
+            if u.button("Load Now").clicked() {
+                want_reload = true;
+            }
+        }
+    });
+
+    if let Some(err) = load_err {
+        u.horizontal_wrapped(|u| {
+            u.colored_label(
+                egui::Color32::from_rgb(230, 100, 90),
+                format!("Load error: {err}"),
+            );
+            if u.button("Retry Load").clicked() {
+                want_reload = true;
+            }
+        });
+    }
+
+    if let Some(slot) = clap.slots.get_mut(&cfg.rt_id)
+        && let Some(main) = slot.main.as_mut()
+        && !main.params.is_empty()
+    {
+        u.horizontal(|u| {
+            u.label("Params:");
+            u.add(egui::TextEdit::singleline(filter).desired_width(140.0));
+        });
+        let q = filter.trim().to_ascii_lowercase();
+        egui::ScrollArea::vertical()
+            .id_salt(("clap_params", cfg.rt_id))
+            .max_height(210.0)
+            .show(u, |u| {
+                for p in &mut main.params {
+                    if p.hidden {
+                        continue;
+                    }
+                    if !q.is_empty()
+                        && !p.name.to_ascii_lowercase().contains(&q)
+                        && !p.module.to_ascii_lowercase().contains(&q)
+                    {
+                        continue;
+                    }
+                    u.horizontal(|u| {
+                        let lbl = if p.module.is_empty() {
+                            p.name.clone()
+                        } else {
+                            format!("{}: {}", p.module, p.name)
+                        };
+                        u.label(lbl);
+                        if p.readonly {
+                            u.small(&p.text);
+                        } else {
+                            let mut slider =
+                                egui::Slider::new(&mut p.value, p.min..=p.max).show_value(false);
+                            if p.stepped {
+                                slider = slider.step_by(1.0);
+                            }
+                            if u.add(slider).changed() {
+                                p.text = format!("{:.2}", p.value);
+                                out.param_updates.push((p.id, p.value));
+                            }
+                            u.small(&p.text);
+                            if u.small_button("R")
+                                .on_hover_text("Reset to default")
+                                .clicked()
+                            {
+                                p.value = p.default.clamp(p.min, p.max);
+                                p.text = format!("{:.2}", p.value);
+                                out.param_updates.push((p.id, p.value));
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
+    for &(pid, val) in &out.param_updates {
+        if let Some(existing) = cfg.params.iter_mut().find(|(id, _)| *id == pid) {
+            existing.1 = val;
+        } else {
+            cfg.params.push((pid, val));
+        }
+    }
+
+    if want_reload {
+        let prev_lat = cfg.reported_latency;
+        out.reloaded = clap.reload_slot(cfg, sr);
+        if cfg.reported_latency != prev_lat || out.reloaded.is_some() {
+            out.graph_dirty = true;
+        }
+    }
+    out
+}
+
 fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+    let sr = s.rt.sr;
     let mut need_rebuild = false;
     let mut need_cutoff = None;
     let mut trigger_pad_note: Option<u8> = None;
     let mut ctx_act: Option<ParamCtxAction> = None;
     let mut open_edison: Option<usize> = None;
+    let mut clap_out: Option<(u64, ClapUiOutput)> = None;
     let mix_names: Vec<String> = s.song.mixer_tracks.iter().map(|m| m.name.clone()).collect();
     let sample_names: Vec<String> = s.song.samples.iter().map(|sm| sm.name.clone()).collect();
     let presets = factory_presets();
@@ -2802,9 +3209,34 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     }
                 });
             }
+            ChannelKind::ClapPlugin(cfg) => {
+                let out = render_clap_editor_ui(
+                    cfg,
+                    &mut ui.clap,
+                    ui.parent_window,
+                    &mut ui.clap_param_filter,
+                    sr,
+                    u,
+                );
+                clap_out = Some((cfg.rt_id, out));
+            }
             ChannelKind::Synth { .. } | ChannelKind::Kit { .. } => {}
         }
     });
+    if let Some((rt_id, co)) = clap_out {
+        if let Some(msg) = co.status {
+            ui.status = msg;
+        }
+        if let Some(node) = co.reloaded {
+            s.mount_clap(rt_id, node);
+        }
+        for (pid, val) in co.param_updates {
+            s.set_clap_param(rt_id, pid, val);
+        }
+        if co.graph_dirty {
+            s.rt.ensure_channels(&s.song);
+        }
+    }
     if need_rebuild {
         s.rebuild_channel(ch);
     } else if let Some(cut) = need_cutoff {
@@ -2903,9 +3335,10 @@ fn step_graph_editor(ui: &mut AppUi, s: &mut AppState, pat: usize, steps: usize,
 
 fn preview_channel(s: &mut AppState, i: usize) {
     match s.song.channels[i].kind.clone() {
-        ChannelKind::Synth { .. } | ChannelKind::SuperSynth(_) | ChannelKind::FmSynth(_) => {
-            s.live_note_ch(i, s.song.channels[i].midi_base)
-        }
+        ChannelKind::Synth { .. }
+        | ChannelKind::SuperSynth(_)
+        | ChannelKind::FmSynth(_)
+        | ChannelKind::ClapPlugin(_) => s.live_note_ch(i, s.song.channels[i].midi_base),
         ChannelKind::DrumRack { pads } => {
             let note = pads.first().map(|p| p.note).unwrap_or(36);
             s.live_note_ch(i, note);
@@ -5163,11 +5596,15 @@ struct FxEditorCtx<'a> {
     sr: f32,
     fft_bins: &'a [f32; fx::FFT_BINS],
     gr_db: f32,
+    clap: &'a mut ClapManager,
+    parent: Option<RawWindowHandle>,
+    clap_filter: &'a mut String,
+    clap_out: &'a mut Option<(u64, ClapUiOutput)>,
 }
 
 fn fx_slot_editor(
     slot: &mut EffectSlot,
-    ctx: &FxEditorCtx<'_>,
+    ctx: &mut FxEditorCtx<'_>,
     u: &mut egui::Ui,
 ) -> Option<ParamCtxAction> {
     let slot_idx = ctx.slot_idx;
@@ -5419,6 +5856,10 @@ fn fx_slot_editor(
                 u.toggle_value(&mut cfg.invert_r, "Inv R");
             });
         }
+        FxKind::ClapPlugin(cfg) => {
+            let out = render_clap_editor_ui(cfg, ctx.clap, ctx.parent, ctx.clap_filter, ctx.sr, u);
+            *ctx.clap_out = Some((cfg.rt_id, out));
+        }
     }
     act
 }
@@ -5434,11 +5875,16 @@ pub fn fx_rack_panel(
     let fft_bins = s.rt.fft_bins;
     let comp_gr = s.rt.comp_gr_db;
     let mut ctx_act: Option<ParamCtxAction> = None;
+    let mut clap_out: Option<(u64, ClapUiOutput)> = None;
+    let mut pick_clap_fx: Option<ClapPluginDesc> = None;
+    let mut scan_clap_fx = false;
+    let mut browse_clap_fx = false;
+    let mut removed_fx = false;
     let Some(track) = s.song.mixer_tracks.get_mut(ins) else {
         return;
     };
     let fx_drop = u.group(|u| {
-        u.horizontal(|u| {
+        u.horizontal_wrapped(|u| {
             u.strong(format!(
                 "Insert FX Rack ({}/{})",
                 track.fx.len(),
@@ -5460,6 +5906,36 @@ pub fn fx_rack_panel(
                     ui.sel_fx_slot = track.fx.len() - 1;
                     ui.status = format!("added {nm} to {}", track.name);
                 }
+            }
+            if can_add {
+                egui::ComboBox::from_id_salt("add_clap_fx_combo")
+                    .selected_text("+ CLAP FX")
+                    .width(86.0)
+                    .show_ui(u, |u| {
+                        let mut shown = 0usize;
+                        for desc in ui.clap_catalog.plugins.iter().filter(|d| d.is_effect) {
+                            if u.button(&desc.name).clicked() {
+                                pick_clap_fx = Some(desc.clone());
+                            }
+                            shown += 1;
+                        }
+                        if shown == 0 {
+                            for desc in &ui.clap_catalog.plugins {
+                                if u.button(&desc.name).clicked() {
+                                    pick_clap_fx = Some(desc.clone());
+                                }
+                            }
+                        }
+                        if !ui.clap_catalog.plugins.is_empty() {
+                            u.separator();
+                        }
+                        if u.button("Scan CLAP folders").clicked() {
+                            scan_clap_fx = true;
+                        }
+                        if u.button("Load .clap file...").clicked() {
+                            browse_clap_fx = true;
+                        }
+                    });
             }
         });
         if track.fx.is_empty() {
@@ -5503,6 +5979,7 @@ pub fn fx_rack_panel(
             }
             if let Some(rm) = rm_idx {
                 track.fx.remove(rm);
+                removed_fx = true;
                 if track.fx.is_empty() {
                     ui.sel_fx_slot = 0;
                     return;
@@ -5511,22 +5988,65 @@ pub fn fx_rack_panel(
             }
             let sel = ui.sel_fx_slot;
             if let Some(slot) = track.fx.get_mut(sel) {
-                let ctx = FxEditorCtx {
+                let mut ctx = FxEditorCtx {
                     slot_idx: sel,
                     ins,
                     names,
                     sr,
                     fft_bins: &fft_bins,
                     gr_db: comp_gr[sel],
+                    clap: &mut ui.clap,
+                    parent: ui.parent_window,
+                    clap_filter: &mut ui.clap_param_filter,
+                    clap_out: &mut clap_out,
                 };
                 cols[1].group(|u| {
-                    if let Some(a) = fx_slot_editor(slot, &ctx, u) {
+                    if let Some(a) = fx_slot_editor(slot, &mut ctx, u) {
                         ctx_act = Some(a);
                     }
                 });
             }
         });
     });
+    if removed_fx {
+        sync_clap_plugins(ui, s);
+    }
+    if scan_clap_fx {
+        scan_all_clap_plugins(ui);
+    }
+    if browse_clap_fx
+        && let Some(p) = rfd::FileDialog::new()
+            .add_filter("CLAP Plugin", &["clap"])
+            .pick_file()
+    {
+        match register_clap_file_into_catalog(ui, &p) {
+            Ok(descs) => {
+                if let Some(d) = descs.iter().find(|d| d.is_effect).or_else(|| descs.first()) {
+                    add_clap_fx_from_desc(ui, s, ins, d);
+                } else {
+                    ui.status = "no CLAP plugins in selected file".into();
+                }
+            }
+            Err(e) => ui.status = format!("CLAP scan failed: {e}"),
+        }
+    }
+    if let Some(desc) = pick_clap_fx {
+        add_clap_fx_from_desc(ui, s, ins, &desc);
+    }
+    if let Some((rt_id, co)) = clap_out {
+        if let Some(msg) = co.status {
+            ui.status = msg;
+        }
+        if let Some(node) = co.reloaded {
+            s.mount_clap(rt_id, node);
+        }
+        for (pid, val) in co.param_updates {
+            s.set_clap_param(rt_id, pid, val);
+        }
+        if co.graph_dirty {
+            s.rt.ensure_channels(&s.song);
+        }
+    }
     if let Some(payload) = fx_drop.response.dnd_release_payload::<BrowserDragPayload>() {
         drop_browser_onto_fx(ui, s, ins, &payload);
     }
@@ -5883,6 +6403,7 @@ pub fn matches_browser_filter(
             "fx", "riser", "sweep", "impact", "verb", "delay", "eq", "comp", "sat", "mod",
         ]),
         BrowserCategory::Presets => low_path.starts_with("preset:") || low_path.ends_with(".json"),
+        BrowserCategory::Plugins => low_path.starts_with("clap:") || low_path.ends_with(".clap"),
     }
 }
 
@@ -5958,6 +6479,21 @@ pub fn drop_browser_onto_channel(
             ui.status = format!("added channel {}", preset.name);
             Some(ch)
         }
+        BrowserDragPayload::ClapPlugin(idx) => {
+            let desc = ui.clap_catalog.plugins.get(*idx)?.clone();
+            if let Some(ch) = target_ch
+                && let Some(c) = s.song.channels.get_mut(ch)
+            {
+                c.kind = ChannelKind::ClapPlugin(clap_cfg_from_desc(&desc));
+                c.name = desc.name.clone();
+                sync_clap_plugins(ui, s);
+                ui.sel_ch = ch;
+                ui.show_ch_settings = true;
+                ui.status = format!("loaded CLAP {} onto channel {}", desc.name, ch + 1);
+                return Some(ch);
+            }
+            Some(add_clap_channel_from_desc(ui, s, &desc))
+        }
         BrowserDragPayload::FxChoice(_) => {
             ui.status = "drop FX modules onto Mixer FX Rack".into();
             None
@@ -6004,22 +6540,32 @@ pub fn drop_browser_onto_fx(
     ins: usize,
     payload: &BrowserDragPayload,
 ) -> bool {
-    let BrowserDragPayload::FxChoice(choice) = payload else {
-        ui.status = "drop FX modules onto Mixer FX Rack".into();
-        return false;
-    };
-    let Some(track) = s.song.mixer_tracks.get_mut(ins) else {
-        return false;
-    };
-    let kind = fx_kind_from_choice(*choice);
-    let nm = kind.default_name().to_string();
-    if track.add_fx(EffectSlot::new(kind)) {
-        ui.sel_fx_slot = track.fx.len().saturating_sub(1);
-        ui.status = format!("added {nm} to {}", track.name);
-        true
-    } else {
-        ui.status = "FX rack full".into();
-        false
+    match payload {
+        BrowserDragPayload::FxChoice(choice) => {
+            let Some(track) = s.song.mixer_tracks.get_mut(ins) else {
+                return false;
+            };
+            let kind = fx_kind_from_choice(*choice);
+            let nm = kind.default_name().to_string();
+            if track.add_fx(EffectSlot::new(kind)) {
+                ui.sel_fx_slot = track.fx.len().saturating_sub(1);
+                ui.status = format!("added {nm} to {}", track.name);
+                true
+            } else {
+                ui.status = "FX rack full".into();
+                false
+            }
+        }
+        BrowserDragPayload::ClapPlugin(idx) => {
+            let Some(desc) = ui.clap_catalog.plugins.get(*idx).cloned() else {
+                return false;
+            };
+            add_clap_fx_from_desc(ui, s, ins, &desc)
+        }
+        _ => {
+            ui.status = "drop FX modules or CLAP FX onto Mixer FX Rack".into();
+            false
+        }
     }
 }
 
@@ -6133,6 +6679,27 @@ pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.browser_dir = home_music_dir();
             ui.browser_tree_dirty = true;
         }
+        if u.button("Scan CLAP")
+            .on_hover_text("Scan standard CLAP plugin folders")
+            .clicked()
+        {
+            scan_all_clap_plugins(ui);
+        }
+        if u.button(".clap...")
+            .on_hover_text("Scan and register a .clap plugin file")
+            .clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .add_filter("CLAP Plugin", &["clap"])
+                .pick_file()
+        {
+            match register_clap_file_into_catalog(ui, &p) {
+                Ok(descs) => {
+                    ui.browser_category = BrowserCategory::Plugins;
+                    ui.status = format!("registered {} CLAP plugin(s)", descs.len());
+                }
+                Err(e) => ui.status = format!("CLAP scan failed: {e}"),
+            }
+        }
     });
 
     if !ui.browser_prefs.pinned_dirs.is_empty() {
@@ -6188,9 +6755,10 @@ pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     let tree = ui.browser_tree.clone();
     if !tree.is_empty() {
         render_browser_nodes(ui, s, u, &tree);
-    } else if ui.browser_category != BrowserCategory::Presets
-        && ui.browser_category != BrowserCategory::Fx
-    {
+    } else if !matches!(
+        ui.browser_category,
+        BrowserCategory::Presets | BrowserCategory::Fx | BrowserCategory::Plugins
+    ) {
         u.small(format!("No audio files in {}", ui.browser_dir));
     }
 
@@ -6267,6 +6835,103 @@ pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                         if resp.double_clicked() {
                             let ins = ui.sel_insert;
                             drop_browser_onto_fx(ui, s, ins, &BrowserDragPayload::FxChoice(fi));
+                        }
+                    });
+                }
+            });
+    }
+
+    if matches!(
+        ui.browser_category,
+        BrowserCategory::All | BrowserCategory::Plugins
+    ) {
+        let plugins = ui.clap_catalog.plugins.clone();
+        let last_err = ui.clap_catalog.last_errors.last().cloned();
+        let err_count = ui.clap_catalog.last_errors.len();
+        egui::CollapsingHeader::new("CLAP Plugins")
+            .default_open(ui.browser_category == BrowserCategory::Plugins)
+            .show(u, |u| {
+                if plugins.is_empty() {
+                    u.small("No CLAP plugins scanned yet. Click Scan CLAP or .clap...");
+                }
+                if err_count > 0 {
+                    let tail = last_err.unwrap_or_default();
+                    u.small(format!("{err_count} scan errors (last: {tail})"));
+                }
+                for (ci, desc) in plugins.iter().enumerate() {
+                    let key = format!("clap:{}:{}", desc.path, desc.id);
+                    if !matches_browser_filter(
+                        &desc.name,
+                        &key,
+                        &ui.browser_search,
+                        ui.browser_category,
+                        ui.browser_fav_only,
+                        &ui.browser_prefs,
+                    ) {
+                        continue;
+                    }
+                    let kind_tag = match (desc.is_instrument, desc.is_effect) {
+                        (true, true) => "Inst+FX",
+                        (true, false) => "Inst",
+                        (false, true) => "FX",
+                        (false, false) => "Plugin",
+                    };
+                    let tip = format!(
+                        "{} v{} by {}\nID: {}\nFeatures: {}\n{} | note-in:{} audio:{}/{}\n{}",
+                        desc.name,
+                        if desc.version.is_empty() {
+                            "?"
+                        } else {
+                            &desc.version
+                        },
+                        if desc.vendor.is_empty() {
+                            "Unknown"
+                        } else {
+                            &desc.vendor
+                        },
+                        desc.id,
+                        if desc.features.is_empty() {
+                            "-".to_string()
+                        } else {
+                            desc.features.join(", ")
+                        },
+                        kind_tag,
+                        if desc.has_note_in { "yes" } else { "no" },
+                        if desc.has_audio_in { "in" } else { "-" },
+                        if desc.has_audio_out { "out" } else { "-" },
+                        desc.path,
+                    );
+                    u.horizontal(|u| {
+                        let fav = ui.browser_prefs.favorites.iter().any(|f| f == &key);
+                        if u.small_button(if fav { "★" } else { "☆" }).clicked() {
+                            toggle_browser_fav(ui, &key);
+                        }
+                        let resp = u
+                            .add(egui::Label::new(&desc.name).sense(egui::Sense::click_and_drag()))
+                            .on_hover_text(&tip);
+                        if resp.dragged() {
+                            resp.dnd_set_drag_payload(BrowserDragPayload::ClapPlugin(ci));
+                        }
+                        if resp.double_clicked() {
+                            if desc.is_effect && !desc.is_instrument {
+                                let ins = ui.sel_insert;
+                                add_clap_fx_from_desc(ui, s, ins, desc);
+                            } else {
+                                add_clap_channel_from_desc(ui, s, desc);
+                            }
+                        }
+                        if u.small_button("→ Ch")
+                            .on_hover_text("Add as CLAP instrument channel")
+                            .clicked()
+                        {
+                            add_clap_channel_from_desc(ui, s, desc);
+                        }
+                        if u.small_button("→ FX")
+                            .on_hover_text("Add to selected mixer insert FX rack")
+                            .clicked()
+                        {
+                            let ins = ui.sel_insert;
+                            add_clap_fx_from_desc(ui, s, ins, desc);
                         }
                     });
                 }
@@ -7477,5 +8142,75 @@ mod ui_tests {
         assert_eq!(h.state().ui.export_cfg.sample_rate, 48000);
         assert_eq!(h.state().ui.export_cfg.oversample, 2);
         assert!(!h.state().ui.show_recovery_prompt);
+    }
+
+    #[test]
+    fn phase7_clap_browser_filter_drop_and_missing_error() {
+        let prefs = BrowserPrefs::default();
+        assert!(matches_browser_filter(
+            "Test Synth",
+            "clap:org.test.synth",
+            "",
+            BrowserCategory::Plugins,
+            false,
+            &prefs,
+        ));
+        assert!(!matches_browser_filter(
+            "Test Synth",
+            "clap:org.test.synth",
+            "",
+            BrowserCategory::Presets,
+            false,
+            &prefs,
+        ));
+
+        let mut ui = AppUi::default();
+        let mut app = AppState::new();
+        ui.clap_catalog.plugins.push(ClapPluginDesc {
+            id: "org.test.missing".into(),
+            name: "Missing CLAP".into(),
+            vendor: "Vendor".into(),
+            version: "1.0".into(),
+            path: "/nonexistent_thunder_clap_12345.clap".into(),
+            is_instrument: true,
+            is_effect: true,
+            has_note_in: true,
+            has_audio_in: true,
+            has_audio_out: true,
+            features: vec!["instrument".into()],
+        });
+
+        let ch =
+            drop_browser_onto_channel(&mut ui, &mut app, None, &BrowserDragPayload::ClapPlugin(0))
+                .expect("drop onto new CLAP channel");
+        let ch_rt_id = match &app.song.channels[ch].kind {
+            ChannelKind::ClapPlugin(c) => c.rt_id,
+            _ => panic!("expected ClapPlugin channel"),
+        };
+        assert!(
+            ui.clap
+                .slots
+                .get(&ch_rt_id)
+                .and_then(|s| s.load_error.as_ref())
+                .is_some()
+        );
+
+        assert!(drop_browser_onto_fx(
+            &mut ui,
+            &mut app,
+            1,
+            &BrowserDragPayload::ClapPlugin(0),
+        ));
+        let fx_rt_id = match &app.song.mixer_tracks[1].fx[0].kind {
+            FxKind::ClapPlugin(c) => c.rt_id,
+            _ => panic!("expected ClapPlugin FX"),
+        };
+        assert!(
+            ui.clap
+                .slots
+                .get(&fx_rt_id)
+                .and_then(|s| s.load_error.as_ref())
+                .is_some()
+        );
     }
 }
