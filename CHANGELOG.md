@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v1.0.0] - 2026-11-15
+
 ### Added
 
 - Lock-free audio engine (`rtrb` command and telemetry queues, preallocated scratch buffers, background WAV disk take writer, underrun counter, and parameter smoothing).
@@ -136,6 +138,7 @@ Initial release.
 - Audio thread drops to silence on lock contention (`Mutex::try_lock`)
 - Linux build needs ALSA/X11/Wayland dev packages (see README)
 
+[v1.0.0]: https://github.com/cotanjant/thunder/releases/tag/v1.0.0
 [v0.3.0]: https://github.com/cotanjant/thunder/releases/tag/v0.3.0
 [v0.2.6]: https://github.com/cotanjant/thunder/releases/tag/v0.2.6
 [v0.2.5]: https://github.com/cotanjant/thunder/releases/tag/v0.2.5

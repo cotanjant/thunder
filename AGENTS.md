@@ -77,6 +77,8 @@ talk, no module lists on the website. Repo docs can carry the technical detail.
   Keep history clean enough to read top to bottom.
 - Push when done. The user checks. `main` and `origin/main` must match
   before reporting completion.
+- Publish a release after pushing shipped changes. Bump version by change
+  size: small fixes `0.0.x`, medium changes `0.x.x`, major milestones `x.x.x`.
 - Releases use cargo-dist. Flow: bump version + CHANGELOG, commit, push,
   tag `vX.Y.Z`, push tag, watch the Release run, then the package run.
 - Retagging a failed release is allowed only when nothing was published.
