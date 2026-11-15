@@ -30,7 +30,7 @@ Reaching FL Studio class means a producer can compose, record, arrange, mix, and
 
 ---
 
-## 3. Phase 1: Lock-Free Audio Core and Complete Signal Path
+## 3. Phase 1: Lock-Free Audio Core and Complete Signal Path (Implemented)
 
 Goal: make the audio thread deterministic, glitch-free, and consistent across all channel types.
 
@@ -50,7 +50,7 @@ Goal: make the audio thread deterministic, glitch-free, and consistent across al
 
 ---
 
-## 4. Phase 2: Decoupled Song Model (Channels, Patterns, Playlist, Mixer Graph)
+## 4. Phase 2: Decoupled Song Model (Channels, Patterns, Playlist, Mixer Graph, Implemented)
 
 Goal: remove fixed counts and 1:1 coupling so songs scale to real projects.
 
@@ -76,7 +76,7 @@ Goal: remove fixed counts and 1:1 coupling so songs scale to real projects.
 
 ---
 
-## 5. Phase 3: FL-Class Piano Roll
+## 5. Phase 3: FL-Class Piano Roll (Implemented)
 
 Goal: bring MIDI editing speed and expressiveness to FL Piano Roll standards.
 
@@ -95,7 +95,7 @@ Goal: bring MIDI editing speed and expressiveness to FL Piano Roll standards.
 
 ---
 
-## 6. Phase 4: Instruments, Sampler Depth, and Mixer FX Rack
+## 6. Phase 4: Instruments, Sampler Depth, and Mixer FX Rack (Implemented)
 
 Goal: make stock sounds and mixing tools capable of finished production without external plugins.
 
@@ -119,7 +119,7 @@ Goal: make stock sounds and mixing tools capable of finished production without 
 
 ---
 
-## 7. Phase 5: Hardware MIDI, Audio Recording, and Automation Clips
+## 7. Phase 5: Hardware MIDI, Audio Recording, and Automation Clips (Implemented)
 
 Goal: support real hardware controllers, live tracking, and song-wide mix automation.
 
@@ -140,7 +140,7 @@ Goal: support real hardware controllers, live tracking, and song-wide mix automa
 
 ---
 
-## 8. Phase 6: Workspace UX, Browser, Project Packaging, and Export
+## 8. Phase 6: Workspace UX, Browser, Project Packaging, and Export (Implemented)
 
 Goal: replace the prototype layout and textboxes with a fast desktop DAW interface.
 
@@ -163,17 +163,17 @@ Goal: replace the prototype layout and textboxes with a fast desktop DAW interfa
 
 ---
 
-## 9. Phase 7: Third-Party Plugin Hosting (CLAP First, Optional VST3)
+## 9. Phase 7: Third-Party Plugin Hosting (CLAP Implemented, VST3 Deferred)
 
-Note: `docs/ROADMAP.md` currently lists VST hosting as out of scope. Once Phases 1 through 5 are solid, third-party plugins become the main boundary between a self-contained DAW and an open studio platform.
+Note: `docs/ROADMAP.md` previously listed plugin hosting as out of scope. CLAP hosting is now implemented on `main` (`src/clap_host.rs`).
 
-1. **CLAP Host (`clack-host` + `clack-extensions`)**
-   - Scan standard OS CLAP paths out-of-process (crash-safe scanner subprocess building a plugin database).
-   - Host CLAP instruments inside Channel Rack slots and CLAP effects inside Mixer Insert FX slots.
-   - Wire audio buffers, sample-accurate MIDI/note events, polyphonic modulation, parameter automation, state save/restore into `Song` JSON, and native plugin GUI embedding (`raw-window-handle` child window).
-   - Read plugin latency (`clap_latency`) and feed it into Mixer PDC.
-2. **VST3 Evaluation**
-   - Evaluate VST3 hosting once CLAP hosting and PDC are proven, using an out-of-process or tightly sandboxed wrapper if cross-platform licensing and ABI stability warrant it.
+1. **CLAP Host (`clack-host` + `clack-extensions`, implemented)**
+   - Scans standard OS CLAP paths out of process (`thunder --scan-clap <path>`) and caches plugin metadata into the Browser `Plugins` category.
+   - Hosts CLAP instruments inside Channel Rack slots and CLAP effects inside Mixer Insert FX slots.
+   - Wires audio buffers, sample-accurate MIDI/note events, polyphonic expression (pan and tuning), parameter automation/UI sliders, base64 state persistence in `Song` JSON, offline rendering/export, and native plugin GUI embedding (`raw-window-handle` transient/parent window).
+   - Reads plugin latency (`clap_latency`) and feeds it into per-channel and mixer DAG PDC.
+2. **VST3 Evaluation (deferred)**
+   - Native CLAP hosting via MIT/Apache `clack-host` and `clack-extensions` covers third-party instruments and effects with C ABI stability, sample-accurate events, and zero SDK licensing restrictions. VST3 hosting stays deferred unless a specific plugin dependency requires the Steinberg SDK and a COM/VST3 bridge.
 
 ---
 

@@ -7,8 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Master-bus recording: the Rec button captures what plays, shows the take
-  length, and saves it as a WAV file. Takes cap at five minutes.
+- Lock-free audio engine (`rtrb` command and telemetry queues, preallocated scratch buffers, background WAV disk take writer, underrun counter, and parameter smoothing).
+- Decoupled song model (`SAVE_VERSION = 2` with `v1` migration): dynamic Channel Rack with choke groups and mixer insert linking, variable-length patterns and time signatures, multi-track Playlist with Pattern/Audio/Automation clips, and DAG Mixer routing with cycle detection and automatic Plugin Delay Compensation (PDC).
+- Piano Roll tools: multi-note selection, Paint/Slice/Mute/Erase/Scrub tools, zoom/pan, slide and portamento notes, Velocity/Pan/Cutoff/Fine-Pitch/Release property lanes, editable ghost notes, scale lock, extended chord stamps, Flam, and non-destructive tool previews.
+- Built-in instruments and Mixer FX: 3-oscillator unison SuperSynth, 4-operator FM synth with factory presets, 16-pad Drum Rack, stereo granular/looping sampler, 10 FX slots per mixer insert (7-band FFT EQ, sidechain compressor, limiter, tempo delay, reverb, chorus/flanger/phaser, saturator, M/S stereo shaper), dB faders, and Peak/RMS meters.
+- Hardware MIDI I/O (`midir`) with CC MIDI learn curves, audio input monitoring/recording with punch-in/out, built-in sample editor (trim, fades, normalize, transient slicing), curve tension Automation clips, and Peak Controller + LFO modulation.
+- Dockable FL-style workspace (`egui_dock`, `F5`-`F9` panels, `Ctrl+T` typing piano), Browser with search, favorites, synced loop preview, and drag-and-drop, native file dialogs (`rfd`), autosave crash recovery, recent projects, templates, `.zip` loop packages, WAV (16/24-bit dithered, 32-bit float), FLAC, OGG, MP3, stem split export, and Type-1 MIDI import/export.
+- Native CLAP plugin hosting (`clack-host` + `clack-extensions`): out-of-process crash-isolated scanner (`--scan-clap`), channel instrument and mixer FX hosting, parameter controls, state serialization into `Song` JSON, offline export rendering, native plugin GUI window embedding, and `clap_latency` PDC integration.
+
+### Changed
+
+- All Channel Rack instrument types (`Synth`, `Kit`, `Sampler`, `SuperSynth`, `FmSynth`, `DrumRack`, `ClapPlugin`) share the same per-channel volume, pan, filter, send, mute/solo, and PDC signal path.
+- Structural edits record undo/redo snapshots while sharing sample PCM buffers via `Arc<[f32]>`.
 
 ## [v0.3.0] - 2026-10-13
 

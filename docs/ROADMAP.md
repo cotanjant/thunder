@@ -22,26 +22,17 @@ The product is now Thunder, not thunder-daw.
 
 ## How to reach FL level
 
-Ordered by what users feel first.
+Ordered by what users feel first. Items 1 through 7 are now implemented on `main` (see [`PLAN.md`](../PLAN.md) and [`CHANGELOG.md`](../CHANGELOG.md)):
 
-1. Undo/redo. The biggest missing editor feature. Nothing else matters
-   as much for daily use.
-2. Copy/paste notes and duplicate patterns. Editing one note at a time
-   gets old fast.
-3. Audio clips on the playlist. Recorded takes and imported files should
-   sit on the timeline, not just play from the browser.
-4. Input recording. The take recorder captures the master bus only.
-   Mic and line-in with monitoring comes next.
-5. MIDI hardware in and out, plus MIDI learn for knobs.
-6. More sound: sampler envelopes and choke groups, EQ, compressor,
-   chorus. The mixer already has sends, it needs per-track slots.
-7. Keyboard shortcuts beyond Space. Arrows, Ctrl+Z, Delete already work
-   in places, the rest is unmapped.
-8. Signed builds. The Gatekeeper and SmartScreen warnings stay until
-   Apple and Microsoft certificates are paid for. Nothing code-side
-   fixes that.
-9. In-app update check pointing at the latest release.
-10. Example projects in the repo and a short video on the site, so new
-    users see the workflow before installing.
+1. Done: Undo/redo across pattern edits and structural changes (shared `Arc<[f32]>` sample buffers).
+2. Done: Copy/paste notes, multi-note marquee/transforms, duplicate/unique patterns, and Piano Roll slide notes.
+3. Done: Multi-track Playlist with Pattern, Audio, and Automation clips plus drag-and-drop from Browser.
+4. Done: Disk-streamed master/input recording, input monitoring, punch-in/out, and built-in sample editor.
+5. Done: Hardware MIDI in/out (`midir`), recording modes, and CC MIDI learn.
+6. Done: Stereo granular sampler, 16-pad Drum Rack, SuperSynth, 4-op FM synth, and 10-slot Mixer FX rack with DAG routing and automatic PDC.
+7. Done: Keyboard shortcuts with panel-focus dispatch, typing piano (`Ctrl+T`), and dockable panels (`F5`-`F9`).
+8. Open: Signed builds. Gatekeeper and SmartScreen warnings stay until Apple and Microsoft certificates are paid for. Nothing code-side fixes that.
+9. Open: In-app update check pointing at the latest release.
+10. Open: Example projects in the repo and a short video on the site, so new users see the workflow before installing.
 
-Out of scope: mobile apps, VST hosting, live collaboration.
+Out of scope: mobile apps, live collaboration. Native CLAP plugin hosting is implemented; VST3 hosting remains deferred.

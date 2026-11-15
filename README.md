@@ -1,10 +1,10 @@
 # thunder
 
-A small FL Studio-style DAW in Rust: step sequencer, piano roll, playlist, mixer.
+A desktop FL Studio-style DAW in Rust: channel rack, piano roll, multi-track playlist, and routable mixer.
 
-- Audio through [cpal](https://crates.io/crates/cpal)
-- Interface with [egui](https://crates.io/crates/egui) via [eframe](https://crates.io/crates/eframe)
-- All sound from [fundsp](https://crates.io/crates/fundsp): each voice is a live DSP graph
+- Audio through [cpal](https://crates.io/crates/cpal) with a lock-free worker and disk take streaming
+- Dockable interface with [egui](https://crates.io/crates/egui) and [egui_dock](https://crates.io/crates/egui_dock) via [eframe](https://crates.io/crates/eframe)
+- Built-in DSP from [fundsp](https://crates.io/crates/fundsp), custom synth/FX engines, and third-party CLAP plugins via [clack-host](https://crates.io/crates/clack-host)
 
 ## Install
 
@@ -17,15 +17,14 @@ Linux an AppImage. No terminal required.
 
 ## Features
 
-- Piano roll: add, drag and resize notes, velocity lane, ghost notes, scales,
-  chord stamps, quantize, humanize, strum, arpeggiate
-- Playlist: 8 patterns as one-bar clips, song or pattern mode
-- Instruments: polyphonic synths (8 voices each), synthesized drum kit,
-  sampler with WAV/MP3/OGG loading and a file browser
-- Mixer: per-channel delay and reverb sends, soft-clipped master, scope, peak meter
-- Automation lanes for volume and filter cutoff
-- Save/load projects as JSON, export WAV mixdown or MIDI file
-- Metronome, swing, tap tempo, song loop
+- Channel Rack: dynamic channels with add, duplicate, reorder, mixer routing, choke groups, and step sequencer
+- Instruments: SuperSynth (3 oscillators, unison, multimode filter, LFO matrix), 4-operator FM synth, 16-pad Drum Rack, synthesized drum kit, and stereo sampler with looping, reverse, and granular time-stretch
+- CLAP plugins: isolated out-of-process scanner, instrument and FX slot hosting, parameter UI, native plugin GUIs, state saving in project files, and latency compensation
+- Piano Roll: multi-note selection, marquee/slice/paint tools, slide and portamento notes, ghost notes, scale lock, chord stamps, property lanes, quantize, humanize, strum, and arpeggiate
+- Playlist: multi-track arrangement with Pattern, Audio, and Automation clips, optional Track Mode, punch-in/out loop region, and curve tension automation
+- Mixer: routable inserts with cycle detection, automatic Plugin Delay Compensation (PDC), sidechain sends, 10 FX slots per insert (7-band EQ with FFT, compressor/limiter, tempo delay, reverb, mod FX, saturator, M/S shaper), Peak Controller + LFO, dB faders, and LUFS/RMS metering
+- Recording and MIDI: hardware MIDI input/output (`midir`), CC MIDI learn, typing-keyboard piano, live audio input monitoring and disk recording, plus a built-in sample editor (trim, fade, normalize, transient slicing)
+- Workspace and export: dockable panels (`F5`-`F9`), drag-and-drop browser, autosave crash recovery, zipped loop packages (`.zip`), WAV (16/24-bit dithered, 32-bit float), FLAC, OGG, MP3, stem split export, and Type-1 MIDI import/export
 
 ## Build from source
 
