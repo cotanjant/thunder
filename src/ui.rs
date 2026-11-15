@@ -5948,17 +5948,16 @@ pub fn fx_rack_panel(
             let mut rm_idx: Option<usize> = None;
             let len = track.fx.len();
             cols[0].group(|u| {
-                for si in 0..len {
+                for (si, slot) in track.fx.iter_mut().enumerate().take(len) {
                     let selected = ui.sel_fx_slot == si;
                     u.horizontal(|u| {
-                        let label = format!("{}. {}", si + 1, track.fx[si].name);
+                        let label = format!("{}. {}", si + 1, slot.name);
                         if u.selectable_label(selected, label).clicked() {
                             ui.sel_fx_slot = si;
                         }
-                        u.toggle_value(&mut track.fx[si].bypass, "Byp");
-                        let mix_r = u.add(
-                            egui::Slider::new(&mut track.fx[si].mix, 0.0..=1.0).show_value(false),
-                        );
+                        u.toggle_value(&mut slot.bypass, "Byp");
+                        let mix_r =
+                            u.add(egui::Slider::new(&mut slot.mix, 0.0..=1.0).show_value(false));
                         collect_param_ctx(&mix_r, AutoTarget::InsertFxMix(ins, si), &mut ctx_act);
                         if si > 0 && u.small_button("^").clicked() {
                             move_op = Some((si, si - 1));

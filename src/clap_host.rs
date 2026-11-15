@@ -1234,7 +1234,9 @@ impl ClapMainInstance {
 
 fn clap_window_from_rwh(raw: RawWindowHandle) -> Option<Window<'static, 'static>> {
     match raw {
+        #[cfg(unix)]
         RawWindowHandle::Xlib(h) => Some(Window::from_x11_handle(h.window)),
+        #[cfg(unix)]
         RawWindowHandle::Xcb(h) => Some(Window::from_x11_handle(h.window.get().into())),
         RawWindowHandle::Win32(h) => {
             Some(unsafe { Window::from_win32_hwnd(h.hwnd.get() as *mut _) })

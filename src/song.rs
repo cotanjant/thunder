@@ -2216,8 +2216,8 @@ impl Song {
         let n = self.mixer_tracks.len();
         let order = self.mixer_topo_order();
         let mut incoming_non_sc: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
-        for u in 0..n {
-            for (ri, r) in self.mixer_tracks[u].routes.iter().enumerate() {
+        for (u, tr) in self.mixer_tracks.iter().enumerate().take(n) {
+            for (ri, r) in tr.routes.iter().enumerate() {
                 if !r.sidechain_only && r.target < n {
                     incoming_non_sc[r.target].push((u, ri));
                 }
