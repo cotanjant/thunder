@@ -2,13 +2,18 @@
 //! playlist, mixer, sample browser.
 
 use crate::engine::{AppState, load_sample_file, sample_into_song};
+use crate::fx;
 use crate::song::{
     ArpCfg, ArpDir, AutoClipPoint, AutoPoint, AutoTarget, Channel, ChannelKind, ChordKind,
-    ClipKind, KitPiece, Note, QuantizeCfg, RandCfg, ScaleKind, SnapGrid, Song, StrumCfg,
-    TICKS_PER_STEP, TimeSig, WaveKind, eval_auto, eval_auto_clip, palette_color, tool_chord_ext,
+    ClipKind, CompCfg, DelayFxCfg, DelaySync, EffectSlot, EqBandType, EqCfg, FilterMode, FmAlgo,
+    FmSynthCfg, FxKind, KitPiece, MAX_FX_SLOTS, ModFxCfg, ModFxKind, ModTarget, Note, QuantizeCfg,
+    RandCfg, ReverbFxCfg, SatCfg, SatKind, ScaleKind, SnapGrid, Song, StereoShaperCfg, StretchMode,
+    StrumCfg, SuperSynthCfg, TICKS_PER_STEP, TimeSig, WaveKind, compute_sample_peaks,
+    default_drum_pads, eval_auto, eval_auto_clip, palette_color, tool_chord_ext,
     tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts, tool_randomize,
     tool_riff_arp, tool_slice_at, tool_strum_opts,
 };
+use crate::synth::{apply_preset_to_channel, factory_presets, load_preset_json, save_preset_json};
 use eframe::egui;
 use std::time::Instant;
 
@@ -186,6 +191,10 @@ pub struct AppUi {
     playlist_auto_drag: Option<(u64, usize)>,
     clip_sample: usize,
     show_ch_settings: bool,
+    sel_pad: usize,
+    sel_fx_slot: usize,
+    add_fx_kind: usize,
+    preset_path: String,
     step_graph: StepGraphMode,
     route_target: usize,
     route_amount: f32,
@@ -274,6 +283,10 @@ impl Default for AppUi {
             playlist_auto_drag: None,
             clip_sample: 0,
             show_ch_settings: false,
+            sel_pad: 0,
+            sel_fx_slot: 0,
+            add_fx_kind: 0,
+            preset_path: "preset.json".into(),
             step_graph: StepGraphMode::Off,
             route_target: 0,
             route_amount: 1.0,
@@ -902,9 +915,11 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     let mut missing = 0;
                     for smp in song.samples.iter_mut() {
                         match load_sample_file(&smp.path) {
-                            Ok((data, sr)) => {
+                            Ok((data, data_r, sr)) => {
                                 smp.data = data.into();
+                                smp.data_r = data_r.into();
                                 smp.sr = sr;
+                                smp.peaks = compute_sample_peaks(&smp.data, &smp.data_r);
                             }
                             Err(_) => missing += 1,
                         }
@@ -912,6 +927,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     ui.sel_ch = ui.sel_ch.min(song.channels.len().saturating_sub(1));
                     ui.sel_pat = ui.sel_pat.min(song.patterns.len().saturating_sub(1));
                     ui.sel_insert = ui.sel_insert.min(song.mixer_tracks.len().saturating_sub(1));
+                    s.set_inspect_insert(ui.sel_insert);
                     s.apply_loaded_song(song);
                     s.set_pattern(ui.sel_pat);
                     ui.reset_history(&s.song);
@@ -956,7 +972,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
 }
 
 pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
-    u.horizontal(|u| {
+    u.horizontal_wrapped(|u| {
         u.heading("Channel rack");
         if u.button("+ Synth").clicked() {
             let idx = s.song.channels.len();
@@ -970,6 +986,52 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.sel_ch = s.song.add_channel(c);
             s.rebuild_channel(ui.sel_ch);
             ui.status = format!("added Synth {}", idx + 1);
+        }
+        if u.button("+ Super").clicked() {
+            let idx = s.song.channels.len();
+            let ins = (idx + 1).min(s.song.mixer_tracks.len().saturating_sub(1));
+            let c = Channel {
+                name: format!("Super {}", idx + 1),
+                kind: ChannelKind::SuperSynth(SuperSynthCfg::default()),
+                color: palette_color(idx),
+                cutoff: 4200.0,
+                mixer_insert: ins,
+                ..Default::default()
+            };
+            ui.sel_ch = s.song.add_channel(c);
+            s.rebuild_channel(ui.sel_ch);
+            ui.status = format!("added SuperSynth {}", idx + 1);
+        }
+        if u.button("+ FM").clicked() {
+            let idx = s.song.channels.len();
+            let ins = (idx + 1).min(s.song.mixer_tracks.len().saturating_sub(1));
+            let c = Channel {
+                name: format!("FM {}", idx + 1),
+                kind: ChannelKind::FmSynth(FmSynthCfg::default()),
+                color: palette_color(idx),
+                cutoff: 9000.0,
+                mixer_insert: ins,
+                ..Default::default()
+            };
+            ui.sel_ch = s.song.add_channel(c);
+            s.rebuild_channel(ui.sel_ch);
+            ui.status = format!("added FM Synth {}", idx + 1);
+        }
+        if u.button("+ DrumRack").clicked() {
+            let idx = s.song.channels.len();
+            let ins = (idx + 1).min(s.song.mixer_tracks.len().saturating_sub(1));
+            let c = Channel {
+                name: format!("Drums {}", idx + 1),
+                kind: ChannelKind::DrumRack {
+                    pads: default_drum_pads(),
+                },
+                color: palette_color(idx),
+                cutoff: 16000.0,
+                mixer_insert: ins,
+                ..Default::default()
+            };
+            ui.sel_ch = s.song.add_channel(c);
+            ui.status = format!("added DrumRack {}", idx + 1);
         }
         if u.button("+ Kit").clicked() {
             let idx = s.song.channels.len();
@@ -1059,7 +1121,7 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 });
             s.song.channels[i].mixer_insert = ins;
 
-            // Kind picker.
+            // Kind picker / badge.
             match s.song.channels[i].kind.clone() {
                 ChannelKind::Synth { wave } => {
                     let mut w = wave;
@@ -1074,6 +1136,24 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     if w != wave {
                         s.song.channels[i].kind = ChannelKind::Synth { wave: w };
                         s.rebuild_channel(i);
+                    }
+                }
+                ChannelKind::SuperSynth(cfg) => {
+                    if u.button(format!("Super {}u", cfg.unison)).clicked() {
+                        ui.sel_ch = i;
+                        ui.show_ch_settings = true;
+                    }
+                }
+                ChannelKind::FmSynth(cfg) => {
+                    if u.button(format!("FM {}", cfg.algo.name())).clicked() {
+                        ui.sel_ch = i;
+                        ui.show_ch_settings = true;
+                    }
+                }
+                ChannelKind::DrumRack { pads } => {
+                    if u.button(format!("Rack ({}p)", pads.len())).clicked() {
+                        ui.sel_ch = i;
+                        ui.show_ch_settings = true;
                     }
                 }
                 ChannelKind::Kit { piece } => {
@@ -1207,70 +1287,409 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
     let mut need_rebuild = false;
     let mut need_cutoff = None;
+    let mut trigger_pad_note: Option<u8> = None;
     let mix_names: Vec<String> = s.song.mixer_tracks.iter().map(|m| m.name.clone()).collect();
-    if let Some(c) = s.song.channels.get_mut(ch) {
-        u.group(|u| {
-            u.horizontal(|u| {
-                u.label("Channel settings:");
-                u.add(egui::TextEdit::singleline(&mut c.name).desired_width(110.0));
-                let cur_name = mix_names
-                    .get(c.mixer_insert)
-                    .cloned()
-                    .unwrap_or_else(|| "Master".into());
-                egui::ComboBox::from_id_salt("ch_set_ins")
-                    .selected_text(cur_name)
-                    .show_ui(u, |u| {
-                        for (mi, name) in mix_names.iter().enumerate() {
-                            u.selectable_value(&mut c.mixer_insert, mi, name.clone());
+    let sample_names: Vec<String> = s.song.samples.iter().map(|sm| sm.name.clone()).collect();
+    let presets = factory_presets();
+
+    let Some(c) = s.song.channels.get_mut(ch) else {
+        return;
+    };
+    u.group(|u| {
+        u.horizontal_wrapped(|u| {
+            u.label("Channel settings:");
+            u.add(egui::TextEdit::singleline(&mut c.name).desired_width(110.0));
+            let cur_name = mix_names
+                .get(c.mixer_insert)
+                .cloned()
+                .unwrap_or_else(|| "Master".into());
+            egui::ComboBox::from_id_salt("ch_set_ins")
+                .selected_text(cur_name)
+                .show_ui(u, |u| {
+                    for (mi, name) in mix_names.iter().enumerate() {
+                        u.selectable_value(&mut c.mixer_insert, mi, name.clone());
+                    }
+                });
+            u.add(egui::Slider::new(&mut c.midi_base, 21..=108).text("Root"));
+            let mut poly = c.polyphony;
+            u.add(
+                egui::DragValue::new(&mut poly)
+                    .range(0..=8)
+                    .prefix("Poly: "),
+            );
+            c.polyphony = poly;
+            u.add(egui::Slider::new(&mut c.portamento, 0.0..=0.5).text("Porta"));
+        });
+        u.horizontal_wrapped(|u| {
+            let old_spec = c.voice_spec();
+            u.add(
+                egui::Slider::new(&mut c.cutoff, 80.0..=16000.0)
+                    .logarithmic(true)
+                    .text("Cut"),
+            );
+            need_cutoff = Some(c.cutoff);
+            u.add(egui::Slider::new(&mut c.q, 0.2..=6.0).text("Q"));
+            u.add(egui::Slider::new(&mut c.attack, 0.001..=1.0).text("A"));
+            u.add(egui::Slider::new(&mut c.decay, 0.005..=2.0).text("D"));
+            u.add(egui::Slider::new(&mut c.sustain, 0.0..=1.0).text("S"));
+            u.add(egui::Slider::new(&mut c.release, 0.005..=2.0).text("R"));
+            if c.voice_spec() != old_spec {
+                need_rebuild = true;
+            }
+        });
+        u.horizontal_wrapped(|u| {
+            u.label("Cut group:");
+            let mut cg = c.cut_group.unwrap_or(0);
+            u.add(egui::DragValue::new(&mut cg).range(0..=8));
+            c.cut_group = (cg > 0).then_some(cg);
+            u.label("Cut by:");
+            let mut cb = c.cut_by.unwrap_or(0);
+            u.add(egui::DragValue::new(&mut cb).range(0..=8));
+            c.cut_by = (cb > 0).then_some(cb);
+            u.add(egui::Slider::new(&mut c.volume, 0.0..=1.5).text("Vol"));
+            u.add(egui::Slider::new(&mut c.pan, -1.0..=1.0).text("Pan"));
+            u.add(egui::Slider::new(&mut c.delay_send, 0.0..=1.0).text("Dly"));
+            u.add(egui::Slider::new(&mut c.reverb_send, 0.0..=1.0).text("Verb"));
+        });
+
+        // Presets bar (Factory + Save/Load JSON).
+        u.horizontal_wrapped(|u| {
+            u.label("Preset:");
+            egui::ComboBox::from_id_salt("ch_factory_preset")
+                .selected_text("Factory...")
+                .show_ui(u, |u| {
+                    for preset in &presets {
+                        if u.button(&preset.name).clicked() {
+                            apply_preset_to_channel(c, preset);
+                            need_rebuild = true;
+                            ui.status = format!("loaded preset {}", preset.name);
+                        }
+                    }
+                });
+            u.add(egui::TextEdit::singleline(&mut ui.preset_path).desired_width(110.0));
+            if u.button("Save Preset").clicked() {
+                match save_preset_json(c, &ui.preset_path) {
+                    Ok(()) => ui.status = format!("saved preset {}", ui.preset_path),
+                    Err(e) => ui.status = format!("preset save failed: {e}"),
+                }
+            }
+            if u.button("Load Preset").clicked() {
+                match load_preset_json(&ui.preset_path) {
+                    Ok(preset) => {
+                        apply_preset_to_channel(c, &preset);
+                        need_rebuild = true;
+                        ui.status = format!("loaded preset {}", preset.name);
+                    }
+                    Err(e) => ui.status = format!("preset load failed: {e}"),
+                }
+            }
+        });
+
+        // Instrument-specific editor.
+        match &mut c.kind {
+            ChannelKind::Sampler { sample } => {
+                u.separator();
+                if let Some(s_idx) = *sample
+                    && let Some(smp) = s.song.samples.get_mut(s_idx)
+                {
+                    let peaks = &smp.peaks;
+                    let w = u.available_width().clamp(240.0, 520.0);
+                    let (wrect, _) =
+                        u.allocate_exact_size(egui::vec2(w, 56.0), egui::Sense::hover());
+                    let wp = u.painter_at(wrect);
+                    wp.rect_filled(wrect, 2.0, egui::Color32::from_gray(16));
+                    let tx0 = wrect.min.x + c.sampler.trim_start * wrect.width();
+                    let tx1 = wrect.min.x + c.sampler.trim_end * wrect.width();
+                    wp.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(tx0, wrect.min.y),
+                            egui::pos2(tx1.max(tx0 + 2.0), wrect.max.y),
+                        ),
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(60, 120, 180, 35),
+                    );
+                    if c.sampler.loop_enabled {
+                        let span = (tx1 - tx0).max(1.0);
+                        let lx0 = tx0 + c.sampler.loop_start * span;
+                        let lx1 = tx0 + c.sampler.loop_end * span;
+                        wp.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(lx0, wrect.min.y),
+                                egui::pos2(lx1.max(lx0 + 2.0), wrect.max.y),
+                            ),
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(120, 210, 100, 45),
+                        );
+                    }
+                    let mid_y = wrect.center().y;
+                    for (bi, &pk) in peaks.iter().enumerate() {
+                        let bx =
+                            wrect.min.x + (bi as f32 / peaks.len().max(1) as f32) * wrect.width();
+                        let half_h = (pk.clamp(0.0, 1.0) * (wrect.height() * 0.45)).max(1.0);
+                        wp.line_segment(
+                            [
+                                egui::pos2(bx, mid_y - half_h),
+                                egui::pos2(bx, mid_y + half_h),
+                            ],
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 195, 240)),
+                        );
+                    }
+                    u.horizontal_wrapped(|u| {
+                        let ch_lbl = if smp.is_stereo() { "Stereo" } else { "Mono" };
+                        u.label(format!(
+                            "{} ({ch_lbl}, {:.0} Hz, {} smp)",
+                            smp.name,
+                            smp.sr,
+                            smp.data.len()
+                        ));
+                        if u.button("Normalize").clicked() {
+                            smp.normalize_in_place();
+                            ui.status = "normalized sample".into();
+                        }
+                        if u.button("Remove DC").clicked() {
+                            smp.remove_dc_in_place();
+                            ui.status = "removed DC offset".into();
+                        }
+                        if u.button("Reverse PCM").clicked() {
+                            smp.reverse_in_place();
+                            ui.status = "reversed PCM data".into();
                         }
                     });
-                u.add(egui::Slider::new(&mut c.midi_base, 21..=108).text("Root"));
-                let mut poly = c.polyphony;
-                u.add(
-                    egui::DragValue::new(&mut poly)
-                        .range(0..=8)
-                        .prefix("Poly: "),
-                );
-                c.polyphony = poly;
-                u.add(egui::Slider::new(&mut c.portamento, 0.0..=0.5).text("Porta"));
-            });
-            u.horizontal(|u| {
-                let old_spec = c.voice_spec();
-                u.add(
-                    egui::Slider::new(&mut c.cutoff, 80.0..=16000.0)
-                        .logarithmic(true)
-                        .text("Cut"),
-                );
-                need_cutoff = Some(c.cutoff);
-                u.add(egui::Slider::new(&mut c.q, 0.2..=6.0).text("Q"));
-                u.add(egui::Slider::new(&mut c.attack, 0.001..=1.0).text("A"));
-                u.add(egui::Slider::new(&mut c.decay, 0.005..=2.0).text("D"));
-                u.add(egui::Slider::new(&mut c.sustain, 0.0..=1.0).text("S"));
-                u.add(egui::Slider::new(&mut c.release, 0.005..=2.0).text("R"));
-                if c.voice_spec() != old_spec {
-                    need_rebuild = true;
+                } else {
+                    u.label("Load a sample from the Browser to view waveform and edit trim/loop.");
                 }
-            });
-            u.horizontal(|u| {
-                u.label("Cut group:");
-                let mut cg = c.cut_group.unwrap_or(0);
-                u.add(egui::DragValue::new(&mut cg).range(0..=8));
-                c.cut_group = (cg > 0).then_some(cg);
-                u.label("Cut by:");
-                let mut cb = c.cut_by.unwrap_or(0);
-                u.add(egui::DragValue::new(&mut cb).range(0..=8));
-                c.cut_by = (cb > 0).then_some(cb);
-                u.add(egui::Slider::new(&mut c.volume, 0.0..=1.5).text("Vol"));
-                u.add(egui::Slider::new(&mut c.pan, -1.0..=1.0).text("Pan"));
-                u.add(egui::Slider::new(&mut c.delay_send, 0.0..=1.0).text("Dly"));
-                u.add(egui::Slider::new(&mut c.reverb_send, 0.0..=1.0).text("Verb"));
-            });
-        });
-    }
+                u.horizontal_wrapped(|u| {
+                    u.add(egui::Slider::new(&mut c.sampler.trim_start, 0.0..=0.95).text("Trim S"));
+                    u.add(egui::Slider::new(&mut c.sampler.trim_end, 0.05..=1.0).text("Trim E"));
+                    u.checkbox(&mut c.sampler.reverse, "Reverse");
+                    u.selectable_value(&mut c.sampler.stretch, StretchMode::Resample, "Resample");
+                    u.selectable_value(&mut c.sampler.stretch, StretchMode::Granular, "Granular");
+                });
+                u.horizontal_wrapped(|u| {
+                    u.checkbox(&mut c.sampler.loop_enabled, "Loop");
+                    u.add(egui::Slider::new(&mut c.sampler.loop_start, 0.0..=0.9).text("Loop S"));
+                    u.add(egui::Slider::new(&mut c.sampler.loop_end, 0.1..=1.0).text("Loop E"));
+                    u.add(egui::Slider::new(&mut c.sampler.loop_xfade, 0.0..=0.45).text("Xfade"));
+                    u.add(
+                        egui::Slider::new(&mut c.sampler.filter_env_amt, -1.0..=1.0).text("FltEnv"),
+                    );
+                });
+            }
+            ChannelKind::SuperSynth(cfg) => {
+                u.separator();
+                u.horizontal_wrapped(|u| {
+                    let mut uni = cfg.unison;
+                    u.add(egui::Slider::new(&mut uni, 1..=7).text("Unison"));
+                    cfg.unison = uni;
+                    u.add(egui::Slider::new(&mut cfg.detune, 0.0..=1.0).text("Detune"));
+                    u.add(egui::Slider::new(&mut cfg.spread, 0.0..=1.0).text("Spread"));
+                    u.add(egui::Slider::new(&mut cfg.sub_level, 0.0..=1.0).text("Sub"));
+                    u.add(egui::Slider::new(&mut cfg.noise_level, 0.0..=0.8).text("Noise"));
+                    u.checkbox(&mut cfg.sync_osc2, "Sync2");
+                    u.checkbox(&mut cfg.ring_mod, "RingMod");
+                });
+                u.horizontal_wrapped(|u| {
+                    egui::ComboBox::from_id_salt("super_flt_mode")
+                        .selected_text(format!("Filter: {}", cfg.filter_mode.name()))
+                        .show_ui(u, |u| {
+                            for fm in FilterMode::ALL {
+                                u.selectable_value(&mut cfg.filter_mode, fm, fm.name());
+                            }
+                        });
+                    u.add(egui::Slider::new(&mut cfg.drive, 0.0..=1.0).text("Drive"));
+                    u.add(egui::Slider::new(&mut cfg.keytrack, 0.0..=1.0).text("Keytrack"));
+                    u.add(egui::Slider::new(&mut cfg.filter_env, -1.0..=1.0).text("FltEnv"));
+                });
+                for (oi, osc) in cfg.oscs.iter_mut().enumerate() {
+                    u.horizontal_wrapped(|u| {
+                        u.label(format!("Osc {}:", oi + 1));
+                        egui::ComboBox::from_id_salt(format!("super_osc_w_{oi}"))
+                            .width(68.0)
+                            .selected_text(osc.wave.name())
+                            .show_ui(u, |u| {
+                                for w in WaveKind::all() {
+                                    u.selectable_value(&mut osc.wave, w, w.name());
+                                }
+                            });
+                        let mut semi = osc.semi;
+                        u.add(
+                            egui::DragValue::new(&mut semi)
+                                .range(-24..=24)
+                                .suffix(" st"),
+                        );
+                        osc.semi = semi;
+                        u.add(egui::Slider::new(&mut osc.cents, -50.0..=50.0).text("ct"));
+                        u.add(egui::Slider::new(&mut osc.level, 0.0..=1.2).text("Lvl"));
+                    });
+                }
+                for (li, lfo) in cfg.lfos.iter_mut().enumerate() {
+                    u.horizontal_wrapped(|u| {
+                        u.label(format!("LFO {}:", li + 1));
+                        egui::ComboBox::from_id_salt(format!("super_lfo_w_{li}"))
+                            .width(64.0)
+                            .selected_text(lfo.wave.name())
+                            .show_ui(u, |u| {
+                                for w in WaveKind::all() {
+                                    u.selectable_value(&mut lfo.wave, w, w.name());
+                                }
+                            });
+                        egui::ComboBox::from_id_salt(format!("super_lfo_t_{li}"))
+                            .width(68.0)
+                            .selected_text(lfo.target.name())
+                            .show_ui(u, |u| {
+                                for t in ModTarget::ALL {
+                                    u.selectable_value(&mut lfo.target, t, t.name());
+                                }
+                            });
+                        u.add(egui::Slider::new(&mut lfo.rate_hz, 0.1..=20.0).text("Hz"));
+                        u.add(egui::Slider::new(&mut lfo.depth, 0.0..=1.0).text("Depth"));
+                    });
+                }
+            }
+            ChannelKind::FmSynth(cfg) => {
+                u.separator();
+                u.horizontal(|u| {
+                    u.label("FM Algorithm:");
+                    egui::ComboBox::from_id_salt("fm_algo_sel")
+                        .selected_text(cfg.algo.name())
+                        .show_ui(u, |u| {
+                            for a in FmAlgo::ALL {
+                                u.selectable_value(&mut cfg.algo, a, a.name());
+                            }
+                        });
+                });
+                for (oi, op) in cfg.ops.iter_mut().enumerate() {
+                    u.horizontal_wrapped(|u| {
+                        u.label(format!("Op {}:", oi + 1));
+                        u.add(egui::Slider::new(&mut op.ratio, 0.25..=12.0).text("Ratio"));
+                        u.add(egui::Slider::new(&mut op.level, 0.0..=1.5).text("Lvl"));
+                        u.add(egui::Slider::new(&mut op.decay, 0.03..=4.0).text("Dec"));
+                        u.add(egui::Slider::new(&mut op.feedback, 0.0..=1.2).text("FB"));
+                    });
+                }
+            }
+            ChannelKind::DrumRack { pads } => {
+                u.separator();
+                if pads.is_empty() {
+                    *pads = default_drum_pads();
+                }
+                ui.sel_pad = ui.sel_pad.min(pads.len() - 1);
+                u.horizontal_top(|u| {
+                    u.vertical(|u| {
+                        u.label("4x4 Pads (click to trigger & edit):");
+                        for row in 0..4 {
+                            u.horizontal(|u| {
+                                for col in 0..4 {
+                                    let pidx = (3 - row) * 4 + col;
+                                    if let Some(p) = pads.get(pidx) {
+                                        let sel = ui.sel_pad == pidx;
+                                        let btn =
+                                            egui::Button::new(format!("{}\n({})", p.name, p.note))
+                                                .min_size(egui::vec2(72.0, 34.0))
+                                                .fill(if sel {
+                                                    egui::Color32::from_rgb(70, 115, 165)
+                                                } else {
+                                                    egui::Color32::from_gray(42)
+                                                });
+                                        if u.add(btn).clicked() {
+                                            ui.sel_pad = pidx;
+                                            trigger_pad_note = Some(p.note);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    if let Some(pad) = pads.get_mut(ui.sel_pad) {
+                        u.vertical(|u| {
+                            u.label(format!("Pad #{} Inspector", ui.sel_pad + 1));
+                            u.horizontal(|u| {
+                                u.add(
+                                    egui::TextEdit::singleline(&mut pad.name).desired_width(90.0),
+                                );
+                                let mut note = pad.note;
+                                u.add(
+                                    egui::DragValue::new(&mut note)
+                                        .range(24..=96)
+                                        .prefix("Note: "),
+                                );
+                                pad.note = note;
+                            });
+                            u.add(egui::Slider::new(&mut pad.gain, 0.0..=2.0).text("Gain"));
+                            u.add(egui::Slider::new(&mut pad.pan, -1.0..=1.0).text("Pan"));
+                            u.add(
+                                egui::Slider::new(&mut pad.tune_semi, -24.0..=24.0).text("Tune st"),
+                            );
+                            u.horizontal(|u| {
+                                let mut cg = pad.cut_group.unwrap_or(0);
+                                u.add(
+                                    egui::DragValue::new(&mut cg)
+                                        .range(0..=8)
+                                        .prefix("CutGrp: "),
+                                );
+                                pad.cut_group = (cg > 0).then_some(cg);
+                                let mut cb = pad.cut_by.unwrap_or(0);
+                                u.add(egui::DragValue::new(&mut cb).range(0..=8).prefix("CutBy: "));
+                                pad.cut_by = (cb > 0).then_some(cb);
+                                let mut off = pad.mixer_offset;
+                                u.add(
+                                    egui::DragValue::new(&mut off)
+                                        .range(-8..=16)
+                                        .prefix("MixOff: "),
+                                );
+                                pad.mixer_offset = off;
+                            });
+                            if let Some(layer) = pad.layers.first_mut() {
+                                u.horizontal(|u| {
+                                    let s_lbl = layer
+                                        .sample
+                                        .and_then(|si| sample_names.get(si))
+                                        .cloned()
+                                        .unwrap_or_else(|| "Kit fallback".into());
+                                    egui::ComboBox::from_id_salt("pad_layer_smp")
+                                        .selected_text(s_lbl)
+                                        .show_ui(u, |u| {
+                                            if u.selectable_label(
+                                                layer.sample.is_none(),
+                                                "Kit fallback",
+                                            )
+                                            .clicked()
+                                            {
+                                                layer.sample = None;
+                                            }
+                                            for (si, sn) in sample_names.iter().enumerate() {
+                                                if u.selectable_label(layer.sample == Some(si), sn)
+                                                    .clicked()
+                                                {
+                                                    layer.sample = Some(si);
+                                                }
+                                            }
+                                        });
+                                    let mut kit = layer.kit_fallback.unwrap_or(KitPiece::Kick);
+                                    egui::ComboBox::from_id_salt("pad_layer_kit")
+                                        .selected_text(kit.name())
+                                        .show_ui(u, |u| {
+                                            for k in KitPiece::all() {
+                                                u.selectable_value(&mut kit, k, k.name());
+                                            }
+                                        });
+                                    layer.kit_fallback = Some(kit);
+                                });
+                            }
+                        });
+                    }
+                });
+            }
+            ChannelKind::Synth { .. } | ChannelKind::Kit { .. } => {}
+        }
+    });
     if need_rebuild {
         s.rebuild_channel(ch);
     } else if let Some(cut) = need_cutoff {
         s.set_channel_cutoff(ch, cut);
+    }
+    if let Some(note) = trigger_pad_note {
+        s.live_note_ch(ch, note);
     }
 }
 
@@ -1354,7 +1773,13 @@ fn step_graph_editor(ui: &mut AppUi, s: &mut AppState, pat: usize, steps: usize,
 
 fn preview_channel(s: &mut AppState, i: usize) {
     match s.song.channels[i].kind.clone() {
-        ChannelKind::Synth { .. } => s.live_note_ch(i, s.song.channels[i].midi_base),
+        ChannelKind::Synth { .. } | ChannelKind::SuperSynth(_) | ChannelKind::FmSynth(_) => {
+            s.live_note_ch(i, s.song.channels[i].midi_base)
+        }
+        ChannelKind::DrumRack { pads } => {
+            let note = pads.first().map(|p| p.note).unwrap_or(36);
+            s.live_note_ch(i, note);
+        }
         ChannelKind::Kit { piece } => s.live_kit(piece),
         ChannelKind::Sampler { sample } => {
             if let Some(idx) = sample {
@@ -3524,12 +3949,409 @@ pub fn try_add_mixer_route(
     }
 }
 
+pub fn fx_kind_from_choice(choice: usize) -> FxKind {
+    match choice {
+        0 => FxKind::ParametricEq(EqCfg::default()),
+        1 => FxKind::Compressor(CompCfg::default()),
+        2 => FxKind::Compressor(CompCfg {
+            threshold_db: -1.5,
+            ratio: 20.0,
+            knee_db: 0.5,
+            attack_ms: 0.5,
+            release_ms: 45.0,
+            makeup_db: 0.0,
+            sidechain_from: None,
+            limiter: true,
+            lookahead_samples: 64,
+        }),
+        3 => FxKind::StereoDelay(DelayFxCfg::default()),
+        4 => FxKind::Reverb(ReverbFxCfg::default()),
+        5 => FxKind::Modulator(ModFxCfg::default()),
+        6 => FxKind::Saturator(SatCfg::default()),
+        _ => FxKind::StereoShaper(StereoShaperCfg::default()),
+    }
+}
+
+const FX_CHOICE_NAMES: [&str; 8] = [
+    "Parametric EQ",
+    "Compressor",
+    "Limiter",
+    "Stereo Delay",
+    "Reverb",
+    "Modulator",
+    "Saturator",
+    "Stereo Shaper",
+];
+
+struct FxEditorCtx<'a> {
+    slot_idx: usize,
+    ins: usize,
+    names: &'a [String],
+    sr: f32,
+    fft_bins: &'a [f32; fx::FFT_BINS],
+    gr_db: f32,
+}
+
+fn fx_slot_editor(slot: &mut EffectSlot, ctx: &FxEditorCtx<'_>, u: &mut egui::Ui) {
+    let slot_idx = ctx.slot_idx;
+    let ins = ctx.ins;
+    let names = ctx.names;
+    let sr = ctx.sr;
+    let fft_bins = ctx.fft_bins;
+    let gr_db = ctx.gr_db;
+    u.horizontal(|u| {
+        u.label(format!("Slot {}: {}", slot_idx + 1, slot.name));
+        u.toggle_value(&mut slot.bypass, "Bypass");
+        u.add(egui::Slider::new(&mut slot.mix, 0.0..=1.0).text("Mix"));
+    });
+    match &mut slot.kind {
+        FxKind::ParametricEq(cfg) => {
+            // Visual 64-bin FFT + combined EQ response curve.
+            let (rect, _) = u.allocate_exact_size(
+                egui::vec2(u.available_width().max(240.0), 86.0),
+                egui::Sense::hover(),
+            );
+            let p = u.painter_at(rect);
+            p.rect_filled(rect, 3.0, egui::Color32::from_gray(20));
+            let mid_y = rect.center().y;
+            p.line_segment(
+                [egui::pos2(rect.min.x, mid_y), egui::pos2(rect.max.x, mid_y)],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(50)),
+            );
+            // FFT bars (dB values in -72.0..=6.0)
+            let bw = rect.width() / fx::FFT_BINS as f32;
+            for (bi, &db) in fft_bins.iter().enumerate() {
+                let norm = ((db + 72.0) / 72.0).clamp(0.0, 1.0);
+                if norm > 0.01 {
+                    let h = norm * rect.height() * 0.9;
+                    let x = rect.min.x + bi as f32 * bw;
+                    p.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, rect.max.y - h),
+                            egui::vec2((bw - 1.0).max(1.0), h),
+                        ),
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(70, 155, 220, 110),
+                    );
+                }
+            }
+            // EQ curve (20 Hz .. 20 kHz log scale)
+            let steps = 48;
+            let mut prev: Option<egui::Pos2> = None;
+            for k in 0..=steps {
+                let t = k as f32 / steps as f32;
+                let hz = 20.0 * (1000.0_f32).powf(t);
+                let db = fx::eq_response_db(cfg, hz, sr).clamp(-18.0, 18.0);
+                let x = rect.min.x + t * rect.width();
+                let y = mid_y - (db / 18.0) * (rect.height() * 0.44);
+                let pt = egui::pos2(x, y);
+                if let Some(pp) = prev {
+                    p.line_segment([pp, pt], egui::Stroke::new(1.8, egui::Color32::GOLD));
+                }
+                prev = Some(pt);
+            }
+            for (bi, band) in cfg.bands.iter_mut().enumerate() {
+                u.horizontal(|u| {
+                    u.toggle_value(&mut band.enabled, format!("B{}", bi + 1));
+                    egui::ComboBox::from_id_salt(("eq_band_kind", ins, slot_idx, bi))
+                        .width(68.0)
+                        .selected_text(band.kind.name())
+                        .show_ui(u, |u| {
+                            for k in EqBandType::ALL {
+                                u.selectable_value(&mut band.kind, k, k.name());
+                            }
+                        });
+                    u.add(
+                        egui::Slider::new(&mut band.freq_hz, 20.0..=18000.0)
+                            .logarithmic(true)
+                            .suffix(" Hz"),
+                    );
+                    u.add(egui::Slider::new(&mut band.gain_db, -18.0..=18.0).suffix(" dB"));
+                    u.add(egui::Slider::new(&mut band.q, 0.3..=10.0).text("Q"));
+                });
+            }
+        }
+        FxKind::Compressor(cfg) => {
+            u.horizontal(|u| {
+                u.toggle_value(&mut cfg.limiter, "Limiter");
+                let sc_label = cfg
+                    .sidechain_from
+                    .and_then(|idx| names.get(idx).cloned())
+                    .unwrap_or_else(|| "Internal".into());
+                egui::ComboBox::from_id_salt(("comp_sc", ins, slot_idx))
+                    .selected_text(format!("SC: {sc_label}"))
+                    .show_ui(u, |u| {
+                        u.selectable_value(&mut cfg.sidechain_from, None, "Internal");
+                        for (mi, nm) in names.iter().enumerate() {
+                            if mi != ins {
+                                u.selectable_value(&mut cfg.sidechain_from, Some(mi), nm.clone());
+                            }
+                        }
+                    });
+                u.label(format!("GR: {:.1} dB", gr_db));
+                let gr_norm = (-gr_db / 24.0).clamp(0.0, 1.0);
+                let (grect, _) =
+                    u.allocate_exact_size(egui::vec2(72.0, 10.0), egui::Sense::hover());
+                let gp = u.painter_at(grect);
+                gp.rect_filled(grect, 2.0, egui::Color32::from_gray(28));
+                if gr_norm > 0.005 {
+                    let w = grect.width() * gr_norm;
+                    gp.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(grect.max.x - w, grect.min.y),
+                            egui::vec2(w, grect.height()),
+                        ),
+                        1.0,
+                        egui::Color32::from_rgb(230, 145, 55),
+                    );
+                }
+            });
+            u.horizontal(|u| {
+                u.add(
+                    egui::Slider::new(&mut cfg.threshold_db, -48.0..=0.0)
+                        .text("Thresh")
+                        .suffix(" dB"),
+                );
+                u.add(egui::Slider::new(&mut cfg.ratio, 1.0..=20.0).text("Ratio"));
+                u.add(
+                    egui::Slider::new(&mut cfg.knee_db, 0.0..=12.0)
+                        .text("Knee")
+                        .suffix(" dB"),
+                );
+            });
+            u.horizontal(|u| {
+                u.add(
+                    egui::Slider::new(&mut cfg.attack_ms, 0.2..=80.0)
+                        .text("Atk")
+                        .suffix(" ms"),
+                );
+                u.add(
+                    egui::Slider::new(&mut cfg.release_ms, 10.0..=600.0)
+                        .text("Rel")
+                        .suffix(" ms"),
+                );
+                u.add(
+                    egui::Slider::new(&mut cfg.makeup_db, -12.0..=18.0)
+                        .text("Gain")
+                        .suffix(" dB"),
+                );
+            });
+            if cfg.limiter {
+                u.add(
+                    egui::Slider::new(&mut cfg.lookahead_samples, 0..=256)
+                        .text("Lookahead")
+                        .suffix(" smp"),
+                );
+            }
+        }
+        FxKind::StereoDelay(cfg) => {
+            u.horizontal(|u| {
+                egui::ComboBox::from_id_salt(("dly_sync", ins, slot_idx))
+                    .selected_text(cfg.sync.name())
+                    .show_ui(u, |u| {
+                        for sy in DelaySync::ALL {
+                            u.selectable_value(&mut cfg.sync, sy, sy.name());
+                        }
+                    });
+                u.toggle_value(&mut cfg.ping_pong, "Ping-Pong");
+                if cfg.sync == DelaySync::FreeMs {
+                    u.add(
+                        egui::Slider::new(&mut cfg.time_ms, 10.0..=1500.0)
+                            .text("Time")
+                            .suffix(" ms"),
+                    );
+                }
+            });
+            u.horizontal(|u| {
+                u.add(egui::Slider::new(&mut cfg.feedback, 0.0..=0.92).text("Feedback"));
+                u.add(
+                    egui::Slider::new(&mut cfg.hp_hz, 20.0..=2000.0)
+                        .logarithmic(true)
+                        .text("HP"),
+                );
+                u.add(
+                    egui::Slider::new(&mut cfg.lp_hz, 800.0..=16000.0)
+                        .logarithmic(true)
+                        .text("LP"),
+                );
+            });
+        }
+        FxKind::Reverb(cfg) => {
+            u.horizontal(|u| {
+                u.add(egui::Slider::new(&mut cfg.room_size, 0.1..=1.0).text("Room"));
+                u.add(egui::Slider::new(&mut cfg.decay, 0.1..=0.95).text("Decay"));
+                u.add(
+                    egui::Slider::new(&mut cfg.pre_delay_ms, 0.0..=120.0)
+                        .text("Pre")
+                        .suffix(" ms"),
+                );
+            });
+            u.horizontal(|u| {
+                u.add(
+                    egui::Slider::new(&mut cfg.high_cut_hz, 1200.0..=16000.0)
+                        .logarithmic(true)
+                        .text("HiCut"),
+                );
+                u.add(egui::Slider::new(&mut cfg.width, 0.0..=1.0).text("Width"));
+            });
+        }
+        FxKind::Modulator(cfg) => {
+            u.horizontal(|u| {
+                egui::ComboBox::from_id_salt(("mod_kind", ins, slot_idx))
+                    .selected_text(cfg.mode.name())
+                    .show_ui(u, |u| {
+                        for m in ModFxKind::ALL {
+                            u.selectable_value(&mut cfg.mode, m, m.name());
+                        }
+                    });
+                u.add(
+                    egui::Slider::new(&mut cfg.rate_hz, 0.05..=8.0)
+                        .text("Rate")
+                        .suffix(" Hz"),
+                );
+                u.add(egui::Slider::new(&mut cfg.depth, 0.0..=1.0).text("Depth"));
+                u.add(egui::Slider::new(&mut cfg.feedback, -0.85..=0.85).text("Fb"));
+            });
+        }
+        FxKind::Saturator(cfg) => {
+            u.horizontal(|u| {
+                egui::ComboBox::from_id_salt(("sat_kind", ins, slot_idx))
+                    .selected_text(cfg.mode.name())
+                    .show_ui(u, |u| {
+                        for sk in SatKind::ALL {
+                            u.selectable_value(&mut cfg.mode, sk, sk.name());
+                        }
+                    });
+                u.add(egui::Slider::new(&mut cfg.drive, 1.0..=12.0).text("Drive"));
+                u.add(egui::Slider::new(&mut cfg.tone, 0.0..=1.0).text("Tone"));
+                u.add(egui::Slider::new(&mut cfg.output_db, -18.0..=6.0).text("Out dB"));
+            });
+        }
+        FxKind::StereoShaper(cfg) => {
+            u.horizontal(|u| {
+                u.add(egui::Slider::new(&mut cfg.mid_gain, 0.0..=2.0).text("Mid"));
+                u.add(egui::Slider::new(&mut cfg.side_gain, 0.0..=2.0).text("Side"));
+                u.add(
+                    egui::Slider::new(&mut cfg.delay_ms, -20.0..=20.0)
+                        .text("L/R dly")
+                        .suffix(" ms"),
+                );
+                u.toggle_value(&mut cfg.invert_l, "Inv L");
+                u.toggle_value(&mut cfg.invert_r, "Inv R");
+            });
+        }
+    }
+}
+
+pub fn fx_rack_panel(
+    ui: &mut AppUi,
+    s: &mut AppState,
+    ins: usize,
+    names: &[String],
+    u: &mut egui::Ui,
+) {
+    let sr = s.rt.sr;
+    let fft_bins = s.rt.fft_bins;
+    let comp_gr = s.rt.comp_gr_db;
+    let Some(track) = s.song.mixer_tracks.get_mut(ins) else {
+        return;
+    };
+    u.group(|u| {
+        u.horizontal(|u| {
+            u.strong(format!(
+                "Insert FX Rack ({}/{})",
+                track.fx.len(),
+                MAX_FX_SLOTS
+            ));
+            let choice = ui.add_fx_kind.min(FX_CHOICE_NAMES.len() - 1);
+            egui::ComboBox::from_id_salt("add_fx_combo")
+                .selected_text(FX_CHOICE_NAMES[choice])
+                .show_ui(u, |u| {
+                    for (ci, &label) in FX_CHOICE_NAMES.iter().enumerate() {
+                        u.selectable_value(&mut ui.add_fx_kind, ci, label);
+                    }
+                });
+            let can_add = track.fx.len() < MAX_FX_SLOTS;
+            if u.add_enabled(can_add, egui::Button::new("+ FX")).clicked() {
+                let kind = fx_kind_from_choice(ui.add_fx_kind);
+                let nm = kind.default_name();
+                if track.add_fx(EffectSlot::new(kind)) {
+                    ui.sel_fx_slot = track.fx.len() - 1;
+                    ui.status = format!("added {nm} to {}", track.name);
+                }
+            }
+        });
+        if track.fx.is_empty() {
+            u.label("No insert effects loaded. Pick a module and click + FX.");
+            return;
+        }
+        ui.sel_fx_slot = ui.sel_fx_slot.min(track.fx.len() - 1);
+        u.columns(2, |cols| {
+            let mut move_op: Option<(usize, usize)> = None;
+            let mut rm_idx: Option<usize> = None;
+            let len = track.fx.len();
+            cols[0].group(|u| {
+                for si in 0..len {
+                    let selected = ui.sel_fx_slot == si;
+                    u.horizontal(|u| {
+                        let label = format!("{}. {}", si + 1, track.fx[si].name);
+                        if u.selectable_label(selected, label).clicked() {
+                            ui.sel_fx_slot = si;
+                        }
+                        u.toggle_value(&mut track.fx[si].bypass, "Byp");
+                        u.add(
+                            egui::Slider::new(&mut track.fx[si].mix, 0.0..=1.0).show_value(false),
+                        );
+                        if si > 0 && u.small_button("^").clicked() {
+                            move_op = Some((si, si - 1));
+                        }
+                        if si + 1 < len && u.small_button("v").clicked() {
+                            move_op = Some((si, si + 1));
+                        }
+                        if u.small_button("×").clicked() {
+                            rm_idx = Some(si);
+                        }
+                    });
+                }
+            });
+            if let Some((from, to)) = move_op
+                && track.move_fx(from, to)
+            {
+                ui.sel_fx_slot = to;
+            }
+            if let Some(rm) = rm_idx {
+                track.fx.remove(rm);
+                if track.fx.is_empty() {
+                    ui.sel_fx_slot = 0;
+                    return;
+                }
+                ui.sel_fx_slot = ui.sel_fx_slot.min(track.fx.len() - 1);
+            }
+            let sel = ui.sel_fx_slot;
+            if let Some(slot) = track.fx.get_mut(sel) {
+                let ctx = FxEditorCtx {
+                    slot_idx: sel,
+                    ins,
+                    names,
+                    sr,
+                    fft_bins: &fft_bins,
+                    gr_db: comp_gr[sel],
+                };
+                cols[1].group(|u| {
+                    fx_slot_editor(slot, &ctx, u);
+                });
+            }
+        });
+    });
+}
+
 pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     u.horizontal(|u| {
         u.heading("Mixer");
         if u.button("+ Insert").clicked() {
             let idx = s.song.add_mixer_insert();
             ui.sel_insert = idx;
+            s.set_inspect_insert(idx);
             ui.status = format!("added Insert {idx}");
         }
         if u.button("Link Ch (Ctrl+L)").clicked() {
@@ -3541,6 +4363,9 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         return;
     }
     ui.sel_insert = ui.sel_insert.min(s.song.mixer_tracks.len() - 1);
+    if s.rt.inspect_insert != ui.sel_insert {
+        s.set_inspect_insert(ui.sel_insert);
+    }
     let pdc = s.song.compute_pdc();
     let linked_ins = s
         .song
@@ -3549,6 +4374,7 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         .map(|c| c.mixer_insert)
         .unwrap_or(0);
 
+    let mut clear_clips = false;
     egui::ScrollArea::horizontal()
         .id_salt("mixer_strips_scroll")
         .show(u, |u| {
@@ -3565,6 +4391,7 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                             };
                             if u.selectable_label(is_sel, label).clicked() {
                                 ui.sel_insert = i;
+                                s.set_inspect_insert(i);
                             }
                             let peak =
                                 s.rt.mix_peaks
@@ -3572,39 +4399,81 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                                     .copied()
                                     .unwrap_or(0.0)
                                     .clamp(0.0, 1.0);
-                            let (mrect, _) =
-                                u.allocate_exact_size(egui::vec2(58.0, 7.0), egui::Sense::hover());
-                            let mp = u.painter_at(mrect);
-                            mp.rect_filled(mrect, 1.0, egui::Color32::from_gray(28));
-                            if peak > 0.003 {
-                                let col = if peak > 0.9 {
-                                    egui::Color32::from_rgb(220, 70, 60)
-                                } else if peak > 0.65 {
-                                    egui::Color32::from_rgb(220, 180, 60)
-                                } else {
-                                    egui::Color32::from_rgb(90, 200, 100)
-                                };
-                                mp.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        mrect.min,
-                                        egui::vec2(mrect.width() * peak, 7.0),
-                                    ),
-                                    1.0,
-                                    col,
+                            let rms = s.rt.mix_rms.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            let clipped = s.rt.mix_clips.get(i).copied().unwrap_or(false);
+                            u.horizontal(|u| {
+                                let (mrect, _) = u.allocate_exact_size(
+                                    egui::vec2(52.0, 9.0),
+                                    egui::Sense::hover(),
                                 );
-                            }
+                                let mp = u.painter_at(mrect);
+                                mp.rect_filled(mrect, 1.0, egui::Color32::from_gray(28));
+                                if peak > 0.003 {
+                                    let col = if peak > 0.9 {
+                                        egui::Color32::from_rgb(220, 70, 60)
+                                    } else if peak > 0.65 {
+                                        egui::Color32::from_rgb(220, 180, 60)
+                                    } else {
+                                        egui::Color32::from_rgb(90, 200, 100)
+                                    };
+                                    mp.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            mrect.min,
+                                            egui::vec2(mrect.width() * peak, 5.0),
+                                        ),
+                                        1.0,
+                                        col,
+                                    );
+                                }
+                                if rms > 0.003 {
+                                    mp.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(mrect.min.x, mrect.min.y + 5.0),
+                                            egui::vec2(mrect.width() * rms, 4.0),
+                                        ),
+                                        1.0,
+                                        egui::Color32::from_rgb(80, 165, 225),
+                                    );
+                                }
+                                let clip_col = if clipped {
+                                    egui::Color32::from_rgb(225, 60, 60)
+                                } else {
+                                    egui::Color32::from_gray(55)
+                                };
+                                if u.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("CL").size(9.0).color(clip_col),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Click to clear clip indicators")
+                                .clicked()
+                                {
+                                    clear_clips = true;
+                                }
+                            });
                             u.horizontal(|u| {
                                 u.toggle_value(&mut s.song.mixer_tracks[i].mute, "M");
                                 u.toggle_value(&mut s.song.mixer_tracks[i].solo, "S");
+                                u.toggle_value(&mut s.song.mixer_tracks[i].polarity_inv, "Ø")
+                                    .on_hover_text("Polarity invert");
                             });
                             u.add(
                                 egui::Slider::new(&mut s.song.mixer_tracks[i].volume, 0.0..=1.5)
                                     .vertical()
                                     .text("vol"),
                             );
+                            u.label(fx::format_db(s.song.mixer_tracks[i].volume));
                             u.add(
                                 egui::Slider::new(&mut s.song.mixer_tracks[i].pan, -1.0..=1.0)
                                     .text("pan"),
+                            );
+                            u.add(
+                                egui::Slider::new(
+                                    &mut s.song.mixer_tracks[i].stereo_sep,
+                                    -1.0..=1.0,
+                                )
+                                .text("sep"),
                             );
                             u.add(
                                 egui::Slider::new(
@@ -3621,7 +4490,10 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                                 .text("vrb"),
                             );
                             let total_lat = pdc.total_out.get(i).copied().unwrap_or(0);
-                            u.label(format!("pdc:{total_lat}"));
+                            u.label(format!(
+                                "pdc:{total_lat} ({} fx)",
+                                s.song.mixer_tracks[i].fx.len()
+                            ));
                         });
                     });
                 }
@@ -3634,6 +4506,9 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 });
             });
         });
+    if clear_clips {
+        s.clear_mix_clips();
+    }
 
     // Selected insert routing + PDC inspector.
     let ins = ui.sel_insert;
@@ -3650,9 +4525,12 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     .prefix("Lat: ")
                     .suffix(" smp"),
             );
+            let eff_lat = s.song.mixer_tracks[ins].effective_latency_samples();
             let comp = pdc.direct_delay.get(ins).copied().unwrap_or(0);
             let out_lat = pdc.total_out.get(ins).copied().unwrap_or(0);
-            u.label(format!("PDC: +{comp} smp, out {out_lat} smp"));
+            u.label(format!(
+                "Eff: {eff_lat} smp | PDC: +{comp}, out {out_lat} smp"
+            ));
         });
         if ins > 0 {
             let mut rm_target: Option<usize> = None;
@@ -3695,6 +4573,9 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             });
         }
     });
+
+    // 10-slot Insert FX Rack for the selected insert.
+    fx_rack_panel(ui, s, ins, &names, u);
 
     // Scope.
     let scope = s.rt.scope_ordered();
@@ -3997,12 +4878,12 @@ mod ui_tests {
     fn playlist_places_and_removes_audio_clip() {
         let mut ui = AppUi::default();
         let mut state = AppState::new();
-        state.song.samples.push(crate::song::SampleRef {
-            name: "tone.wav".into(),
-            path: "tone.wav".into(),
-            data: vec![0.5].into(),
-            sr: 44100.0,
-        });
+        state.song.samples.push(crate::song::SampleRef::from_mono(
+            "tone.wav",
+            "tone.wav",
+            vec![0.5],
+            44100.0,
+        ));
         ui.playlist_paint = PlaylistPaint::Audio;
         ui.clip_sample = 0;
         let id = add_playlist_clip_at(&mut ui, &mut state, 1, 64).unwrap();
@@ -4040,6 +4921,41 @@ mod ui_tests {
     }
 
     #[test]
+    fn channel_rack_adds_supersynth_fm_and_drumrack() {
+        struct CState {
+            ui: AppUi,
+            app: AppState,
+        }
+        let state = CState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+        };
+        let initial = state.app.song.channels.len();
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut CState| {
+                channel_rack(&mut st.ui, &mut st.app, u);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1280.0, 720.0));
+        h.step();
+        h.get_by_label("+ Super").click();
+        h.step();
+        h.get_by_label("+ FM").click();
+        h.step();
+        h.get_by_label("+ DrumRack").click();
+        h.step();
+        let chs = &h.state().app.song.channels;
+        assert_eq!(chs.len(), initial + 3);
+        assert!(matches!(chs[initial].kind, ChannelKind::SuperSynth(_)));
+        assert!(matches!(chs[initial + 1].kind, ChannelKind::FmSynth(_)));
+        assert!(matches!(
+            chs[initial + 2].kind,
+            ChannelKind::DrumRack { .. }
+        ));
+    }
+
+    #[test]
     fn mixer_ui_rejects_route_cycle_and_adds_insert() {
         let mut ui = AppUi::default();
         let mut state = AppState::new();
@@ -4050,6 +4966,46 @@ mod ui_tests {
         assert!(try_add_mixer_route(&mut ui, &mut state, 1, 2, 1.0, false));
         assert!(!try_add_mixer_route(&mut ui, &mut state, 2, 1, 1.0, false));
         assert!(ui.status.contains("cycle"));
+    }
+
+    #[test]
+    fn mixer_fx_rack_adds_reorders_and_bypasses_slots() {
+        struct MState {
+            ui: AppUi,
+            app: AppState,
+        }
+        let state = MState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+        };
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut MState| {
+                mixer(&mut st.ui, &mut st.app, u);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1280.0, 900.0));
+        h.step();
+        h.state_mut().ui.add_fx_kind = 0; // Parametric EQ
+        h.get_by_label("+ FX").click();
+        h.step();
+        h.state_mut().ui.add_fx_kind = 1; // Compressor
+        h.get_by_label("+ FX").click();
+        h.step();
+        assert_eq!(h.state().app.song.mixer_tracks[1].fx.len(), 2);
+        assert_eq!(
+            h.state().app.song.mixer_tracks[1].fx[0].name,
+            "Parametric EQ"
+        );
+        assert_eq!(h.state().app.song.mixer_tracks[1].fx[1].name, "Compressor");
+
+        // Reorder and bypass slot via UI buttons.
+        h.get_by_label("^").click();
+        h.step();
+        assert_eq!(h.state().app.song.mixer_tracks[1].fx[0].name, "Compressor");
+        h.get_by_label("Bypass").click();
+        h.step();
+        assert!(h.state().app.song.mixer_tracks[1].fx[0].bypass);
     }
 
     #[test]

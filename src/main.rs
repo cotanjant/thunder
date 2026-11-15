@@ -7,7 +7,9 @@
 
 mod engine;
 mod export;
+mod fx;
 mod song;
+mod synth;
 mod ui;
 
 use engine::{AppState, start_audio};

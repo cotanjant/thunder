@@ -2,10 +2,12 @@
 //! PCM kit + pitched sampler playback routed through per-channel DSP,
 //! delay/reverb sends, sample-clock scheduler, and disk-streaming take recorder.
 
+use crate::fx::{FFT_BINS, MixerInsertRt, compute_fft_bins};
 use crate::song::{
-    AutoTarget, ChannelKind, ClipKind, KitPiece, Song, VoiceSpec, WaveKind, eval_auto,
-    eval_auto_clip,
+    AutoTarget, ChannelKind, ClipKind, KitPiece, MAX_FX_SLOTS, SampleRef, Song, StretchMode,
+    VoiceSpec, WaveKind, eval_auto, eval_auto_clip,
 };
+use crate::synth::AdvVoiceRt;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fundsp::prelude::{
     AudioUnit, Shared, Wave, adsr_live, dc, highpass_hz, lowpass, midi_hz, pan, reverb_stereo, saw,
@@ -239,26 +241,65 @@ fn render_click(sr: f32, freq: f32) -> Vec<f32> {
     out
 }
 
-/// Load an audio file (wav/mp3/ogg/...) into mono f32 + native sample rate.
-pub fn load_sample_file(path: &str) -> Result<(Vec<f32>, f32), String> {
+/// Load an audio file (wav/mp3/ogg/...) into full stereo (L, optional R) f32 + native sample rate.
+pub fn load_sample_file(path: &str) -> Result<(Vec<f32>, Vec<f32>, f32), String> {
     let wave = Wave::load(path).map_err(|e| format!("{e}"))?;
     if wave.is_empty() {
         return Err("empty audio file".into());
     }
-    // shortcut: 30s cap per sample; Phase 4 expands to streaming/full stems.
-    let n = wave
-        .len()
-        .min((wave.sample_rate() as usize).saturating_mul(30).max(1));
+    let n = wave.len();
     let nch = wave.channels().max(1);
-    let mut mono = vec![0.0; n];
-    for (i, m) in mono.iter_mut().enumerate() {
-        let mut v = 0.0;
-        for c in 0..nch {
-            v += wave.channel(c).get(i).copied().unwrap_or(0.0);
-        }
-        *m = v / nch as f32;
+    let left: Vec<f32> = (0..n)
+        .map(|i| wave.channel(0).get(i).copied().unwrap_or(0.0))
+        .collect();
+    let right: Vec<f32> = if nch >= 2 {
+        (0..n)
+            .map(|i| wave.channel(1).get(i).copied().unwrap_or(0.0))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((left, right, wave.sample_rate() as f32))
+}
+
+#[inline]
+fn cubic_hermite(y_m1: f32, y0: f32, y1: f32, y2: f32, t: f32) -> f32 {
+    let c0 = y0;
+    let c1 = 0.5 * (y1 - y_m1);
+    let c2 = y_m1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;
+    let c3 = 0.5 * (y2 - y_m1) + 1.5 * (y0 - y1);
+    ((c3 * t + c2) * t + c1) * t + c0
+}
+
+fn read_sample_hermite_lr(smp: &SampleRef, pos: f32) -> (f32, f32) {
+    let len = smp.data.len();
+    if len == 0 || pos < 0.0 || pos >= len as f32 {
+        return (0.0, 0.0);
     }
-    Ok((mono, wave.sample_rate() as f32))
+    let p0 = pos as usize;
+    let frac = pos - p0 as f32;
+    let i_m1 = p0.saturating_sub(1);
+    let i1 = (p0 + 1).min(len - 1);
+    let i2 = (p0 + 2).min(len - 1);
+    let l = cubic_hermite(
+        smp.data[i_m1],
+        smp.data[p0],
+        smp.data[i1],
+        smp.data[i2],
+        frac,
+    );
+    let r = if smp.is_stereo() {
+        cubic_hermite(
+            smp.data_r[i_m1],
+            smp.data_r[p0],
+            smp.data_r[i1],
+            smp.data_r[i2],
+            frac,
+        )
+    } else {
+        l
+    };
+    (l, r)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +350,21 @@ enum PlayKind {
 struct PlayHead {
     kind: PlayKind,
     ch: Option<usize>,
+    direct_insert: Option<usize>,
+    pad_cut_by: Option<u8>,
     mixer_insert: usize,
     pos: f32,
+    start_pos: f32,
     end_pos: Option<f32>,
+    loop_enabled: bool,
+    loop_start: f32,
+    loop_end: f32,
+    loop_xfade: f32,
+    reverse: bool,
+    granular: bool,
+    grain_phase: f32,
+    grain_anchor: f32,
+    filter_env_amt: f32,
     pitch_ratio: f32,
     slide_start_ratio: f32,
     slide_target_ratio: f32,
@@ -323,7 +376,8 @@ struct PlayHead {
     rel_mul: f32,
     fade_in_samples: usize,
     fade_out_samples: usize,
-    lp_z: f32,
+    lp_l: f32,
+    lp_r: f32,
     env_sample: usize,
     gate_off: usize,
     rel_sample: usize,
@@ -340,9 +394,21 @@ impl PlayHead {
         Self {
             kind,
             ch,
+            direct_insert: None,
+            pad_cut_by: None,
             mixer_insert: 0,
             pos: 0.0,
+            start_pos: 0.0,
             end_pos: None,
+            loop_enabled: false,
+            loop_start: 0.0,
+            loop_end: 0.0,
+            loop_xfade: 0.05,
+            reverse: false,
+            granular: false,
+            grain_phase: 0.0,
+            grain_anchor: 0.0,
+            filter_env_amt: 0.0,
             pitch_ratio,
             slide_start_ratio: pitch_ratio,
             slide_target_ratio: pitch_ratio,
@@ -354,7 +420,8 @@ impl PlayHead {
             rel_mul: 1.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
-            lp_z: 0.0,
+            lp_l: 0.0,
+            lp_r: 0.0,
             env_sample: 0,
             gate_off,
             rel_sample: 0,
@@ -481,7 +548,7 @@ impl RingDelay {
 fn mixer_graph_sig(song: &Song) -> u64 {
     let mut h = (song.mixer_tracks.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     for (i, t) in song.mixer_tracks.iter().enumerate() {
-        h ^= ((t.latency_samples as u64) << 16) ^ (i as u64);
+        h ^= ((t.effective_latency_samples() as u64) << 16) ^ (i as u64);
         h = h.rotate_left(7);
         for r in &t.routes {
             h ^= ((r.target as u64) << 8) ^ (r.sidechain_only as u64);
@@ -494,6 +561,7 @@ fn mixer_graph_sig(song: &Song) -> u64 {
 pub struct EngineRt {
     pub sr: f32,
     voices: Vec<Vec<VoiceRt>>,
+    adv_voices: Vec<Vec<AdvVoiceRt>>,
     playheads: Vec<PlayHead>,
     metro_heads: Vec<MetroHead>,
     kit: [Vec<f32>; 4],
@@ -517,6 +585,12 @@ pub struct EngineRt {
     pub ch_peaks: Vec<f32>,
     /// Per-mixer-insert post-fader peak, decaying.
     pub mix_peaks: Vec<f32>,
+    pub mix_rms: Vec<f32>,
+    pub mix_clips: Vec<bool>,
+    pub inspect_insert: usize,
+    pub fft_bins: [f32; FFT_BINS],
+    pub comp_gr_db: [f32; MAX_FX_SLOTS],
+    fft_tick: usize,
     /// Master-bus recording. Captured post-fader while playing.
     pub recording: bool,
     pub take_l: Vec<f32>,
@@ -534,6 +608,8 @@ pub struct EngineRt {
     master_auto_vol: Option<f32>,
     smooth: Vec<SmoothCh>,
     mix_smooth: Vec<SmoothMix>,
+    mix_fx: Vec<MixerInsertRt>,
+    mix_sc_bus: Vec<(f32, f32)>,
     ch_accum: Vec<(f32, f32)>,
     mix_direct_in: Vec<(f32, f32)>,
     mix_route_in: Vec<(f32, f32)>,
@@ -552,6 +628,17 @@ pub struct EngineRt {
     take_tx: Option<rtrb::Producer<f32>>,
 }
 
+#[derive(Clone, Copy)]
+struct HeadSpawn {
+    ch: usize,
+    pitch_midi: f32,
+    vel: f32,
+    pan: f32,
+    cutoff_mul: f32,
+    rel_mul: f32,
+    off: usize,
+}
+
 impl EngineRt {
     pub fn new(sr: f32) -> Self {
         let live_voice = VoiceRt::new(LIVE_VOICE_SPEC, midi_hz(69.0_f32), 2600.0, sr as f64);
@@ -561,6 +648,7 @@ impl EngineRt {
         let mut rt = Self {
             sr,
             voices: Vec::new(),
+            adv_voices: Vec::new(),
             playheads: Vec::with_capacity(MAX_PLAYHEADS),
             metro_heads: Vec::with_capacity(8),
             kit: [vec![], vec![], vec![], vec![]],
@@ -580,6 +668,12 @@ impl EngineRt {
             peak: 0.0,
             ch_peaks: Vec::new(),
             mix_peaks: Vec::new(),
+            mix_rms: Vec::new(),
+            mix_clips: Vec::new(),
+            inspect_insert: 0,
+            fft_bins: [-72.0; FFT_BINS],
+            comp_gr_db: [0.0; MAX_FX_SLOTS],
+            fft_tick: 0,
             recording: false,
             take_l: Vec::new(),
             take_r: Vec::new(),
@@ -595,6 +689,8 @@ impl EngineRt {
             master_auto_vol: None,
             smooth: Vec::new(),
             mix_smooth: Vec::new(),
+            mix_fx: Vec::new(),
+            mix_sc_bus: Vec::new(),
             ch_accum: Vec::new(),
             mix_direct_in: Vec::new(),
             mix_route_in: Vec::new(),
@@ -636,6 +732,8 @@ impl EngineRt {
         reverb.allocate();
         self.reverb = reverb;
         self.voices.clear();
+        self.adv_voices.clear();
+        self.mix_fx.clear();
         self.mixer_sig = u64::MAX;
         self.ensure_channels(song);
         self.reset_transport();
@@ -654,9 +752,16 @@ impl EngineRt {
         self.pdc_route_delay = pdc.route_delay;
 
         self.mix_peaks.resize(nmix, 0.0);
+        self.mix_rms.resize(nmix, 0.0);
+        self.mix_clips.resize(nmix, false);
         self.mix_auto_vol.resize(nmix, 1.0);
         self.mix_direct_in.resize(nmix, (0.0, 0.0));
         self.mix_route_in.resize(nmix, (0.0, 0.0));
+        self.mix_sc_bus.resize(nmix, (0.0, 0.0));
+        while self.mix_fx.len() < nmix {
+            self.mix_fx.push(MixerInsertRt::new(self.sr));
+        }
+        self.mix_fx.truncate(nmix);
         self.mix_smooth.clear();
         for t in &song.mixer_tracks {
             self.mix_smooth.push(SmoothMix {
@@ -670,7 +775,7 @@ impl EngineRt {
         self.direct_pdc_delay.resize_with(nmix, RingDelay::default);
         self.route_pdc_delay.resize_with(nmix, Vec::new);
         for (i, t) in song.mixer_tracks.iter().enumerate() {
-            self.track_lat_delay[i].reserve(t.latency_samples);
+            self.track_lat_delay[i].reserve(t.effective_latency_samples());
             self.direct_pdc_delay[i].reserve(self.pdc_direct_delay.get(i).copied().unwrap_or(0));
             let rlen = t.routes.len();
             self.route_pdc_delay[i].resize_with(rlen, RingDelay::default);
@@ -689,7 +794,8 @@ impl EngineRt {
     /// (Re)build voice pools and mixer PDC plan to match the song.
     pub fn ensure_channels(&mut self, song: &Song) {
         self.ensure_mixer_graph(song);
-        if self.voices.len() == song.channels.len() {
+        if self.voices.len() == song.channels.len() && self.adv_voices.len() == song.channels.len()
+        {
             for i in 0..song.channels.len() {
                 let spec = song.channels[i].voice_spec();
                 if self.voice_specs.get(i) != Some(&spec) {
@@ -699,6 +805,7 @@ impl EngineRt {
             return;
         }
         self.voices.clear();
+        self.adv_voices.clear();
         self.smooth.clear();
         self.voice_specs.clear();
         for ch in &song.channels {
@@ -709,6 +816,8 @@ impl EngineRt {
                 pool.push(VoiceRt::new(spec, base_hz, ch.cutoff, self.sr as f64));
             }
             self.voices.push(pool);
+            self.adv_voices
+                .push(vec![AdvVoiceRt::default(); VOICES_PER_CH]);
             self.voice_specs.push(spec);
             self.smooth.push(SmoothCh {
                 vol: ch.volume,
@@ -730,7 +839,7 @@ impl EngineRt {
         if idx >= song.channels.len() {
             return;
         }
-        if idx >= self.voices.len() {
+        if idx >= self.voices.len() || idx >= self.adv_voices.len() {
             self.ensure_channels(song);
             return;
         }
@@ -741,6 +850,9 @@ impl EngineRt {
             v.cutoff.set_value(cutoff_val);
             v.slide_rem = 0;
             v.off = 0;
+        }
+        for v in self.adv_voices[idx].iter_mut() {
+            v.kill();
         }
         if idx < self.voice_specs.len() {
             self.voice_specs[idx] = spec;
@@ -772,11 +884,143 @@ impl EngineRt {
         Some(v)
     }
 
+    fn alloc_adv_voice(&mut self, ch: usize, max_poly: u8) -> Option<&mut AdvVoiceRt> {
+        let pool = self.adv_voices.get_mut(ch)?;
+        let cap = if max_poly == 0 {
+            pool.len()
+        } else {
+            (max_poly as usize).clamp(1, pool.len())
+        };
+        let sub = &mut pool[..cap];
+        let idx = sub
+            .iter()
+            .position(|v| !v.active)
+            .or_else(|| {
+                sub.iter()
+                    .enumerate()
+                    .min_by_key(|(_, v)| v.age)
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        self.age = self.age.wrapping_add(1);
+        let v = &mut sub[idx];
+        v.age = self.age;
+        Some(v)
+    }
+
     fn push_playhead(&mut self, head: PlayHead) {
         if self.playheads.len() >= MAX_PLAYHEADS {
             self.playheads.remove(0);
         }
         self.playheads.push(head);
+    }
+
+    fn spawn_sampler_head(&mut self, song: &Song, sample_idx: usize, h: HeadSpawn) {
+        let Some(channel) = song.channels.get(h.ch) else {
+            return;
+        };
+        let smp_len = song
+            .samples
+            .get(sample_idx)
+            .map(|s| s.data.len())
+            .unwrap_or(0) as f32;
+        if smp_len <= 0.0 {
+            return;
+        }
+        let cfg = channel.sampler;
+        let t_start = (cfg.trim_start.clamp(0.0, 0.98) * smp_len).min(smp_len - 1.0);
+        let t_end = (cfg.trim_end.clamp(0.02, 1.0) * smp_len).max(t_start + 1.0);
+        let trim_span = (t_end - t_start).max(1.0);
+        let l_start = t_start + cfg.loop_start.clamp(0.0, 0.95) * trim_span;
+        let l_end = (t_start + cfg.loop_end.clamp(0.05, 1.0) * trim_span).max(l_start + 8.0);
+        let ratio = 2.0_f32.powf((h.pitch_midi - channel.midi_base as f32) / 12.0);
+        let mut head = PlayHead::new(
+            PlayKind::Sample(sample_idx),
+            Some(h.ch),
+            ratio,
+            h.vel,
+            h.off,
+        );
+        head.pan = h.pan.clamp(-1.0, 1.0);
+        head.cutoff_mul = h.cutoff_mul;
+        head.rel_mul = h.rel_mul;
+        head.start_pos = t_start;
+        head.end_pos = Some(t_end);
+        head.pos = if cfg.reverse {
+            (t_end - 1.0).max(t_start)
+        } else {
+            t_start
+        };
+        head.loop_enabled = cfg.loop_enabled;
+        head.loop_start = l_start;
+        head.loop_end = l_end.min(t_end);
+        head.loop_xfade = cfg.loop_xfade.clamp(0.0, 0.5);
+        head.reverse = cfg.reverse;
+        head.granular = cfg.stretch == StretchMode::Granular;
+        head.grain_anchor = head.pos;
+        head.filter_env_amt = cfg.filter_env_amt;
+        self.push_playhead(head);
+    }
+
+    fn spawn_drum_pad_head(&mut self, song: &Song, midi: u8, h: HeadSpawn) {
+        let Some(channel) = song.channels.get(h.ch) else {
+            return;
+        };
+        let ChannelKind::DrumRack { pads } = &channel.kind else {
+            return;
+        };
+        if pads.is_empty() {
+            return;
+        }
+        let pad = pads
+            .iter()
+            .find(|p| p.note == midi)
+            .unwrap_or(&pads[(midi as usize) % pads.len()]);
+
+        // Pad-local choke group cuts other ringing pads on this DrumRack channel.
+        if let Some(cg) = pad.cut_group
+            && cg > 0
+        {
+            for head in self.playheads.iter_mut() {
+                if head.ch == Some(h.ch) && head.pad_cut_by == Some(cg) {
+                    head.gate_off = head.env_sample;
+                }
+            }
+        }
+
+        let layer = pad
+            .layers
+            .iter()
+            .find(|l| h.vel >= l.vel_min && h.vel <= l.vel_max)
+            .or_else(|| pad.layers.first());
+        let Some(layer) = layer else {
+            return;
+        };
+        let kind = if let Some(s_idx) = layer.sample {
+            PlayKind::Sample(s_idx)
+        } else if let Some(kit) = layer.kit_fallback {
+            PlayKind::Kit(kit)
+        } else {
+            return;
+        };
+
+        let ratio = 2.0_f32.powf(pad.tune_semi / 12.0);
+        let nmix = song.mixer_tracks.len().max(1);
+        let ins = (channel.mixer_insert as isize + pad.mixer_offset as isize)
+            .clamp(0, (nmix - 1) as isize) as usize;
+        let mut head = PlayHead::new(
+            kind,
+            Some(h.ch),
+            ratio,
+            (h.vel * pad.gain).clamp(0.0, 2.0),
+            usize::MAX,
+        );
+        head.pan = (h.pan + pad.pan).clamp(-1.0, 1.0);
+        head.cutoff_mul = h.cutoff_mul;
+        head.rel_mul = h.rel_mul;
+        head.pad_cut_by = pad.cut_by;
+        head.direct_insert = (pad.mixer_offset != 0).then_some(ins);
+        self.push_playhead(head);
     }
 
     pub fn live_note(&mut self, midi: u8) {
@@ -789,7 +1033,7 @@ impl EngineRt {
         self.live_off = (self.sr * 0.4) as usize;
     }
 
-    /// Preview a note using the selected channel's real synth, kit, or pitched sampler.
+    /// Preview a note using the selected channel's real synth, kit, drum rack, or pitched sampler.
     pub fn live_note_ch(&mut self, song: &Song, ch: usize, midi: u8, vel: f32) {
         self.ensure_channels(song);
         let Some(channel) = song.channels.get(ch) else {
@@ -797,7 +1041,7 @@ impl EngineRt {
             return;
         };
         let off = (self.sr * 0.35) as usize;
-        match channel.kind {
+        match &channel.kind {
             ChannelKind::Synth { .. } => {
                 let hz = midi_hz(midi as f32);
                 let poly = channel.polyphony;
@@ -813,25 +1057,52 @@ impl EngineRt {
                     v.off = off;
                 }
             }
+            ChannelKind::SuperSynth(_) | ChannelKind::FmSynth(_) => {
+                let hz = midi_hz(midi as f32);
+                let poly = channel.polyphony;
+                if let Some(v) = self.alloc_adv_voice(ch, poly) {
+                    v.trigger(hz, hz, 1.0, vel, 0.0, off);
+                }
+            }
             ChannelKind::Kit { piece } => {
                 self.push_playhead(PlayHead::new(
-                    PlayKind::Kit(piece),
+                    PlayKind::Kit(*piece),
                     Some(ch),
                     1.0,
                     vel.clamp(0.05, 1.0),
                     usize::MAX,
                 ));
             }
-            ChannelKind::Sampler { sample } => {
-                if let Some(idx) = sample {
-                    let ratio = 2.0_f32.powf((midi as f32 - channel.midi_base as f32) / 12.0);
-                    self.push_playhead(PlayHead::new(
-                        PlayKind::Sample(idx),
-                        Some(ch),
-                        ratio,
-                        vel.clamp(0.05, 1.0),
+            ChannelKind::DrumRack { .. } => {
+                self.spawn_drum_pad_head(
+                    song,
+                    midi,
+                    HeadSpawn {
+                        ch,
+                        pitch_midi: midi as f32,
+                        vel: vel.clamp(0.05, 1.0),
+                        pan: 0.0,
+                        cutoff_mul: 1.0,
+                        rel_mul: 1.0,
                         off,
-                    ));
+                    },
+                );
+            }
+            ChannelKind::Sampler { sample } => {
+                if let Some(idx) = *sample {
+                    self.spawn_sampler_head(
+                        song,
+                        idx,
+                        HeadSpawn {
+                            ch,
+                            pitch_midi: midi as f32,
+                            vel: vel.clamp(0.05, 1.0),
+                            pan: 0.0,
+                            cutoff_mul: 1.0,
+                            rel_mul: 1.0,
+                            off,
+                        },
+                    );
                 }
             }
         }
@@ -1192,6 +1463,11 @@ impl EngineRt {
                 }
             }
         }
+        for pool in self.adv_voices.iter_mut() {
+            for v in pool.iter_mut() {
+                v.tick_gate();
+            }
+        }
     }
 
     fn fire_note(&mut self, song: &Song, trig: &NoteTrigger, spt: f64) {
@@ -1228,6 +1504,11 @@ impl EngineRt {
                             v.off = 0;
                         }
                     }
+                    if let Some(pool) = self.adv_voices.get_mut(cj) {
+                        for v in pool.iter_mut() {
+                            v.kill();
+                        }
+                    }
                     for h in self.playheads.iter_mut() {
                         if h.ch == Some(cj) {
                             h.gate_off = h.env_sample;
@@ -1248,7 +1529,6 @@ impl EngineRt {
             .unwrap_or(channel.cutoff);
         let poly = channel.polyphony;
         let porta = channel.portamento;
-        let base_midi = channel.midi_base;
         match channel.kind {
             ChannelKind::Synth { .. } => {
                 if ch < self.voices.len() {
@@ -1288,6 +1568,30 @@ impl EngineRt {
                     }
                 }
             }
+            ChannelKind::SuperSynth(_) | ChannelKind::FmSynth(_) => {
+                if ch < self.adv_voices.len() {
+                    let target_hz = midi_hz(pitch_midi);
+                    let prev_hz = self.channel_last_hz.get(ch).and_then(|x| *x);
+                    let glide = if porta > 0.001 && prev_hz.is_some() {
+                        (1.0 - (-1.0 / (porta * self.sr.max(1.0))).exp()).clamp(0.0005, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let start_hz = if glide < 1.0 {
+                        prev_hz.unwrap_or(target_hz)
+                    } else {
+                        target_hz
+                    };
+                    if let Some(v) = self.alloc_adv_voice(ch, poly) {
+                        v.cutoff_mul = cutoff_mul;
+                        v.rel_mul = rel_mul;
+                        v.trigger(start_hz, target_hz, glide, vel, pan, off);
+                    }
+                    if ch < self.channel_last_hz.len() {
+                        self.channel_last_hz[ch] = Some(target_hz);
+                    }
+                }
+            }
             ChannelKind::Kit { piece } => {
                 let ratio = 2.0_f32.powf(fine_pitch / 12.0);
                 let mut head =
@@ -1297,14 +1601,36 @@ impl EngineRt {
                 head.rel_mul = rel_mul;
                 self.push_playhead(head);
             }
+            ChannelKind::DrumRack { .. } => {
+                self.spawn_drum_pad_head(
+                    song,
+                    midi,
+                    HeadSpawn {
+                        ch,
+                        pitch_midi,
+                        vel,
+                        pan,
+                        cutoff_mul,
+                        rel_mul,
+                        off,
+                    },
+                );
+            }
             ChannelKind::Sampler { sample } => {
                 if let Some(idx) = sample {
-                    let ratio = 2.0_f32.powf((pitch_midi - base_midi as f32) / 12.0);
-                    let mut head = PlayHead::new(PlayKind::Sample(idx), Some(ch), ratio, vel, off);
-                    head.pan = pan.clamp(-1.0, 1.0);
-                    head.cutoff_mul = cutoff_mul;
-                    head.rel_mul = rel_mul;
-                    self.push_playhead(head);
+                    self.spawn_sampler_head(
+                        song,
+                        idx,
+                        HeadSpawn {
+                            ch,
+                            pitch_midi,
+                            vel,
+                            pan,
+                            cutoff_mul,
+                            rel_mul,
+                            off,
+                        },
+                    );
                 }
             }
         }
@@ -1336,6 +1662,21 @@ impl EngineRt {
                     }
                 }
             }
+            ChannelKind::SuperSynth(_) | ChannelKind::FmSynth(_) => {
+                let target_hz = midi_hz(pitch_midi);
+                if let Some(pool) = self.adv_voices.get_mut(trig.ch) {
+                    for v in pool.iter_mut().filter(|v| v.off > 0) {
+                        v.slide_start_hz = v.cur_hz.max(20.0);
+                        v.target_hz = target_hz;
+                        v.slide_vel_start = v.vel;
+                        v.slide_vel_target = trig.vel.clamp(0.05, 1.0);
+                        v.slide_pan_start = v.pan;
+                        v.slide_pan_target = trig.pan.clamp(-1.0, 1.0);
+                        v.slide_tot = dur_samples;
+                        v.slide_rem = dur_samples;
+                    }
+                }
+            }
             ChannelKind::Sampler { .. } => {
                 let target_ratio = 2.0_f32.powf((pitch_midi - channel.midi_base as f32) / 12.0);
                 for h in self.playheads.iter_mut() {
@@ -1347,13 +1688,14 @@ impl EngineRt {
                     }
                 }
             }
-            ChannelKind::Kit { .. } => {}
+            ChannelKind::Kit { .. } | ChannelKind::DrumRack { .. } => {}
         }
     }
 
     fn render_sample(&mut self, song: &Song) -> (f32, f32) {
         let mut dly_send = 0.0f32;
         let mut rev_send = 0.0f32;
+        let sr = self.sr.max(1.0);
 
         for pair in self.ch_accum.iter_mut() {
             *pair = (0.0, 0.0);
@@ -1365,7 +1707,7 @@ impl EngineRt {
             *pair = (0.0, 0.0);
         }
 
-        // Accumulate synth voices per channel (with per-note pan offset).
+        // Accumulate synth voices (fundsp + SuperSynth + FmSynth) per channel.
         for (ci, pool) in self.voices.iter_mut().enumerate() {
             let mut vl_sum = 0.0f32;
             let mut vr_sum = 0.0f32;
@@ -1380,16 +1722,49 @@ impl EngineRt {
                 acc.1 += vr_sum;
             }
         }
+        for (ci, pool) in self.adv_voices.iter_mut().enumerate() {
+            let Some(channel) = song.channels.get(ci) else {
+                continue;
+            };
+            let base_cut = self
+                .auto_cut
+                .get(ci)
+                .and_then(|x| *x)
+                .unwrap_or(channel.cutoff);
+            let mut vl_sum = 0.0f32;
+            let mut vr_sum = 0.0f32;
+            match &channel.kind {
+                ChannelKind::SuperSynth(cfg) => {
+                    for v in pool.iter_mut() {
+                        let (vl, vr) = v.render_super(channel, cfg, sr, base_cut);
+                        vl_sum += vl;
+                        vr_sum += vr;
+                    }
+                }
+                ChannelKind::FmSynth(cfg) => {
+                    for v in pool.iter_mut() {
+                        let (vl, vr) = v.render_fm(channel, cfg, sr, base_cut);
+                        vl_sum += vl;
+                        vr_sum += vr;
+                    }
+                }
+                _ => {}
+            }
+            if let Some(acc) = self.ch_accum.get_mut(ci) {
+                acc.0 += vl_sum;
+                acc.1 += vr_sum;
+            }
+        }
 
-        // Render PCM playheads (kit / pitched sampler / playlist audio clips).
-        let sr = self.sr.max(1.0);
+        // Render PCM playheads (kit / stereo+granular+looping sampler / drum rack / playlist clips).
         let nmix = song.mixer_tracks.len();
+        let solo_ch_any = song.channels.iter().any(|c| c.solo);
         let mut i = 0;
         while i < self.playheads.len() {
             let mut done = false;
             {
                 let h = &mut self.playheads[i];
-                let (data, base_ratio, sr_ok) = match h.kind {
+                let (data_len, base_ratio, smp_opt) = match h.kind {
                     PlayKind::Kit(p) => {
                         let b = match p {
                             KitPiece::Kick => &self.kit[0],
@@ -1397,17 +1772,27 @@ impl EngineRt {
                             KitPiece::Clap => &self.kit[2],
                             KitPiece::Hat => &self.kit[3],
                         };
-                        (b.as_slice(), 1.0, true)
+                        (b.len(), 1.0, None)
                     }
                     PlayKind::Sample(idx) => match song.samples.get(idx) {
                         Some(s) if !s.data.is_empty() && s.sr > 0.0 => {
-                            (s.data.as_ref(), s.sr / sr, true)
+                            (s.data.len(), s.sr / sr, Some(s))
                         }
-                        _ => (&[][..], 1.0, false),
+                        _ => (0, 1.0, None),
                     },
                 };
-                let past_end = h.end_pos.is_some_and(|e| h.pos >= e);
-                if !sr_ok || (h.pos as usize) >= data.len() || past_end {
+
+                let past_bounds = if data_len == 0 {
+                    true
+                } else if h.loop_enabled {
+                    false
+                } else if h.reverse {
+                    h.pos < h.start_pos
+                } else {
+                    (h.pos as usize) >= data_len || h.end_pos.is_some_and(|e| h.pos >= e)
+                };
+
+                if past_bounds {
                     done = true;
                 } else {
                     if h.slide_rem > 0 && h.slide_tot > 0 {
@@ -1416,26 +1801,85 @@ impl EngineRt {
                         let start = h.slide_start_ratio.max(0.05);
                         h.pitch_ratio = start * (h.slide_target_ratio / start).powf(frac);
                     }
-                    let p0 = h.pos as usize;
-                    let frac = h.pos - p0 as f32;
-                    let v0 = data[p0];
-                    let v1 = data.get(p0 + 1).copied().unwrap_or(0.0);
-                    let mut v = (v0 + (v1 - v0) * frac) * h.gain;
+
+                    let dir = if h.reverse { -1.0f32 } else { 1.0f32 };
+                    let (mut vl, mut vr) = match h.kind {
+                        PlayKind::Kit(p) => {
+                            let b = match p {
+                                KitPiece::Kick => &self.kit[0],
+                                KitPiece::Snare => &self.kit[1],
+                                KitPiece::Clap => &self.kit[2],
+                                KitPiece::Hat => &self.kit[3],
+                            };
+                            let p0 = (h.pos as usize).min(b.len().saturating_sub(1));
+                            let frac = h.pos - p0 as f32;
+                            let v0 = b[p0];
+                            let v1 = b.get(p0 + 1).copied().unwrap_or(0.0);
+                            let s = v0 + (v1 - v0) * frac;
+                            h.pos += dir * base_ratio * h.pitch_ratio;
+                            (s, s)
+                        }
+                        PlayKind::Sample(_) => {
+                            let smp = smp_opt.expect("checked non-empty");
+                            let max_pos = (data_len.saturating_sub(1)) as f32;
+                            if h.granular {
+                                let grain_size = 1024.0_f32;
+                                let p1 = h.grain_phase;
+                                let p2 = (h.grain_phase + 0.5) % 1.0;
+                                let w1 = 0.5 * (1.0 - (std::f32::consts::TAU * p1).cos());
+                                let w2 = 0.5 * (1.0 - (std::f32::consts::TAU * p2).cos());
+                                let pos1 = (h.grain_anchor
+                                    + (p1 - 0.5) * grain_size * h.pitch_ratio)
+                                    .clamp(0.0, max_pos);
+                                let pos2 = (h.grain_anchor
+                                    + (p2 - 0.5) * grain_size * h.pitch_ratio)
+                                    .clamp(0.0, max_pos);
+                                let (l1, r1) = read_sample_hermite_lr(smp, pos1);
+                                let (l2, r2) = read_sample_hermite_lr(smp, pos2);
+                                h.grain_phase =
+                                    (h.grain_phase + (h.pitch_ratio / grain_size).max(1e-4)) % 1.0;
+                                h.grain_anchor += dir * base_ratio;
+                                h.pos = h.grain_anchor;
+                                (l1 * w1 + l2 * w2, r1 * w1 + r2 * w2)
+                            } else {
+                                let (mut sl, mut sr_s) =
+                                    read_sample_hermite_lr(smp, h.pos.clamp(0.0, max_pos));
+                                if h.loop_enabled && h.loop_xfade > 0.001 {
+                                    let loop_span = (h.loop_end - h.loop_start).max(8.0);
+                                    let xf_len = (loop_span * h.loop_xfade).max(1.0);
+                                    if !h.reverse && h.pos >= h.loop_end - xf_len {
+                                        let t = ((h.pos - (h.loop_end - xf_len)) / xf_len)
+                                            .clamp(0.0, 1.0);
+                                        let xp = (h.loop_start + (h.pos - (h.loop_end - xf_len)))
+                                            .clamp(0.0, max_pos);
+                                        let (xl, xr) = read_sample_hermite_lr(smp, xp);
+                                        sl = sl * (1.0 - t) + xl * t;
+                                        sr_s = sr_s * (1.0 - t) + xr * t;
+                                    }
+                                }
+                                h.pos += dir * base_ratio * h.pitch_ratio;
+                                (sl, sr_s)
+                            }
+                        }
+                    };
+
+                    if h.loop_enabled {
+                        let loop_span = (h.loop_end - h.loop_start).max(1.0);
+                        if !h.reverse && h.pos >= h.loop_end {
+                            h.pos = h.loop_start + (h.pos - h.loop_end) % loop_span;
+                            h.grain_anchor = h.pos;
+                        } else if h.reverse && h.pos < h.loop_start {
+                            h.pos = h.loop_end - (h.loop_start - h.pos) % loop_span;
+                            h.grain_anchor = h.pos;
+                        }
+                    }
+
+                    vl *= h.gain;
+                    vr *= h.gain;
 
                     if let Some(ci) = h.ch
                         && let Some(channel) = song.channels.get(ci)
                     {
-                        let cut = self
-                            .auto_cut
-                            .get(ci)
-                            .and_then(|x| *x)
-                            .unwrap_or(channel.cutoff)
-                            * h.cutoff_mul;
-                        let alpha = (2.0 * std::f32::consts::PI * cut.clamp(40.0, 18000.0) / sr)
-                            .clamp(0.01, 0.99);
-                        h.lp_z += alpha * (v - h.lp_z);
-                        v = h.lp_z;
-
                         let (env_g, env_done) = h.adsr_gain(
                             sr,
                             channel.attack,
@@ -1443,14 +1887,46 @@ impl EngineRt {
                             channel.sustain,
                             channel.release,
                         );
-                        v *= env_g;
+                        let base_cut = self
+                            .auto_cut
+                            .get(ci)
+                            .and_then(|x| *x)
+                            .unwrap_or(channel.cutoff);
+                        let cut = (base_cut
+                            * h.cutoff_mul
+                            * 2.0_f32.powf(env_g * h.filter_env_amt * 3.0))
+                        .clamp(40.0, 18000.0);
+                        let alpha = (2.0 * std::f32::consts::PI * cut / sr).clamp(0.01, 0.99);
+                        h.lp_l += alpha * (vl - h.lp_l);
+                        h.lp_r += alpha * (vr - h.lp_r);
+                        vl = h.lp_l * env_g;
+                        vr = h.lp_r * env_g;
                         if env_done {
                             done = true;
                         }
-                        if let Some(acc) = self.ch_accum.get_mut(ci) {
-                            let (pl, pr) = pan_gains(h.pan, std::f32::consts::SQRT_2);
-                            acc.0 += v * pl;
-                            acc.1 += v * pr;
+                        let (pl, pr) = pan_gains(h.pan, std::f32::consts::SQRT_2);
+                        let out_l = vl * pl;
+                        let out_r = vr * pr;
+                        if let Some(ins) = h.direct_insert {
+                            let muted =
+                                (solo_ch_any && !channel.solo) || (!solo_ch_any && channel.mute);
+                            if !muted {
+                                let vol_auto = self.auto_vol.get(ci).copied().unwrap_or(1.0);
+                                let fader = channel.volume * vol_auto;
+                                let (cl, cr) = (out_l * fader, out_r * fader);
+                                let target = ins.min(nmix.saturating_sub(1));
+                                if let Some(m) = self.mix_direct_in.get_mut(target) {
+                                    m.0 += cl;
+                                    m.1 += cr;
+                                }
+                                if ci < self.ch_peaks.len() {
+                                    self.ch_peaks[ci] =
+                                        self.ch_peaks[ci].max(cl.abs().max(cr.abs()));
+                                }
+                            }
+                        } else if let Some(acc) = self.ch_accum.get_mut(ci) {
+                            acc.0 += out_l;
+                            acc.1 += out_r;
                         }
                     } else {
                         let mut fade = 1.0f32;
@@ -1467,14 +1943,13 @@ impl EngineRt {
                             }
                         }
                         h.env_sample += 1;
-                        let s_out = v * 0.9 * fade;
+                        let scale = 0.9 * fade;
                         let target = h.mixer_insert.min(nmix.saturating_sub(1));
                         if let Some(m) = self.mix_direct_in.get_mut(target) {
-                            m.0 += s_out;
-                            m.1 += s_out;
+                            m.0 += vl * scale;
+                            m.1 += vr * scale;
                         }
                     }
-                    h.pos += base_ratio * h.pitch_ratio;
                 }
             }
             if done {
@@ -1486,7 +1961,6 @@ impl EngineRt {
 
         // Smooth channel controls, pan, feed mixer inserts, meter, and accumulate sends.
         let smooth_k = (220.0 / sr).clamp(0.001, 0.25);
-        let solo_any = song.channels.iter().any(|c| c.solo);
         for (ci, channel) in song.channels.iter().enumerate() {
             let (raw_l, raw_r) = self.ch_accum.get(ci).copied().unwrap_or((0.0, 0.0));
             let sm = self.smooth.get_mut(ci);
@@ -1506,7 +1980,7 @@ impl EngineRt {
                 )
             };
 
-            let muted = (solo_any && !channel.solo) || (!solo_any && channel.mute);
+            let muted = (solo_ch_any && !channel.solo) || (!solo_ch_any && channel.mute);
             let vol_auto = self.auto_vol.get(ci).copied().unwrap_or(1.0);
             let fader = if muted { 0.0 } else { vol_s * vol_auto };
             let (lg, rg) = pan_gains(pan_s, fader);
@@ -1556,10 +2030,11 @@ impl EngineRt {
             }
         }
 
-        // Process Mixer Insert DAG in topological order with automatic PDC.
+        // Process Mixer Insert DAG in topological order with automatic PDC and 10-slot FX rack.
         let mut l = 0.0f32;
         let mut r = 0.0f32;
         let solo_inserts = song.mixer_tracks.iter().skip(1).any(|m| m.solo);
+        self.fft_tick = self.fft_tick.wrapping_add(1);
         for oi in 0..self.pdc_order.len() {
             let t = self.pdc_order[oi];
             let Some(track) = song.mixer_tracks.get(t) else {
@@ -1572,6 +2047,21 @@ impl EngineRt {
                 direct.1 + self.mix_route_in[t].1,
             );
             let post_lat = self.track_lat_delay[t].push_pop(pre, track.latency_samples);
+            let post_fx = if t < self.mix_fx.len() {
+                self.mix_fx[t].process_insert_fx(
+                    track,
+                    sr,
+                    song.bpm,
+                    post_lat.0,
+                    post_lat.1,
+                    &self.mix_sc_bus,
+                )
+            } else {
+                post_lat
+            };
+            if t < self.mix_sc_bus.len() {
+                self.mix_sc_bus[t] = post_fx;
+            }
 
             let (t_vol, t_pan, t_dly, t_rev) = if let Some(sm) = self.mix_smooth.get_mut(t) {
                 sm.vol += (track.volume - sm.vol) * smooth_k;
@@ -1590,11 +2080,33 @@ impl EngineRt {
             let auto_g = self.mix_auto_vol.get(t).copied().unwrap_or(1.0);
             let gain = if is_muted { 0.0 } else { t_vol * auto_g };
             let (gl, gr) = pan_gains(t_pan, gain * std::f32::consts::SQRT_2);
-            let tl = post_lat.0 * gl;
-            let tr = post_lat.1 * gr;
+            let tl = post_fx.0 * gl;
+            let tr = post_fx.1 * gr;
 
             if t < self.mix_peaks.len() {
                 self.mix_peaks[t] = (self.mix_peaks[t] * 0.94).max(tl.abs().max(tr.abs()));
+            }
+            if t < self.mix_fx.len() {
+                let rms = self.mix_fx[t].update_meters(tl, tr);
+                if t < self.mix_rms.len() {
+                    self.mix_rms[t] = rms;
+                }
+                if t < self.mix_clips.len() && self.mix_fx[t].clip_hold > 0 {
+                    self.mix_clips[t] = true;
+                }
+                if t == self.inspect_insert {
+                    for (si, slot_rt) in self.mix_fx[t].slots.iter().enumerate().take(MAX_FX_SLOTS)
+                    {
+                        self.comp_gr_db[si] = slot_rt.last_gr_db;
+                    }
+                    if self.fft_tick.is_multiple_of(128) {
+                        compute_fft_bins(
+                            &self.mix_fx[t].spec_ring,
+                            self.mix_fx[t].spec_pos,
+                            &mut self.fft_bins,
+                        );
+                    }
+                }
             }
             let mono_t = (tl + tr) * 0.5;
             dly_send += mono_t * t_dly;
@@ -1676,6 +2188,11 @@ impl EngineRt {
                 v.off = 0;
             }
         }
+        for pool in self.adv_voices.iter_mut() {
+            for v in pool.iter_mut() {
+                v.kill();
+            }
+        }
         self.live_voice.gate.set_value(0.0);
         self.live_off = 0;
         self.playheads.clear();
@@ -1684,6 +2201,10 @@ impl EngineRt {
         self.recording = false;
         self.master_auto_vol = None;
         self.mix_auto_vol.fill(1.0);
+        self.mix_sc_bus.fill((0.0, 0.0));
+        for m in self.mix_fx.iter_mut() {
+            m.reset();
+        }
         for d in self.track_lat_delay.iter_mut() {
             d.clear();
         }
@@ -1701,6 +2222,10 @@ impl EngineRt {
         for p in self.mix_peaks.iter_mut() {
             *p = 0.0;
         }
+        self.mix_rms.fill(0.0);
+        self.mix_clips.fill(false);
+        self.fft_bins.fill(-72.0);
+        self.comp_gr_db.fill(0.0);
     }
 }
 
@@ -1718,6 +2243,8 @@ enum AudioCmd {
     ClearTake,
     RebuildChannel(usize),
     SetChannelCutoff(usize, f32),
+    SetInspectInsert(usize),
+    ClearMixClips,
     LiveNote { ch: usize, midi: u8, vel: f32 },
     LiveKit(KitPiece),
     LiveSample(usize),
@@ -1736,6 +2263,10 @@ struct AudioTelemetry {
     ack_seq: AtomicU64,
     ch_peaks: [AtomicU32; MAX_TELEM_CH],
     mix_peaks: [AtomicU32; MAX_TELEM_CH],
+    mix_rms: [AtomicU32; MAX_TELEM_CH],
+    mix_clips: [AtomicBool; MAX_TELEM_CH],
+    fft_bins: [AtomicU32; FFT_BINS],
+    comp_gr_db: [AtomicU32; MAX_FX_SLOTS],
     scope: [AtomicU32; SCOPE_LEN],
 }
 
@@ -1754,6 +2285,10 @@ impl AudioTelemetry {
             ack_seq: AtomicU64::new(0),
             ch_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             mix_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            mix_rms: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            mix_clips: std::array::from_fn(|_| AtomicBool::new(false)),
+            fft_bins: std::array::from_fn(|_| AtomicU32::new((-72.0_f32).to_bits())),
+            comp_gr_db: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             scope: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
         }
     }
@@ -1893,6 +2428,13 @@ impl AudioWorker {
                 }
                 AudioCmd::RebuildChannel(ch) => self.rt.rebuild_channel(&self.song, ch),
                 AudioCmd::SetChannelCutoff(ch, v) => self.rt.set_channel_cutoff(ch, v),
+                AudioCmd::SetInspectInsert(ins) => self.rt.inspect_insert = ins,
+                AudioCmd::ClearMixClips => {
+                    self.rt.mix_clips.fill(false);
+                    for m in self.rt.mix_fx.iter_mut() {
+                        m.clip_hold = 0;
+                    }
+                }
                 AudioCmd::LiveNote { ch, midi, vel } => {
                     self.rt.live_note_ch(&self.song, ch, midi, vel);
                 }
@@ -1947,6 +2489,18 @@ impl AudioWorker {
         }
         for (i, p) in self.rt.mix_peaks.iter().take(MAX_TELEM_CH).enumerate() {
             t.mix_peaks[i].store(p.to_bits(), Ordering::Relaxed);
+        }
+        for (i, r) in self.rt.mix_rms.iter().take(MAX_TELEM_CH).enumerate() {
+            t.mix_rms[i].store(r.to_bits(), Ordering::Relaxed);
+        }
+        for (i, c) in self.rt.mix_clips.iter().take(MAX_TELEM_CH).enumerate() {
+            t.mix_clips[i].store(*c, Ordering::Relaxed);
+        }
+        for (i, b) in self.rt.fft_bins.iter().take(FFT_BINS).enumerate() {
+            t.fft_bins[i].store(b.to_bits(), Ordering::Relaxed);
+        }
+        for (i, g) in self.rt.comp_gr_db.iter().take(MAX_FX_SLOTS).enumerate() {
+            t.comp_gr_db[i].store(g.to_bits(), Ordering::Relaxed);
         }
         let n = self.rt.scope.len().min(SCOPE_LEN);
         for k in 0..n {
@@ -2016,13 +2570,46 @@ impl AppState {
         if self.rt.mix_peaks.len() != self.song.mixer_tracks.len() {
             self.rt.mix_peaks.resize(self.song.mixer_tracks.len(), 0.0);
         }
+        if self.rt.mix_rms.len() != self.song.mixer_tracks.len() {
+            self.rt.mix_rms.resize(self.song.mixer_tracks.len(), 0.0);
+        }
+        if self.rt.mix_clips.len() != self.song.mixer_tracks.len() {
+            self.rt
+                .mix_clips
+                .resize(self.song.mixer_tracks.len(), false);
+        }
         for i in 0..nmix {
             self.rt.mix_peaks[i] = f32::from_bits(t.mix_peaks[i].load(Ordering::Relaxed));
+            self.rt.mix_rms[i] = f32::from_bits(t.mix_rms[i].load(Ordering::Relaxed));
+            self.rt.mix_clips[i] = t.mix_clips[i].load(Ordering::Relaxed);
+        }
+        for i in 0..FFT_BINS {
+            self.rt.fft_bins[i] = f32::from_bits(t.fft_bins[i].load(Ordering::Relaxed));
+        }
+        for i in 0..MAX_FX_SLOTS {
+            self.rt.comp_gr_db[i] = f32::from_bits(t.comp_gr_db[i].load(Ordering::Relaxed));
         }
         for (i, s) in self.rt.scope.iter_mut().enumerate().take(SCOPE_LEN) {
             *s = f32::from_bits(t.scope[i].load(Ordering::Relaxed));
         }
         self.rt.scope_pos = 0;
+    }
+
+    pub fn set_inspect_insert(&mut self, ins: usize) {
+        self.rt.inspect_insert = ins;
+        if let Some(b) = &mut self.audio {
+            b.send(AudioCmd::SetInspectInsert(ins));
+        }
+    }
+
+    pub fn clear_mix_clips(&mut self) {
+        self.rt.mix_clips.fill(false);
+        for m in self.rt.mix_fx.iter_mut() {
+            m.clip_hold = 0;
+        }
+        if let Some(b) = &mut self.audio {
+            b.send(AudioCmd::ClearMixClips);
+        }
     }
 
     pub fn set_playing(&mut self, playing: bool) {
@@ -2205,17 +2792,17 @@ pub fn sample_into_song(s: &mut AppState, path: &str) -> Result<usize, String> {
     if let Some(idx) = s.song.samples.iter().position(|x| x.path == path) {
         return Ok(idx);
     }
-    let (data, sr) = load_sample_file(path)?;
+    let (data, data_r, sr) = load_sample_file(path)?;
     let name = std::path::Path::new(path)
         .file_name()
         .map(|x| x.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
-    s.song.samples.push(crate::song::SampleRef {
-        name,
-        path: path.into(),
-        data: data.into(),
-        sr,
-    });
+    let sample_ref = if data_r.is_empty() {
+        SampleRef::from_mono(name, path, data, sr)
+    } else {
+        SampleRef::from_stereo(name, path, data, data_r, sr)
+    };
+    s.song.samples.push(sample_ref);
     Ok(s.song.samples.len() - 1)
 }
 
@@ -2294,6 +2881,9 @@ pub fn start_audio(state: &mut AppState) -> Option<cpal::Stream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::song::{
+        CompCfg, EffectSlot, EqCfg, FmSynthCfg, FxKind, SuperSynthCfg, default_drum_pads,
+    };
 
     /// Regression test: a fresh engine (all gates closed) must be bit-finite.
     /// A zeroed filter default once NaN'd the SVF and poisoned the mix bus.
@@ -2354,15 +2944,12 @@ mod tests {
     #[test]
     fn sampler_pitches_relative_to_midi_base() {
         let mut song = crate::song::new_empty();
-        song.samples.push(crate::song::SampleRef {
-            name: "sine.wav".into(),
-            path: "sine.wav".into(),
-            data: (0..4410)
-                .map(|i| (i as f32 * 0.1).sin())
-                .collect::<Vec<_>>()
-                .into(),
-            sr: 44100.0,
-        });
+        song.samples.push(SampleRef::from_mono(
+            "sine.wav",
+            "sine.wav",
+            (0..4410).map(|i| (i as f32 * 0.1).sin()).collect(),
+            44100.0,
+        ));
         song.channels[7].kind = ChannelKind::Sampler { sample: Some(0) };
         song.channels[7].midi_base = 60;
         let mut rt = EngineRt::new(44100.0);
@@ -2431,12 +3018,12 @@ mod tests {
     #[test]
     fn playlist_audio_clip_renders() {
         let mut song = crate::song::new_empty();
-        song.samples.push(crate::song::SampleRef {
-            name: "tone.wav".into(),
-            path: "tone.wav".into(),
-            data: vec![0.5; 4410].into(),
-            sr: 44100.0,
-        });
+        song.samples.push(SampleRef::from_mono(
+            "tone.wav",
+            "tone.wav",
+            vec![0.5; 4410],
+            44100.0,
+        ));
         song.add_audio_clip(0, 0, 0, 1.0);
         let mut rt = EngineRt::new(44100.0);
         rt.ensure_channels(&song);
@@ -2458,12 +3045,8 @@ mod tests {
         for s in &mut imp[64..80] {
             *s = 1.0;
         }
-        song.samples.push(crate::song::SampleRef {
-            name: "imp.wav".into(),
-            path: "imp.wav".into(),
-            data: imp.into(),
-            sr: 44100.0,
-        });
+        song.samples
+            .push(SampleRef::from_mono("imp.wav", "imp.wav", imp, 44100.0));
         // Two channels triggering identical pulse at tick 0 -> Insert 1 (lat=64) and Insert 2 (lat=0).
         song.channels[0].kind = ChannelKind::Sampler { sample: Some(0) };
         song.channels[0].mixer_insert = 1;
@@ -2580,5 +3163,112 @@ mod tests {
         rt.process(&song, &mut l, &mut r);
         let peak = l.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         assert!(peak < 1e-6, "muted note must emit zero audio, got {peak}");
+    }
+
+    #[test]
+    fn supersynth_fm_and_drumrack_render_clean_stereo() {
+        let mut song = crate::song::new_empty();
+        song.channels[4].kind = ChannelKind::SuperSynth(SuperSynthCfg {
+            unison: 5,
+            detune: 0.4,
+            spread: 0.85,
+            ..Default::default()
+        });
+        song.channels[5].kind = ChannelKind::FmSynth(FmSynthCfg::default());
+        song.channels[6].kind = ChannelKind::DrumRack {
+            pads: default_drum_pads(),
+        };
+        song.patterns[0].notes[4].push(crate::song::Note::new(0, 16, 60, 0.9));
+        song.patterns[0].notes[5].push(crate::song::Note::new(0, 16, 48, 0.9));
+        song.patterns[0].notes[6].push(crate::song::Note::new(0, 4, 36, 0.9));
+        let mut rt = EngineRt::new(44100.0);
+        rt.playing = true;
+        let mut l = vec![0.0; 4096];
+        let mut r = vec![0.0; 4096];
+        rt.process(&song, &mut l, &mut r);
+        let peak = l.iter().chain(&r).map(|x| x.abs()).fold(0.0f32, f32::max);
+        let diff: f32 = l.iter().zip(&r).map(|(a, b)| (a - b).abs()).sum();
+        assert!(peak > 0.02, "expected audible output, got {peak}");
+        assert!(diff > 0.5, "expected stereo image from SuperSynth spread");
+        assert!(l.iter().chain(&r).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn sampler_reverse_loop_and_granular_render_cleanly() {
+        let mut song = crate::song::new_empty();
+        let left: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.05).sin() * 0.8).collect();
+        let right: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.05).cos() * 0.8).collect();
+        song.samples.push(SampleRef::from_stereo(
+            "st.wav", "st.wav", left, right, 44100.0,
+        ));
+        song.channels[7].kind = ChannelKind::Sampler { sample: Some(0) };
+        song.channels[7].sampler.reverse = true;
+        song.channels[7].sampler.loop_enabled = true;
+        song.channels[7].sampler.stretch = StretchMode::Granular;
+        song.channels[7].cutoff = 16000.0;
+        song.patterns[0].notes[7].push(crate::song::Note::new(0, 16, 60, 1.0));
+        let mut rt = EngineRt::new(44100.0);
+        rt.playing = true;
+        let mut l = vec![0.0; 4096];
+        let mut r = vec![0.0; 4096];
+        rt.process(&song, &mut l, &mut r);
+        let peak = l.iter().chain(&r).map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(peak > 0.01, "granular reverse looping sampler silent");
+        assert!(l.iter().chain(&r).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn mixer_fx_rack_sidechain_and_fft_work() {
+        let mut song = crate::song::new_empty();
+        // Channel 0 -> Insert 2 (sidechain source)
+        // Channel 4 -> Insert 1 (compressed by Insert 2, EQed, and inspected for FFT/GR)
+        song.channels[0].mixer_insert = 2;
+        song.channels[4].mixer_insert = 1;
+        song.mixer_tracks[1].add_fx(EffectSlot {
+            name: "EQ".into(),
+            bypass: false,
+            mix: 1.0,
+            kind: FxKind::ParametricEq(EqCfg::default()),
+        });
+        song.mixer_tracks[1].add_fx(EffectSlot {
+            name: "SC Comp".into(),
+            bypass: false,
+            mix: 1.0,
+            kind: FxKind::Compressor(CompCfg {
+                threshold_db: -28.0,
+                ratio: 8.0,
+                attack_ms: 1.0,
+                release_ms: 40.0,
+                makeup_db: 0.0,
+                knee_db: 3.0,
+                sidechain_from: Some(2),
+                limiter: false,
+                lookahead_samples: 0,
+            }),
+        });
+        song.mixer_tracks[2].routes.clear();
+        song.mixer_tracks[2].routes.push(crate::song::MixerRoute {
+            target: 0,
+            amount: 1.0,
+            sidechain_only: false,
+        });
+        song.patterns[0].notes[0].push(crate::song::Note::new(0, 4, 36, 1.0));
+        song.patterns[0].notes[4].push(crate::song::Note::new(0, 16, 48, 1.0));
+        let mut rt = EngineRt::new(44100.0);
+        rt.inspect_insert = 1;
+        rt.playing = true;
+        let mut l = vec![0.0; 2048];
+        let mut r = vec![0.0; 2048];
+        rt.process(&song, &mut l, &mut r);
+        assert!(
+            rt.comp_gr_db[1] < -0.05,
+            "expected sidechain GR, got {}",
+            rt.comp_gr_db[1]
+        );
+        assert!(
+            rt.fft_bins.iter().any(|&b| b > -70.0),
+            "expected active FFT bins on inspected insert"
+        );
+        assert!(rt.mix_rms[1] > 0.001, "expected RMS meter activity");
     }
 }

@@ -59,11 +59,714 @@ impl KitPiece {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StretchMode {
+    Resample,
+    Granular,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SamplerCfg {
+    pub trim_start: f32,
+    pub trim_end: f32,
+    pub loop_enabled: bool,
+    pub loop_start: f32,
+    pub loop_end: f32,
+    pub loop_xfade: f32,
+    pub reverse: bool,
+    pub stretch: StretchMode,
+    pub filter_env_amt: f32,
+}
+
+impl Default for SamplerCfg {
+    fn default() -> Self {
+        Self {
+            trim_start: 0.0,
+            trim_end: 1.0,
+            loop_enabled: false,
+            loop_start: 0.25,
+            loop_end: 0.75,
+            loop_xfade: 0.05,
+            reverse: false,
+            stretch: StretchMode::Resample,
+            filter_env_amt: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PadLayer {
+    pub vel_min: f32,
+    pub vel_max: f32,
+    pub sample: Option<usize>,
+    pub kit_fallback: Option<KitPiece>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrumPad {
+    pub name: String,
+    pub note: u8,
+    pub gain: f32,
+    pub pan: f32,
+    pub tune_semi: f32,
+    pub cut_group: Option<u8>,
+    pub cut_by: Option<u8>,
+    pub mixer_offset: i8,
+    pub layers: Vec<PadLayer>,
+}
+
+type PadSpec = (
+    &'static str,
+    u8,
+    Option<KitPiece>,
+    f32,
+    Option<u8>,
+    Option<u8>,
+);
+
+pub fn default_drum_pads() -> Vec<DrumPad> {
+    let specs: [PadSpec; 16] = [
+        ("Kick", 36, Some(KitPiece::Kick), 0.0, None, None),
+        ("Rim", 37, Some(KitPiece::Snare), 7.0, None, None),
+        ("Snare", 38, Some(KitPiece::Snare), 0.0, None, None),
+        ("Clap", 39, Some(KitPiece::Clap), 0.0, None, None),
+        ("ClosedHat", 40, Some(KitPiece::Hat), 0.0, None, Some(1)),
+        ("LowTom", 41, Some(KitPiece::Kick), 5.0, None, None),
+        ("PedalHat", 42, Some(KitPiece::Hat), -2.0, Some(1), Some(1)),
+        ("MidTom", 43, Some(KitPiece::Kick), 9.0, None, None),
+        ("OpenHat", 44, Some(KitPiece::Hat), -5.0, Some(1), Some(1)),
+        ("HighTom", 45, Some(KitPiece::Kick), 12.0, None, None),
+        ("Crash", 46, Some(KitPiece::Hat), -7.0, None, None),
+        ("Ride", 47, Some(KitPiece::Hat), 3.0, None, None),
+        ("Perc1", 48, Some(KitPiece::Clap), 4.0, None, None),
+        ("Perc2", 49, Some(KitPiece::Clap), -4.0, None, None),
+        ("Perc3", 50, Some(KitPiece::Snare), -6.0, None, None),
+        ("Perc4", 51, Some(KitPiece::Snare), 10.0, None, None),
+    ];
+    specs
+        .into_iter()
+        .map(|(name, note, kit, tune, cg, cb)| DrumPad {
+            name: name.into(),
+            note,
+            gain: 1.0,
+            pan: 0.0,
+            tune_semi: tune,
+            cut_group: cg,
+            cut_by: cb,
+            mixer_offset: 0,
+            layers: vec![PadLayer {
+                vel_min: 0.0,
+                vel_max: 1.0,
+                sample: None,
+                kit_fallback: kit,
+            }],
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterMode {
+    Lp,
+    Bp,
+    Hp,
+    Notch,
+}
+
+impl FilterMode {
+    pub const ALL: [FilterMode; 4] = [
+        FilterMode::Lp,
+        FilterMode::Bp,
+        FilterMode::Hp,
+        FilterMode::Notch,
+    ];
+    pub fn name(&self) -> &'static str {
+        match self {
+            FilterMode::Lp => "LP",
+            FilterMode::Bp => "BP",
+            FilterMode::Hp => "HP",
+            FilterMode::Notch => "Notch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModTarget {
+    None,
+    Pitch,
+    Cutoff,
+    Amp,
+    Pan,
+}
+
+impl ModTarget {
+    pub const ALL: [ModTarget; 5] = [
+        ModTarget::None,
+        ModTarget::Pitch,
+        ModTarget::Cutoff,
+        ModTarget::Amp,
+        ModTarget::Pan,
+    ];
+    pub fn name(&self) -> &'static str {
+        match self {
+            ModTarget::None => "Off",
+            ModTarget::Pitch => "Pitch",
+            ModTarget::Cutoff => "Cutoff",
+            ModTarget::Amp => "Amp",
+            ModTarget::Pan => "Pan",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OscCfg {
+    pub wave: WaveKind,
+    pub semi: i8,
+    pub cents: f32,
+    pub level: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LfoCfg {
+    pub wave: WaveKind,
+    pub rate_hz: f32,
+    pub depth: f32,
+    pub target: ModTarget,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SuperSynthCfg {
+    pub oscs: [OscCfg; 3],
+    pub unison: u8,
+    pub detune: f32,
+    pub spread: f32,
+    pub sub_level: f32,
+    pub noise_level: f32,
+    pub sync_osc2: bool,
+    pub ring_mod: bool,
+    pub filter_mode: FilterMode,
+    pub drive: f32,
+    pub keytrack: f32,
+    pub filter_env: f32,
+    pub lfos: [LfoCfg; 2],
+}
+
+impl Default for SuperSynthCfg {
+    fn default() -> Self {
+        Self {
+            oscs: [
+                OscCfg {
+                    wave: WaveKind::Saw,
+                    semi: 0,
+                    cents: 0.0,
+                    level: 0.85,
+                },
+                OscCfg {
+                    wave: WaveKind::Saw,
+                    semi: 0,
+                    cents: 7.0,
+                    level: 0.6,
+                },
+                OscCfg {
+                    wave: WaveKind::Square,
+                    semi: -12,
+                    cents: -5.0,
+                    level: 0.4,
+                },
+            ],
+            unison: 3,
+            detune: 0.25,
+            spread: 0.65,
+            sub_level: 0.3,
+            noise_level: 0.0,
+            sync_osc2: false,
+            ring_mod: false,
+            filter_mode: FilterMode::Lp,
+            drive: 0.1,
+            keytrack: 0.35,
+            filter_env: 0.35,
+            lfos: [
+                LfoCfg {
+                    wave: WaveKind::Sine,
+                    rate_hz: 2.5,
+                    depth: 0.15,
+                    target: ModTarget::Cutoff,
+                },
+                LfoCfg {
+                    wave: WaveKind::Triangle,
+                    rate_hz: 5.0,
+                    depth: 0.0,
+                    target: ModTarget::Pitch,
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FmAlgo {
+    Serial,
+    Parallel,
+    PairStack,
+    YBranch,
+}
+
+impl FmAlgo {
+    pub const ALL: [FmAlgo; 4] = [
+        FmAlgo::Serial,
+        FmAlgo::Parallel,
+        FmAlgo::PairStack,
+        FmAlgo::YBranch,
+    ];
+    pub fn name(&self) -> &'static str {
+        match self {
+            FmAlgo::Serial => "4->3->2->1",
+            FmAlgo::Parallel => "(4->3)+(2->1)",
+            FmAlgo::PairStack => "(4+3)->2->1",
+            FmAlgo::YBranch => "(4+3->2)->1",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FmOpCfg {
+    pub ratio: f32,
+    pub level: f32,
+    pub decay: f32,
+    pub feedback: f32,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct FmSynthCfg {
+    pub algo: FmAlgo,
+    pub ops: [FmOpCfg; 4],
+}
+
+impl Default for FmSynthCfg {
+    fn default() -> Self {
+        Self {
+            algo: FmAlgo::Parallel,
+            ops: [
+                FmOpCfg {
+                    ratio: 1.0,
+                    level: 1.0,
+                    decay: 1.2,
+                    feedback: 0.0,
+                },
+                FmOpCfg {
+                    ratio: 2.0,
+                    level: 0.65,
+                    decay: 0.45,
+                    feedback: 0.0,
+                },
+                FmOpCfg {
+                    ratio: 1.0,
+                    level: 0.55,
+                    decay: 0.85,
+                    feedback: 0.15,
+                },
+                FmOpCfg {
+                    ratio: 3.5,
+                    level: 0.4,
+                    decay: 0.25,
+                    feedback: 0.2,
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChannelKind {
     Synth { wave: WaveKind },
     Kit { piece: KitPiece },
     Sampler { sample: Option<usize> },
+    SuperSynth(SuperSynthCfg),
+    FmSynth(FmSynthCfg),
+    DrumRack { pads: Vec<DrumPad> },
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelPreset {
+    pub name: String,
+    pub kind: ChannelKind,
+    pub cutoff: f32,
+    pub q: f32,
+    pub attack: f32,
+    pub decay: f32,
+    pub sustain: f32,
+    pub release: f32,
+}
+
+pub const MAX_FX_SLOTS: usize = 10;
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EqBandType {
+    HighPass,
+    LowShelf,
+    Bell,
+    HighShelf,
+    LowPass,
+}
+
+impl EqBandType {
+    pub const ALL: [EqBandType; 5] = [
+        EqBandType::HighPass,
+        EqBandType::LowShelf,
+        EqBandType::Bell,
+        EqBandType::HighShelf,
+        EqBandType::LowPass,
+    ];
+    pub fn name(&self) -> &'static str {
+        match self {
+            EqBandType::HighPass => "HPF",
+            EqBandType::LowShelf => "LShelf",
+            EqBandType::Bell => "Bell",
+            EqBandType::HighShelf => "HShelf",
+            EqBandType::LowPass => "LPF",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EqBand {
+    pub enabled: bool,
+    pub kind: EqBandType,
+    pub freq_hz: f32,
+    pub gain_db: f32,
+    pub q: f32,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct EqCfg {
+    pub bands: [EqBand; 7],
+}
+
+impl Default for EqCfg {
+    fn default() -> Self {
+        Self {
+            bands: [
+                EqBand {
+                    enabled: false,
+                    kind: EqBandType::HighPass,
+                    freq_hz: 35.0,
+                    gain_db: 0.0,
+                    q: 0.71,
+                },
+                EqBand {
+                    enabled: true,
+                    kind: EqBandType::LowShelf,
+                    freq_hz: 110.0,
+                    gain_db: 0.0,
+                    q: 0.71,
+                },
+                EqBand {
+                    enabled: true,
+                    kind: EqBandType::Bell,
+                    freq_hz: 280.0,
+                    gain_db: 0.0,
+                    q: 1.0,
+                },
+                EqBand {
+                    enabled: true,
+                    kind: EqBandType::Bell,
+                    freq_hz: 1000.0,
+                    gain_db: 0.0,
+                    q: 1.0,
+                },
+                EqBand {
+                    enabled: true,
+                    kind: EqBandType::Bell,
+                    freq_hz: 3500.0,
+                    gain_db: 0.0,
+                    q: 1.0,
+                },
+                EqBand {
+                    enabled: true,
+                    kind: EqBandType::HighShelf,
+                    freq_hz: 8500.0,
+                    gain_db: 0.0,
+                    q: 0.71,
+                },
+                EqBand {
+                    enabled: false,
+                    kind: EqBandType::LowPass,
+                    freq_hz: 16500.0,
+                    gain_db: 0.0,
+                    q: 0.71,
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CompCfg {
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub knee_db: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub makeup_db: f32,
+    pub sidechain_from: Option<usize>,
+    pub limiter: bool,
+    pub lookahead_samples: usize,
+}
+
+impl Default for CompCfg {
+    fn default() -> Self {
+        Self {
+            threshold_db: -14.0,
+            ratio: 4.0,
+            knee_db: 4.0,
+            attack_ms: 8.0,
+            release_ms: 90.0,
+            makeup_db: 0.0,
+            sidechain_from: None,
+            limiter: false,
+            lookahead_samples: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DelaySync {
+    FreeMs,
+    Sync1_4,
+    Sync1_8,
+    Sync1_16,
+    Sync1_8Dot,
+    Sync1_8Trip,
+}
+
+impl DelaySync {
+    pub const ALL: [DelaySync; 6] = [
+        DelaySync::FreeMs,
+        DelaySync::Sync1_4,
+        DelaySync::Sync1_8,
+        DelaySync::Sync1_16,
+        DelaySync::Sync1_8Dot,
+        DelaySync::Sync1_8Trip,
+    ];
+    pub fn name(&self) -> &'static str {
+        match self {
+            DelaySync::FreeMs => "Free ms",
+            DelaySync::Sync1_4 => "1/4",
+            DelaySync::Sync1_8 => "1/8",
+            DelaySync::Sync1_16 => "1/16",
+            DelaySync::Sync1_8Dot => "1/8.",
+            DelaySync::Sync1_8Trip => "1/8T",
+        }
+    }
+    pub fn delay_secs(&self, bpm: f32, free_ms: f32) -> f32 {
+        let beat = 60.0 / bpm.max(30.0);
+        match self {
+            DelaySync::FreeMs => (free_ms * 0.001).clamp(0.005, 1.9),
+            DelaySync::Sync1_4 => beat.clamp(0.005, 1.9),
+            DelaySync::Sync1_8 => (beat * 0.5).clamp(0.005, 1.9),
+            DelaySync::Sync1_16 => (beat * 0.25).clamp(0.005, 1.9),
+            DelaySync::Sync1_8Dot => (beat * 0.75).clamp(0.005, 1.9),
+            DelaySync::Sync1_8Trip => (beat / 3.0).clamp(0.005, 1.9),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DelayFxCfg {
+    pub sync: DelaySync,
+    pub time_ms: f32,
+    pub feedback: f32,
+    pub ping_pong: bool,
+    pub hp_hz: f32,
+    pub lp_hz: f32,
+}
+
+impl Default for DelayFxCfg {
+    fn default() -> Self {
+        Self {
+            sync: DelaySync::Sync1_8,
+            time_ms: 350.0,
+            feedback: 0.42,
+            ping_pong: true,
+            hp_hz: 120.0,
+            lp_hz: 6500.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ReverbFxCfg {
+    pub room_size: f32,
+    pub decay: f32,
+    pub pre_delay_ms: f32,
+    pub high_cut_hz: f32,
+    pub width: f32,
+}
+
+impl Default for ReverbFxCfg {
+    fn default() -> Self {
+        Self {
+            room_size: 0.6,
+            decay: 0.65,
+            pre_delay_ms: 18.0,
+            high_cut_hz: 8000.0,
+            width: 0.85,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModFxKind {
+    Chorus,
+    Flanger,
+    Phaser,
+}
+
+impl ModFxKind {
+    pub const ALL: [ModFxKind; 3] = [ModFxKind::Chorus, ModFxKind::Flanger, ModFxKind::Phaser];
+    pub fn name(&self) -> &'static str {
+        match self {
+            ModFxKind::Chorus => "Chorus",
+            ModFxKind::Flanger => "Flanger",
+            ModFxKind::Phaser => "Phaser",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModFxCfg {
+    pub mode: ModFxKind,
+    pub rate_hz: f32,
+    pub depth: f32,
+    pub feedback: f32,
+}
+
+impl Default for ModFxCfg {
+    fn default() -> Self {
+        Self {
+            mode: ModFxKind::Chorus,
+            rate_hz: 0.8,
+            depth: 0.5,
+            feedback: 0.25,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SatKind {
+    SoftClip,
+    Tube,
+    Wavefold,
+}
+
+impl SatKind {
+    pub const ALL: [SatKind; 3] = [SatKind::SoftClip, SatKind::Tube, SatKind::Wavefold];
+    pub fn name(&self) -> &'static str {
+        match self {
+            SatKind::SoftClip => "SoftClip",
+            SatKind::Tube => "Tube",
+            SatKind::Wavefold => "Wavefold",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SatCfg {
+    pub mode: SatKind,
+    pub drive: f32,
+    pub tone: f32,
+    pub output_db: f32,
+}
+
+impl Default for SatCfg {
+    fn default() -> Self {
+        Self {
+            mode: SatKind::SoftClip,
+            drive: 2.5,
+            tone: 0.75,
+            output_db: -2.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StereoShaperCfg {
+    pub mid_gain: f32,
+    pub side_gain: f32,
+    pub delay_ms: f32,
+    pub invert_l: bool,
+    pub invert_r: bool,
+}
+
+impl Default for StereoShaperCfg {
+    fn default() -> Self {
+        Self {
+            mid_gain: 1.0,
+            side_gain: 1.0,
+            delay_ms: 0.0,
+            invert_l: false,
+            invert_r: false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub enum FxKind {
+    ParametricEq(EqCfg),
+    Compressor(CompCfg),
+    StereoDelay(DelayFxCfg),
+    Reverb(ReverbFxCfg),
+    Modulator(ModFxCfg),
+    Saturator(SatCfg),
+    StereoShaper(StereoShaperCfg),
+}
+
+impl FxKind {
+    pub fn default_name(&self) -> &'static str {
+        match self {
+            FxKind::ParametricEq(_) => "Parametric EQ",
+            FxKind::Compressor(c) => {
+                if c.limiter {
+                    "Limiter"
+                } else {
+                    "Compressor"
+                }
+            }
+            FxKind::StereoDelay(_) => "Stereo Delay",
+            FxKind::Reverb(_) => "Reverb",
+            FxKind::Modulator(m) => m.mode.name(),
+            FxKind::Saturator(_) => "Saturator",
+            FxKind::StereoShaper(_) => "Stereo Shaper",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectSlot {
+    pub name: String,
+    pub bypass: bool,
+    pub mix: f32,
+    pub kind: FxKind,
+}
+
+impl EffectSlot {
+    pub fn new(kind: FxKind) -> Self {
+        Self {
+            name: kind.default_name().into(),
+            bypass: false,
+            mix: 1.0,
+            kind,
+        }
+    }
+
+    pub fn latency_samples(&self) -> usize {
+        if self.bypass {
+            return 0;
+        }
+        match &self.kind {
+            FxKind::Compressor(c) if c.limiter => c.lookahead_samples.min(256),
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +804,29 @@ impl TimeSig {
     }
 }
 
+pub const SAMPLE_PEAK_BINS: usize = 256;
+
+pub fn compute_sample_peaks(l: &[f32], r: &[f32]) -> Arc<[f32]> {
+    if l.is_empty() {
+        return Arc::from([]);
+    }
+    let bins = SAMPLE_PEAK_BINS.min(l.len()).max(1);
+    let mut out = vec![0.0f32; bins];
+    let step = l.len() as f32 / bins as f32;
+    for (b, slot) in out.iter_mut().enumerate() {
+        let start = (b as f32 * step) as usize;
+        let end = (((b + 1) as f32 * step).ceil() as usize).clamp(start + 1, l.len());
+        let mut peak = 0.0f32;
+        for (i, &lv) in l.iter().enumerate().take(end).skip(start) {
+            let vl = lv.abs();
+            let vr = r.get(i).copied().unwrap_or(0.0).abs();
+            peak = peak.max(vl.max(vr));
+        }
+        *slot = peak;
+    }
+    Arc::from(out)
+}
+
 /// One user sample. PCM is reloaded from `path` on project load
 /// (never stored in the JSON).
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -110,12 +836,106 @@ pub struct SampleRef {
     #[serde(skip)]
     pub data: Arc<[f32]>,
     #[serde(skip)]
+    pub data_r: Arc<[f32]>,
+    #[serde(skip)]
+    pub peaks: Arc<[f32]>,
+    #[serde(skip)]
     pub sr: f32,
+}
+
+impl SampleRef {
+    pub fn from_mono(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        data: Vec<f32>,
+        sr: f32,
+    ) -> Self {
+        let peaks = compute_sample_peaks(&data, &[]);
+        Self {
+            name: name.into(),
+            path: path.into(),
+            data: Arc::from(data),
+            data_r: Arc::from([]),
+            peaks,
+            sr,
+        }
+    }
+
+    pub fn from_stereo(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        left: Vec<f32>,
+        right: Vec<f32>,
+        sr: f32,
+    ) -> Self {
+        let peaks = compute_sample_peaks(&left, &right);
+        Self {
+            name: name.into(),
+            path: path.into(),
+            data: Arc::from(left),
+            data_r: Arc::from(right),
+            peaks,
+            sr,
+        }
+    }
+
+    pub fn is_stereo(&self) -> bool {
+        !self.data_r.is_empty() && self.data_r.len() == self.data.len()
+    }
+
+    pub fn normalize_in_place(&mut self) {
+        let peak = self
+            .data
+            .iter()
+            .chain(self.data_r.iter())
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max);
+        if peak < 1e-6 {
+            return;
+        }
+        let g = 0.98 / peak;
+        let l: Vec<f32> = self.data.iter().map(|x| x * g).collect();
+        let r: Vec<f32> = self.data_r.iter().map(|x| x * g).collect();
+        self.peaks = compute_sample_peaks(&l, &r);
+        self.data = Arc::from(l);
+        self.data_r = Arc::from(r);
+    }
+
+    pub fn remove_dc_in_place(&mut self) {
+        if self.data.is_empty() {
+            return;
+        }
+        let mean_l = self.data.iter().sum::<f32>() / self.data.len() as f32;
+        let l: Vec<f32> = self.data.iter().map(|x| x - mean_l).collect();
+        let r: Vec<f32> = if self.is_stereo() {
+            let mean_r = self.data_r.iter().sum::<f32>() / self.data_r.len() as f32;
+            self.data_r.iter().map(|x| x - mean_r).collect()
+        } else {
+            Vec::new()
+        };
+        self.peaks = compute_sample_peaks(&l, &r);
+        self.data = Arc::from(l);
+        self.data_r = Arc::from(r);
+    }
+
+    pub fn reverse_in_place(&mut self) {
+        let mut l: Vec<f32> = self.data.iter().copied().collect();
+        l.reverse();
+        let mut r: Vec<f32> = self.data_r.iter().copied().collect();
+        r.reverse();
+        self.peaks = compute_sample_peaks(&l, &r);
+        self.data = Arc::from(l);
+        self.data_r = Arc::from(r);
+    }
 }
 
 impl PartialEq for SampleRef {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.path == other.path && self.sr == other.sr
+        self.name == other.name
+            && self.path == other.path
+            && self.sr == other.sr
+            && self.data.len() == other.data.len()
+            && self.data_r.len() == other.data_r.len()
     }
 }
 
@@ -199,6 +1019,8 @@ pub struct Channel {
     pub cut_group: Option<u8>,
     #[serde(default)]
     pub cut_by: Option<u8>,
+    #[serde(default)]
+    pub sampler: SamplerCfg,
 }
 
 fn default_ch_color() -> [u8; 3] {
@@ -230,7 +1052,7 @@ impl Channel {
         VoiceSpec {
             wave: match self.kind {
                 ChannelKind::Synth { wave } => wave,
-                // Kit/sampler channels still get a pool so live preview works.
+                // Kit/sampler/custom synth channels still keep a fallback voice spec.
                 _ => WaveKind::Sine,
             },
             q: self.q,
@@ -268,6 +1090,7 @@ impl Default for Channel {
             portamento: 0.0,
             cut_group: None,
             cut_by: None,
+            sampler: SamplerCfg::default(),
         }
     }
 }
@@ -467,6 +1290,12 @@ pub struct MixerTrack {
     pub latency_samples: usize,
     #[serde(default)]
     pub routes: Vec<MixerRoute>,
+    #[serde(default)]
+    pub fx: Vec<EffectSlot>,
+    #[serde(default)]
+    pub polarity_inv: bool,
+    #[serde(default)]
+    pub stereo_sep: f32,
 }
 
 impl MixerTrack {
@@ -482,6 +1311,9 @@ impl MixerTrack {
             reverb_send: 0.0,
             latency_samples: 0,
             routes: Vec::new(),
+            fx: Vec::new(),
+            polarity_inv: false,
+            stereo_sep: 0.0,
         }
     }
 
@@ -501,7 +1333,32 @@ impl MixerTrack {
                 amount: 1.0,
                 sidechain_only: false,
             }],
+            fx: Vec::new(),
+            polarity_inv: false,
+            stereo_sep: 0.0,
         }
+    }
+
+    pub fn effective_latency_samples(&self) -> usize {
+        self.latency_samples
+            .saturating_add(self.fx.iter().map(EffectSlot::latency_samples).sum())
+    }
+
+    pub fn add_fx(&mut self, slot: EffectSlot) -> bool {
+        if self.fx.len() >= MAX_FX_SLOTS {
+            return false;
+        }
+        self.fx.push(slot);
+        true
+    }
+
+    pub fn move_fx(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.fx.len() || to >= self.fx.len() || from == to {
+            return false;
+        }
+        let s = self.fx.remove(from);
+        self.fx.insert(to, s);
+        true
     }
 }
 
@@ -1040,7 +1897,7 @@ impl Song {
             for &(u, ri) in &incoming_non_sc[v] {
                 route_delay[u][ri].1 = max_in.saturating_sub(total_out[u]);
             }
-            total_out[v] = max_in.saturating_add(self.mixer_tracks[v].latency_samples);
+            total_out[v] = max_in.saturating_add(self.mixer_tracks[v].effective_latency_samples());
         }
 
         PdcPlan {
@@ -2318,15 +3175,67 @@ mod tests {
     #[test]
     fn song_clone_shares_sample_audio() {
         let mut song = new_empty();
-        song.samples.push(SampleRef {
-            name: "tone.wav".into(),
-            path: "tone.wav".into(),
-            data: vec![0.1, -0.1].into(),
-            sr: 44100.0,
-        });
+        song.samples.push(SampleRef::from_mono(
+            "tone.wav",
+            "tone.wav",
+            vec![0.1, -0.1],
+            44100.0,
+        ));
 
         let copy = song.clone();
         assert!(Arc::ptr_eq(&song.samples[0].data, &copy.samples[0].data));
+        assert!(!song.samples[0].peaks.is_empty());
+    }
+
+    #[test]
+    fn sample_dsp_ops_and_fx_slots_work() {
+        let mut smp = SampleRef::from_stereo(
+            "st.wav",
+            "st.wav",
+            vec![0.6, 0.2, 0.4, 0.2],
+            vec![0.2, 0.4, 0.6, 0.2],
+            44100.0,
+        );
+        assert!(smp.is_stereo());
+        smp.remove_dc_in_place();
+        let mean: f32 = smp.data.iter().sum::<f32>() / smp.data.len() as f32;
+        assert!(mean.abs() < 1e-5);
+        smp.normalize_in_place();
+        let peak = smp.data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(peak > 0.3);
+        smp.reverse_in_place();
+
+        let mut song = new_empty();
+        for _ in 0..MAX_FX_SLOTS {
+            assert!(
+                song.mixer_tracks[1]
+                    .add_fx(EffectSlot::new(FxKind::ParametricEq(EqCfg::default())))
+            );
+        }
+        assert!(
+            !song.mixer_tracks[1].add_fx(EffectSlot::new(FxKind::Reverb(ReverbFxCfg::default())))
+        );
+        assert!(song.mixer_tracks[1].move_fx(0, 2));
+
+        let lim = CompCfg {
+            limiter: true,
+            lookahead_samples: 32,
+            ..Default::default()
+        };
+        song.mixer_tracks[2].add_fx(EffectSlot::new(FxKind::Compressor(lim)));
+        assert_eq!(song.mixer_tracks[2].effective_latency_samples(), 32);
+
+        let pads = default_drum_pads();
+        assert_eq!(pads.len(), 16);
+        song.channels.push(Channel {
+            name: "Drums".into(),
+            kind: ChannelKind::DrumRack { pads },
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&song).unwrap();
+        let back = Song::from_json_str(&json).unwrap();
+        assert_eq!(back.mixer_tracks[1].fx.len(), MAX_FX_SLOTS);
+        assert_eq!(back.channels.len(), song.channels.len());
     }
 
     #[test]
