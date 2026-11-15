@@ -927,6 +927,114 @@ impl SampleRef {
         self.data = Arc::from(l);
         self.data_r = Arc::from(r);
     }
+
+    pub fn trim_range_in_place(&mut self, start_frac: f32, end_frac: f32) {
+        let len = self.data.len();
+        if len < 2 {
+            return;
+        }
+        let s = ((start_frac.clamp(0.0, 0.99) * len as f32) as usize).min(len - 2);
+        let e = ((end_frac.clamp(0.01, 1.0) * len as f32) as usize).clamp(s + 1, len);
+        let l: Vec<f32> = self.data[s..e].to_vec();
+        let r: Vec<f32> = if self.is_stereo() {
+            self.data_r[s..e].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.peaks = compute_sample_peaks(&l, &r);
+        self.data = Arc::from(l);
+        self.data_r = Arc::from(r);
+    }
+
+    pub fn fade_in_range_in_place(&mut self, start_frac: f32, end_frac: f32) {
+        let len = self.data.len();
+        if len < 2 {
+            return;
+        }
+        let s = ((start_frac.clamp(0.0, 0.99) * len as f32) as usize).min(len - 2);
+        let e = ((end_frac.clamp(0.01, 1.0) * len as f32) as usize).clamp(s + 2, len);
+        let span = (e - s) as f32;
+        let mut l: Vec<f32> = self.data.to_vec();
+        let mut r: Vec<f32> = self.data_r.to_vec();
+        for i in s..e {
+            let g = (i - s) as f32 / span;
+            l[i] *= g;
+            if i < r.len() {
+                r[i] *= g;
+            }
+        }
+        self.peaks = compute_sample_peaks(&l, &r);
+        self.data = Arc::from(l);
+        self.data_r = Arc::from(r);
+    }
+
+    pub fn fade_out_range_in_place(&mut self, start_frac: f32, end_frac: f32) {
+        let len = self.data.len();
+        if len < 2 {
+            return;
+        }
+        let s = ((start_frac.clamp(0.0, 0.99) * len as f32) as usize).min(len - 2);
+        let e = ((end_frac.clamp(0.01, 1.0) * len as f32) as usize).clamp(s + 2, len);
+        let span = (e - s) as f32;
+        let mut l: Vec<f32> = self.data.to_vec();
+        let mut r: Vec<f32> = self.data_r.to_vec();
+        for i in s..e {
+            let g = 1.0 - (i - s) as f32 / span;
+            l[i] *= g;
+            if i < r.len() {
+                r[i] *= g;
+            }
+        }
+        self.peaks = compute_sample_peaks(&l, &r);
+        self.data = Arc::from(l);
+        self.data_r = Arc::from(r);
+    }
+
+    pub fn detect_transients(&self, threshold: f32, min_gap_samples: usize) -> Vec<usize> {
+        let len = self.data.len();
+        if len < 64 {
+            return vec![0];
+        }
+        let gap = min_gap_samples.max(256);
+        let mut marks = vec![0usize];
+        let mut env_fast = 0.0f32;
+        let mut env_slow = 0.0f32;
+        let thresh = threshold.clamp(0.02, 0.9);
+        for (i, &lv) in self.data.iter().enumerate() {
+            let rv = self.data_r.get(i).copied().unwrap_or(0.0);
+            let mag = lv.abs().max(rv.abs());
+            env_fast += 0.08 * (mag - env_fast);
+            env_slow += 0.002 * (mag - env_slow);
+            if i > gap
+                && (i - *marks.last().unwrap_or(&0)) >= gap
+                && env_fast > thresh
+                && env_fast > env_slow * 1.85
+            {
+                marks.push(i);
+            }
+        }
+        marks
+    }
+
+    pub fn extract_slice(&self, name: impl Into<String>, start_smp: usize, end_smp: usize) -> Self {
+        let len = self.data.len();
+        if len == 0 {
+            return Self::from_mono(name, "", Vec::new(), self.sr.max(44100.0));
+        }
+        let s = start_smp.min(len - 1);
+        let e = end_smp.clamp(s + 1, len);
+        if self.is_stereo() {
+            Self::from_stereo(
+                name,
+                self.path.clone(),
+                self.data[s..e].to_vec(),
+                self.data_r[s..e].to_vec(),
+                self.sr,
+            )
+        } else {
+            Self::from_mono(name, self.path.clone(), self.data[s..e].to_vec(), self.sr)
+        }
+    }
 }
 
 impl PartialEq for SampleRef {
@@ -1190,11 +1298,14 @@ impl PlaylistTrack {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutoTarget {
     ChannelVol(usize),
+    ChannelPan(usize),
     ChannelCut(usize),
     InsertVol(usize),
+    InsertPan(usize),
+    InsertFxMix(usize, usize),
     MasterVol,
 }
 
@@ -1202,6 +1313,7 @@ impl AutoTarget {
     pub fn label(&self) -> String {
         match self {
             AutoTarget::ChannelVol(ch) => format!("Ch {} Vol", ch + 1),
+            AutoTarget::ChannelPan(ch) => format!("Ch {} Pan", ch + 1),
             AutoTarget::ChannelCut(ch) => format!("Ch {} Cut", ch + 1),
             AutoTarget::InsertVol(ins) => {
                 if *ins == 0 {
@@ -1210,6 +1322,8 @@ impl AutoTarget {
                     format!("Ins {ins} Vol")
                 }
             }
+            AutoTarget::InsertPan(ins) => format!("Ins {ins} Pan"),
+            AutoTarget::InsertFxMix(ins, slot) => format!("Ins {ins} FX{} Mix", slot + 1),
             AutoTarget::MasterVol => "Master Vol".into(),
         }
     }
@@ -1219,7 +1333,44 @@ impl AutoTarget {
             AutoTarget::ChannelVol(_) | AutoTarget::InsertVol(_) | AutoTarget::MasterVol => {
                 (0.0, 1.5)
             }
+            AutoTarget::ChannelPan(_) | AutoTarget::InsertPan(_) => (-1.0, 1.0),
             AutoTarget::ChannelCut(_) => (80.0, 16000.0),
+            AutoTarget::InsertFxMix(_, _) => (0.0, 1.0),
+        }
+    }
+
+    pub fn default_val(&self) -> f32 {
+        match self {
+            AutoTarget::ChannelVol(_) | AutoTarget::InsertVol(_) | AutoTarget::MasterVol => 0.9,
+            AutoTarget::ChannelPan(_) | AutoTarget::InsertPan(_) => 0.0,
+            AutoTarget::ChannelCut(_) => 2000.0,
+            AutoTarget::InsertFxMix(_, _) => 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CurveMode {
+    #[default]
+    Linear,
+    Smooth,
+    Hold,
+    Exp,
+}
+
+impl CurveMode {
+    pub const ALL: [CurveMode; 4] = [
+        CurveMode::Linear,
+        CurveMode::Smooth,
+        CurveMode::Hold,
+        CurveMode::Exp,
+    ];
+    pub fn name(&self) -> &'static str {
+        match self {
+            CurveMode::Linear => "Linear",
+            CurveMode::Smooth => "S-Curve",
+            CurveMode::Hold => "Hold",
+            CurveMode::Exp => "Exp",
         }
     }
 }
@@ -1230,6 +1381,66 @@ pub struct AutoClipPoint {
     pub value: f32,
     #[serde(default)]
     pub tension: f32,
+    #[serde(default)]
+    pub curve: CurveMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MapCurve {
+    #[default]
+    Linear,
+    Log,
+    Inverted,
+}
+
+impl MapCurve {
+    pub const ALL: [MapCurve; 3] = [MapCurve::Linear, MapCurve::Log, MapCurve::Inverted];
+    pub fn name(&self) -> &'static str {
+        match self {
+            MapCurve::Linear => "Linear",
+            MapCurve::Log => "Log",
+            MapCurve::Inverted => "Inverted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MidiMapping {
+    pub cc: u8,
+    pub channel: Option<u8>,
+    pub target: AutoTarget,
+    pub curve: MapCurve,
+    pub min: f32,
+    pub max: f32,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeakController {
+    pub name: String,
+    pub source_insert: usize,
+    pub target: AutoTarget,
+    pub amount: f32,
+    pub base: f32,
+    pub decay_ms: f32,
+    pub lfo_hz: f32,
+    pub lfo_amt: f32,
+    pub enabled: bool,
+}
+
+impl Default for PeakController {
+    fn default() -> Self {
+        Self {
+            name: "Peak Ctrl".into(),
+            source_insert: 1,
+            target: AutoTarget::ChannelVol(4),
+            amount: -0.5,
+            base: 0.9,
+            decay_ms: 80.0,
+            lfo_hz: 1.0,
+            lfo_amt: 0.0,
+            enabled: true,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -1404,6 +1615,18 @@ pub struct Song {
     pub mixer_tracks: Vec<MixerTrack>,
     pub next_clip_id: u64,
     pub samples: Vec<SampleRef>,
+    #[serde(default)]
+    pub midi_mappings: Vec<MidiMapping>,
+    #[serde(default)]
+    pub peak_controllers: Vec<PeakController>,
+    #[serde(default)]
+    pub count_in_bars: u8,
+    #[serde(default)]
+    pub auto_quantize_rec: bool,
+    #[serde(default)]
+    pub punch_in_tick: Option<u32>,
+    #[serde(default)]
+    pub punch_out_tick: Option<u32>,
 }
 
 // Legacy v1 representation used solely for automatic v1 -> v2 loading.
@@ -1716,10 +1939,10 @@ impl Song {
             self.add_playlist_track();
         }
         let (lo, hi) = target.range();
-        let mid = match target {
-            AutoTarget::ChannelCut(_) => 2000.0,
-            _ => (lo + hi) * 0.5,
-        };
+        let init_val = self
+            .target_value(target)
+            .unwrap_or(target.default_val())
+            .clamp(lo, hi);
         let len = len_ticks.max(TICKS_PER_STEP * 4);
         let id = self.alloc_clip_id();
         self.clips.push(Clip {
@@ -1735,18 +1958,88 @@ impl Song {
                 points: vec![
                     AutoClipPoint {
                         tick: 0,
-                        value: mid,
+                        value: init_val,
                         tension: 0.0,
+                        curve: CurveMode::Linear,
                     },
                     AutoClipPoint {
                         tick: len,
-                        value: mid,
+                        value: init_val,
                         tension: 0.0,
+                        curve: CurveMode::Linear,
                     },
                 ],
             },
         });
         id
+    }
+
+    pub fn target_value(&self, target: AutoTarget) -> Option<f32> {
+        match target {
+            AutoTarget::ChannelVol(ci) => self.channels.get(ci).map(|c| c.volume),
+            AutoTarget::ChannelPan(ci) => self.channels.get(ci).map(|c| c.pan),
+            AutoTarget::ChannelCut(ci) => self.channels.get(ci).map(|c| c.cutoff),
+            AutoTarget::InsertVol(ins) => self.mixer_tracks.get(ins).map(|m| m.volume),
+            AutoTarget::InsertPan(ins) => self.mixer_tracks.get(ins).map(|m| m.pan),
+            AutoTarget::InsertFxMix(ins, slot) => self
+                .mixer_tracks
+                .get(ins)
+                .and_then(|m| m.fx.get(slot))
+                .map(|f| f.mix),
+            AutoTarget::MasterVol => Some(self.master_vol),
+        }
+    }
+
+    pub fn apply_target_value(&mut self, target: AutoTarget, value: f32) -> bool {
+        let (lo, hi) = target.range();
+        let v = value.clamp(lo, hi);
+        match target {
+            AutoTarget::ChannelVol(ci) => {
+                if let Some(ch) = self.channels.get_mut(ci) {
+                    ch.volume = v;
+                    return true;
+                }
+            }
+            AutoTarget::ChannelPan(ci) => {
+                if let Some(ch) = self.channels.get_mut(ci) {
+                    ch.pan = v;
+                    return true;
+                }
+            }
+            AutoTarget::ChannelCut(ci) => {
+                if let Some(ch) = self.channels.get_mut(ci) {
+                    ch.cutoff = v;
+                    return true;
+                }
+            }
+            AutoTarget::InsertVol(ins) => {
+                if let Some(tr) = self.mixer_tracks.get_mut(ins) {
+                    tr.volume = v;
+                    return true;
+                }
+            }
+            AutoTarget::InsertPan(ins) => {
+                if let Some(tr) = self.mixer_tracks.get_mut(ins) {
+                    tr.pan = v;
+                    return true;
+                }
+            }
+            AutoTarget::InsertFxMix(ins, slot) => {
+                if let Some(fx) = self
+                    .mixer_tracks
+                    .get_mut(ins)
+                    .and_then(|m| m.fx.get_mut(slot))
+                {
+                    fx.mix = v;
+                    return true;
+                }
+            }
+            AutoTarget::MasterVol => {
+                self.master_vol = v;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn remove_clip(&mut self, id: u64) -> bool {
@@ -2071,6 +2364,30 @@ fn migrate_v1_to_v2(v1: SongV1) -> Song {
         mixer_tracks: default_mixer_tracks(),
         next_clip_id: next_id,
         samples: v1.samples,
+        midi_mappings: Vec::new(),
+        peak_controllers: Vec::new(),
+        count_in_bars: 0,
+        auto_quantize_rec: false,
+        punch_in_tick: None,
+        punch_out_tick: None,
+    }
+}
+
+pub fn map_cc_value(val: u8, m: &MidiMapping) -> f32 {
+    let u = (val as f32 / 127.0).clamp(0.0, 1.0);
+    let (lo, hi) = m.target.range();
+    let min = m.min.clamp(lo, hi);
+    let max = m.max.clamp(lo, hi);
+    match m.curve {
+        MapCurve::Linear => min + (max - min) * u,
+        MapCurve::Inverted => max - (max - min) * u,
+        MapCurve::Log => {
+            if min > 0.0 && max > min {
+                min * (max / min).powf(u)
+            } else {
+                min + (max - min) * u * u
+            }
+        }
     }
 }
 
@@ -2105,16 +2422,39 @@ pub fn eval_auto_clip(points: &[AutoClipPoint], t_local: f32) -> Option<f32> {
     for w in points.windows(2) {
         let t0 = w[0].tick as f32;
         let t1 = w[1].tick as f32;
-        if t_local >= t0 && t_local <= t1 {
+        if t_local >= t0 && t_local < t1 {
             let span = (t1 - t0).max(1e-4);
             let u = ((t_local - t0) / span).clamp(0.0, 1.0);
             let ten = w[0].tension.clamp(-1.0, 1.0);
-            let shaped = if ten.abs() < 1e-3 {
-                u
-            } else if ten > 0.0 {
-                u.powf(1.0 + ten * 3.0)
-            } else {
-                1.0 - (1.0 - u).powf(1.0 + (-ten) * 3.0)
+            let shaped = match w[0].curve {
+                CurveMode::Hold => return Some(w[0].value),
+                CurveMode::Linear => {
+                    if ten.abs() < 1e-3 {
+                        u
+                    } else if ten > 0.0 {
+                        u.powf(1.0 + ten * 3.0)
+                    } else {
+                        1.0 - (1.0 - u).powf(1.0 + (-ten) * 3.0)
+                    }
+                }
+                CurveMode::Smooth => {
+                    let s = u * u * (3.0 - 2.0 * u);
+                    if ten.abs() < 1e-3 {
+                        s
+                    } else if ten > 0.0 {
+                        s.powf(1.0 + ten * 2.0)
+                    } else {
+                        1.0 - (1.0 - s).powf(1.0 + (-ten) * 2.0)
+                    }
+                }
+                CurveMode::Exp => {
+                    let k = 2.0 + ten.abs() * 4.0;
+                    if ten >= 0.0 {
+                        ((k * u).exp() - 1.0) / (k.exp() - 1.0)
+                    } else {
+                        1.0 - ((k * (1.0 - u)).exp() - 1.0) / (k.exp() - 1.0)
+                    }
+                }
             };
             return Some(w[0].value + (w[1].value - w[0].value) * shaped);
         }
@@ -2835,6 +3175,12 @@ pub fn new_empty() -> Song {
         mixer_tracks: default_mixer_tracks(),
         next_clip_id: 1,
         samples: Vec::new(),
+        midi_mappings: Vec::new(),
+        peak_controllers: Vec::new(),
+        count_in_bars: 0,
+        auto_quantize_rec: false,
+        punch_in_tick: None,
+        punch_out_tick: None,
     }
 }
 
@@ -2920,6 +3266,12 @@ pub fn demo_song() -> Song {
         mixer_tracks: default_mixer_tracks(),
         next_clip_id: 1,
         samples: Vec::new(),
+        midi_mappings: Vec::new(),
+        peak_controllers: Vec::new(),
+        count_in_bars: 0,
+        auto_quantize_rec: false,
+        punch_in_tick: None,
+        punch_out_tick: None,
     };
     for (bar, pat) in [0usize, 0, 1, 2, 0, 3, 2, 1].into_iter().enumerate() {
         song.add_pattern_clip(0, bar as u32 * TICKS_PATTERN, pat);
@@ -3271,5 +3623,108 @@ mod tests {
         assert_eq!(fl.len(), 2);
         assert_eq!(fl[0].tick, 6);
         assert!((fl[0].vel - 0.45).abs() < 1e-4);
+    }
+
+    #[test]
+    fn phase5_auto_curves_midi_mapping_and_edison_ops() {
+        let hold_pts = vec![
+            AutoClipPoint {
+                tick: 0,
+                value: 0.2,
+                tension: 0.0,
+                curve: CurveMode::Hold,
+            },
+            AutoClipPoint {
+                tick: 10,
+                value: 0.8,
+                tension: 0.0,
+                curve: CurveMode::Linear,
+            },
+        ];
+        assert!((eval_auto_clip(&hold_pts, 5.0).unwrap() - 0.2).abs() < 1e-5);
+        assert!((eval_auto_clip(&hold_pts, 10.0).unwrap() - 0.8).abs() < 1e-5);
+
+        let smooth_pts = vec![
+            AutoClipPoint {
+                tick: 0,
+                value: 0.0,
+                tension: 0.0,
+                curve: CurveMode::Smooth,
+            },
+            AutoClipPoint {
+                tick: 10,
+                value: 1.0,
+                tension: 0.0,
+                curve: CurveMode::Smooth,
+            },
+        ];
+        assert!((eval_auto_clip(&smooth_pts, 5.0).unwrap() - 0.5).abs() < 1e-4);
+        assert!(eval_auto_clip(&smooth_pts, 2.5).unwrap() < 0.25);
+
+        let exp_pts = vec![
+            AutoClipPoint {
+                tick: 0,
+                value: 0.0,
+                tension: 0.5,
+                curve: CurveMode::Exp,
+            },
+            AutoClipPoint {
+                tick: 10,
+                value: 1.0,
+                tension: 0.0,
+                curve: CurveMode::Exp,
+            },
+        ];
+        assert!(eval_auto_clip(&exp_pts, 5.0).unwrap() < 0.2);
+
+        let map_inv = MidiMapping {
+            cc: 74,
+            channel: None,
+            target: AutoTarget::ChannelVol(0),
+            curve: MapCurve::Inverted,
+            min: 0.0,
+            max: 1.0,
+        };
+        assert!((map_cc_value(0, &map_inv) - 1.0).abs() < 1e-5);
+        assert!((map_cc_value(127, &map_inv) - 0.0).abs() < 1e-5);
+
+        let map_log = MidiMapping {
+            cc: 74,
+            channel: Some(1),
+            target: AutoTarget::ChannelCut(0),
+            curve: MapCurve::Log,
+            min: 100.0,
+            max: 10000.0,
+        };
+        let mid_cut = map_cc_value(64, &map_log);
+        assert!((800.0..=1300.0).contains(&mid_cut));
+
+        let mut song = new_empty();
+        song.midi_mappings.push(map_log);
+        song.peak_controllers.push(PeakController::default());
+        song.count_in_bars = 1;
+        song.auto_quantize_rec = true;
+        song.punch_in_tick = Some(16);
+        song.punch_out_tick = Some(64);
+        let json = serde_json::to_string(&song).unwrap();
+        let back = Song::from_json_str(&json).unwrap();
+        assert_eq!(back.midi_mappings.len(), 1);
+        assert_eq!(back.peak_controllers.len(), 1);
+        assert_eq!(back.count_in_bars, 1);
+        assert!(back.auto_quantize_rec);
+        assert_eq!(back.punch_in_tick, Some(16));
+
+        let mut pcm = vec![0.0f32; 2000];
+        pcm[100..200].fill(0.8);
+        pcm[1100..1200].fill(0.9);
+        let mut smp = SampleRef::from_mono("take.wav", "take.wav", pcm, 44100.0);
+        let slices = smp.detect_transients(0.3, 400);
+        assert!(slices.len() >= 2);
+        let slice0 = smp.extract_slice("slice0.wav", 100, 400);
+        assert_eq!(slice0.data.len(), 300);
+        smp.fade_in_range_in_place(0.0, 0.5);
+        smp.fade_out_range_in_place(0.5, 1.0);
+        smp.trim_range_in_place(0.05, 0.6);
+        assert_eq!(smp.data.len(), 1100);
     }
 }

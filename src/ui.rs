@@ -3,15 +3,18 @@
 
 use crate::engine::{AppState, load_sample_file, sample_into_song};
 use crate::fx;
+use crate::midi::{
+    AudioInputHandle, MidiLearnState, MidiRecMode, MidiRecorder, MidiService, list_audio_inputs,
+};
 use crate::song::{
     ArpCfg, ArpDir, AutoClipPoint, AutoPoint, AutoTarget, Channel, ChannelKind, ChordKind,
-    ClipKind, CompCfg, DelayFxCfg, DelaySync, EffectSlot, EqBandType, EqCfg, FilterMode, FmAlgo,
-    FmSynthCfg, FxKind, KitPiece, MAX_FX_SLOTS, ModFxCfg, ModFxKind, ModTarget, Note, QuantizeCfg,
-    RandCfg, ReverbFxCfg, SatCfg, SatKind, ScaleKind, SnapGrid, Song, StereoShaperCfg, StretchMode,
-    StrumCfg, SuperSynthCfg, TICKS_PER_STEP, TimeSig, WaveKind, compute_sample_peaks,
-    default_drum_pads, eval_auto, eval_auto_clip, palette_color, tool_chord_ext,
-    tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts, tool_randomize,
-    tool_riff_arp, tool_slice_at, tool_strum_opts,
+    ClipKind, CompCfg, CurveMode, DelayFxCfg, DelaySync, EffectSlot, EqBandType, EqCfg, FilterMode,
+    FmAlgo, FmSynthCfg, FxKind, KitPiece, MAX_FX_SLOTS, MapCurve, ModFxCfg, ModFxKind, ModTarget,
+    Note, PeakController, QuantizeCfg, RandCfg, ReverbFxCfg, SatCfg, SatKind, ScaleKind, SnapGrid,
+    Song, StereoShaperCfg, StretchMode, StrumCfg, SuperSynthCfg, TICKS_PER_STEP, TimeSig, WaveKind,
+    compute_sample_peaks, default_drum_pads, eval_auto, eval_auto_clip, palette_color,
+    tool_chord_ext, tool_duplicate_after, tool_flam, tool_flip, tool_legato, tool_quantize_opts,
+    tool_randomize, tool_riff_arp, tool_slice_at, tool_strum_opts,
 };
 use crate::synth::{apply_preset_to_channel, factory_presets, load_preset_json, save_preset_json};
 use eframe::egui;
@@ -189,6 +192,7 @@ pub struct AppUi {
     playlist_snap: u32,
     playlist_paint: PlaylistPaint,
     playlist_auto_drag: Option<(u64, usize)>,
+    playlist_auto_pt: Option<usize>,
     clip_sample: usize,
     show_ch_settings: bool,
     sel_pad: usize,
@@ -205,6 +209,21 @@ pub struct AppUi {
     pub show_piano: bool,
     pub show_playlist: bool,
     pub show_mixer: bool,
+    pub show_io_panel: bool,
+    // Phase 5: Hardware MIDI, MIDI Learn, Audio Input, Edison-lite.
+    pub midi: MidiService,
+    pub midi_rec: MidiRecorder,
+    pub midi_learn: MidiLearnState,
+    pub lock_midi_ch: Option<usize>,
+    pub audio_in: Option<AudioInputHandle>,
+    pub audio_in_ports: Vec<String>,
+    pub selected_audio_in: Option<usize>,
+    pub audio_in_ch: usize,
+    pub audio_in_stereo: bool,
+    pub edison_sample: Option<usize>,
+    pub edison_sel: (f32, f32),
+    pub edison_zoom: f32,
+    pub edison_slices: Vec<usize>,
     tool: PianoTool,
     piano_bot: u8,
     piano_zoom_x: f32,
@@ -281,6 +300,7 @@ impl Default for AppUi {
             playlist_snap: 16,
             playlist_paint: PlaylistPaint::Pattern,
             playlist_auto_drag: None,
+            playlist_auto_pt: None,
             clip_sample: 0,
             show_ch_settings: false,
             sel_pad: 0,
@@ -296,6 +316,20 @@ impl Default for AppUi {
             show_piano: true,
             show_playlist: true,
             show_mixer: true,
+            show_io_panel: false,
+            midi: MidiService::default(),
+            midi_rec: MidiRecorder::default(),
+            midi_learn: MidiLearnState::default(),
+            lock_midi_ch: None,
+            audio_in: None,
+            audio_in_ports: Vec::new(),
+            selected_audio_in: None,
+            audio_in_ch: 0,
+            audio_in_stereo: true,
+            edison_sample: None,
+            edison_sel: (0.0, 1.0),
+            edison_zoom: 1.0,
+            edison_slices: Vec::new(),
             tool: PianoTool::Draw,
             piano_bot: 40,
             piano_zoom_x: 1.0,
@@ -397,6 +431,10 @@ impl AppUi {
 
     fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+
+    pub fn rec_snap_ticks(&self) -> u32 {
+        self.snap_grid.step_ticks(12.0).round().max(1.0) as u32
     }
 }
 
@@ -647,6 +685,52 @@ const TIME_SIGS: [(u8, u8); 5] = [(4, 4), (3, 4), (6, 8), (5, 4), (7, 8)];
 // Panels
 // ---------------------------------------------------------------------------
 
+enum ParamCtxAction {
+    CreateAuto(AutoTarget),
+    MidiLearn(AutoTarget),
+}
+
+fn collect_param_ctx(resp: &egui::Response, target: AutoTarget, out: &mut Option<ParamCtxAction>) {
+    resp.context_menu(|u| {
+        if u.button("Create automation clip").clicked() {
+            *out = Some(ParamCtxAction::CreateAuto(target));
+            u.close();
+        }
+        if u.button("Link to controller (MIDI Learn)").clicked() {
+            *out = Some(ParamCtxAction::MidiLearn(target));
+            u.close();
+        }
+    });
+}
+
+fn apply_param_ctx(ui: &mut AppUi, s: &mut AppState, act: ParamCtxAction) {
+    match act {
+        ParamCtxAction::CreateAuto(target) => {
+            let len = s.song.time_sig.ticks_per_bar().max(TICKS_PER_STEP * 4);
+            let track = ui
+                .sel_track
+                .min(s.song.playlist_tracks.len().saturating_sub(1));
+            let cid = s.song.add_auto_clip(track, 0, len, target);
+            ui.sel_clip = Some(cid);
+            ui.show_playlist = true;
+            ui.status = format!("created automation clip: {}", target.label());
+        }
+        ParamCtxAction::MidiLearn(target) => {
+            ui.midi_learn.armed_target = Some(target);
+            ui.show_io_panel = true;
+            ui.status = format!("MIDI Learn armed for {}", target.label());
+        }
+    }
+}
+
+fn param_context_menu(resp: &egui::Response, ui: &mut AppUi, s: &mut AppState, target: AutoTarget) {
+    let mut act = None;
+    collect_param_ctx(resp, target, &mut act);
+    if let Some(a) = act {
+        apply_param_ctx(ui, s, a);
+    }
+}
+
 pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     if !s.song.patterns.is_empty() {
         ui.sel_pat = ui.sel_pat.min(s.song.patterns.len() - 1);
@@ -695,6 +779,8 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         {
             ui.show_mixer = v;
         }
+        u.toggle_value(&mut ui.show_io_panel, "MIDI/Audio")
+            .on_hover_text("Hardware MIDI, MIDI Learn, Audio Input & Peak Controllers");
         u.separator();
         let playing = s.rt.playing;
         if u.button(if playing { "⏹ Stop" } else { "▶ Play" })
@@ -738,6 +824,12 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             } else {
                 "take kept".into()
             };
+        }
+        if u.toggle_value(&mut ui.midi_rec.armed, "MIDI Rec")
+            .on_hover_text("Record incoming MIDI notes into Piano Roll")
+            .changed()
+        {
+            ui.midi_rec.reset_pass();
         }
         let take_secs = s.take_duration_secs();
         u.label(format!(
@@ -844,8 +936,9 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         u.toggle_value(&mut lp, "Loop");
         s.song.loop_song = lp;
         let mut master = s.song.master_vol;
-        u.add(egui::Slider::new(&mut master, 0.0..=1.5).text("Master"));
+        let m_resp = u.add(egui::Slider::new(&mut master, 0.0..=1.5).text("Master"));
         s.song.master_vol = master;
+        param_context_menu(&m_resp, ui, s, AutoTarget::MasterVol);
         // Position readout.
         let tick = s.rt.tick_pos.max(0.0) as u64;
         let bar_ticks = s.song.time_sig.ticks_per_bar().max(1) as u64;
@@ -900,9 +993,31 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                 }
             });
         s.song.time_sig = proj_ts;
+        egui::ComboBox::from_id_salt("midi_rec_mode")
+            .width(68.0)
+            .selected_text(ui.midi_rec.mode.name())
+            .show_ui(u, |u| {
+                for m in MidiRecMode::ALL {
+                    u.selectable_value(&mut ui.midi_rec.mode, m, m.name());
+                }
+            });
+        u.checkbox(&mut s.song.auto_quantize_rec, "Auto-Q");
+        let ci_lbl = match s.song.count_in_bars {
+            0 => "Count: Off",
+            1 => "Count: 1b",
+            _ => "Count: 2b",
+        };
+        egui::ComboBox::from_id_salt("count_in_sel")
+            .width(74.0)
+            .selected_text(ci_lbl)
+            .show_ui(u, |u| {
+                u.selectable_value(&mut s.song.count_in_bars, 0, "Off");
+                u.selectable_value(&mut s.song.count_in_bars, 1, "1 Bar");
+                u.selectable_value(&mut s.song.count_in_bars, 2, "2 Bars");
+            });
         u.separator();
         u.label("Project:");
-        u.add(egui::TextEdit::singleline(&mut ui.save_path).desired_width(140.0));
+        u.add(egui::TextEdit::singleline(&mut ui.save_path).desired_width(120.0));
         if u.button("Save").clicked() {
             match s.song.save(&ui.save_path.clone()) {
                 Ok(()) => ui.status = format!("saved {}", ui.save_path),
@@ -941,7 +1056,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
         }
         u.label("WAV:");
-        u.add(egui::TextEdit::singleline(&mut ui.wav_path).desired_width(100.0));
+        u.add(egui::TextEdit::singleline(&mut ui.wav_path).desired_width(90.0));
         if u.button("Export").clicked() {
             match crate::export::export_wav(&s.song, &ui.wav_path.clone()) {
                 Ok(m) => ui.status = m,
@@ -949,7 +1064,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
         }
         u.label("MIDI:");
-        u.add(egui::TextEdit::singleline(&mut ui.mid_path).desired_width(90.0));
+        u.add(egui::TextEdit::singleline(&mut ui.mid_path).desired_width(80.0));
         if u.button("Export").clicked() {
             match crate::export::export_midi(&s.song, ui.sel_pat, &ui.mid_path.clone()) {
                 Ok(m) => ui.status = m,
@@ -957,7 +1072,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
         }
         u.label("Take:");
-        u.add(egui::TextEdit::singleline(&mut ui.take_path).desired_width(90.0));
+        u.add(egui::TextEdit::singleline(&mut ui.take_path).desired_width(80.0));
         if u.button("Save").clicked() {
             if !s.has_take() {
                 ui.status = "nothing recorded yet".into();
@@ -967,6 +1082,311 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     Err(e) => ui.status = format!("take save failed: {e}"),
                 }
             }
+        }
+        if u.button("→ Clip")
+            .on_hover_text("Commit recorded take into Playlist audio clip")
+            .clicked()
+        {
+            match s.commit_audio_take(ui.sel_track, 0) {
+                Ok(cid) => {
+                    ui.sel_clip = Some(cid);
+                    ui.show_playlist = true;
+                    ui.status = "committed audio take to Playlist".into();
+                }
+                Err(e) => ui.status = format!("take commit failed: {e}"),
+            }
+        }
+    });
+    if ui.show_io_panel {
+        io_and_controllers_panel(ui, s, u);
+    }
+}
+
+pub fn io_and_controllers_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
+    u.group(|u| {
+        u.horizontal_wrapped(|u| {
+            u.strong("Hardware MIDI & MIDI Learn");
+            if u.button("↻ Refresh Devices").clicked() {
+                ui.midi.refresh();
+                ui.audio_in_ports = list_audio_inputs();
+                ui.status = format!(
+                    "found {} MIDI in, {} Audio in",
+                    ui.midi.in_ports.len(),
+                    ui.audio_in_ports.len()
+                );
+            }
+            let in_lbl = ui
+                .midi
+                .selected_in
+                .and_then(|i| ui.midi.in_ports.get(i))
+                .cloned()
+                .unwrap_or_else(|| "(none)".into());
+            let mut req_in = ui.midi.selected_in;
+            egui::ComboBox::from_id_salt("midi_in_sel")
+                .selected_text(format!("In: {in_lbl}"))
+                .show_ui(u, |u| {
+                    u.selectable_value(&mut req_in, None, "(none)");
+                    for (i, name) in ui.midi.in_ports.iter().enumerate() {
+                        u.selectable_value(&mut req_in, Some(i), name.clone());
+                    }
+                });
+            if req_in != ui.midi.selected_in {
+                match req_in {
+                    None => {
+                        ui.midi.disconnect_in();
+                        ui.status = "MIDI input disconnected".into();
+                    }
+                    Some(i) => match ui.midi.connect_in(i) {
+                        Ok(nm) => ui.status = format!("MIDI in: {nm}"),
+                        Err(e) => ui.status = format!("MIDI in error: {e}"),
+                    },
+                }
+            }
+            let out_lbl = ui
+                .midi
+                .selected_out
+                .and_then(|i| ui.midi.out_ports.get(i))
+                .cloned()
+                .unwrap_or_else(|| "(none)".into());
+            let mut req_out = ui.midi.selected_out;
+            egui::ComboBox::from_id_salt("midi_out_sel")
+                .selected_text(format!("Out: {out_lbl}"))
+                .show_ui(u, |u| {
+                    for (i, name) in ui.midi.out_ports.iter().enumerate() {
+                        u.selectable_value(&mut req_out, Some(i), name.clone());
+                    }
+                });
+            if req_out != ui.midi.selected_out
+                && let Some(i) = req_out
+            {
+                match ui.midi.connect_out(i) {
+                    Ok(nm) => ui.status = format!("MIDI out: {nm}"),
+                    Err(e) => ui.status = format!("MIDI out error: {e}"),
+                }
+            }
+            if ui.midi.selected_out.is_some() && u.button("Test Out").clicked() {
+                ui.midi.send_note_on(0, 60, 0.8);
+                ui.midi.send_note_off(0, 60);
+                ui.status = "sent MIDI C4 test".into();
+            }
+            let tgt_lbl = ui
+                .lock_midi_ch
+                .and_then(|ci| s.song.channels.get(ci).map(|c| format!("Lock: {}", c.name)))
+                .unwrap_or_else(|| "Follow active".into());
+            egui::ComboBox::from_id_salt("midi_tgt_lock")
+                .selected_text(tgt_lbl)
+                .show_ui(u, |u| {
+                    u.selectable_value(&mut ui.lock_midi_ch, None, "Follow active");
+                    for (ci, c) in s.song.channels.iter().enumerate() {
+                        u.selectable_value(&mut ui.lock_midi_ch, Some(ci), c.name.clone());
+                    }
+                });
+            egui::ComboBox::from_id_salt("learn_curve_sel")
+                .selected_text(format!("Learn: {}", ui.midi_learn.pending_curve.name()))
+                .show_ui(u, |u| {
+                    for c in MapCurve::ALL {
+                        u.selectable_value(&mut ui.midi_learn.pending_curve, c, c.name());
+                    }
+                });
+            if let Some(armed) = ui.midi_learn.armed_target {
+                u.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("Move CC for {}", armed.label()),
+                );
+                if u.small_button("Cancel").clicked() {
+                    ui.midi_learn.armed_target = None;
+                }
+            } else if let Some((ch, cc, val)) = ui.midi_learn.last_cc {
+                u.label(format!("Last CC ch{} #{}={}", ch + 1, cc, val));
+            }
+        });
+        if !s.song.midi_mappings.is_empty() {
+            let mut rm_map = None;
+            u.horizontal_wrapped(|u| {
+                u.label("Bindings:");
+                for (mi, m) in s.song.midi_mappings.iter().enumerate() {
+                    u.label(format!(
+                        "CC{} -> {} ({})",
+                        m.cc,
+                        m.target.label(),
+                        m.curve.name()
+                    ));
+                    if u.small_button("×").clicked() {
+                        rm_map = Some(mi);
+                    }
+                }
+            });
+            if let Some(mi) = rm_map {
+                s.song.midi_mappings.remove(mi);
+            }
+        }
+        u.separator();
+        u.horizontal_wrapped(|u| {
+            u.strong("Audio Input & Punch");
+            let ai_lbl = ui
+                .selected_audio_in
+                .and_then(|i| ui.audio_in_ports.get(i))
+                .cloned()
+                .unwrap_or_else(|| "(none)".into());
+            let mut sel_ai = ui.selected_audio_in;
+            egui::ComboBox::from_id_salt("audio_in_sel")
+                .selected_text(ai_lbl)
+                .show_ui(u, |u| {
+                    u.selectable_value(&mut sel_ai, None, "(none)");
+                    for (i, nm) in ui.audio_in_ports.iter().enumerate() {
+                        u.selectable_value(&mut sel_ai, Some(i), nm.clone());
+                    }
+                });
+            ui.selected_audio_in = sel_ai;
+            u.add(
+                egui::DragValue::new(&mut ui.audio_in_ch)
+                    .range(0..=16)
+                    .prefix("In Ch "),
+            );
+            u.checkbox(&mut ui.audio_in_stereo, "Stereo");
+            let is_open = ui.audio_in.is_some();
+            if u.button(if is_open { "Close In" } else { "Open In" })
+                .clicked()
+            {
+                if is_open {
+                    ui.audio_in = None;
+                    s.set_input_consumer(None);
+                    ui.status = "audio input closed".into();
+                } else if let Some(idx) = ui.selected_audio_in {
+                    let (tx, rx) = rtrb::RingBuffer::new(16384);
+                    match AudioInputHandle::open(idx, ui.audio_in_ch, ui.audio_in_stereo, tx) {
+                        Ok(h) => {
+                            ui.status = format!(
+                                "audio input open: {} ({:.0} Hz)",
+                                h.device_name, h.sample_rate
+                            );
+                            ui.audio_in = Some(h);
+                            s.set_input_consumer(Some(rx));
+                        }
+                        Err(e) => ui.status = format!("audio input error: {e}"),
+                    }
+                } else {
+                    ui.status = "select an audio input device first".into();
+                }
+            }
+            let mut mon = s.rt.input_monitor;
+            let mut mon_ins = s.rt.input_insert;
+            if u.toggle_value(&mut mon, "Monitor").changed() {
+                s.set_input_monitor(mon, mon_ins);
+            }
+            let ins_lbl = s
+                .song
+                .mixer_tracks
+                .get(mon_ins)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| "Master".into());
+            egui::ComboBox::from_id_salt("audio_mon_ins")
+                .width(74.0)
+                .selected_text(ins_lbl)
+                .show_ui(u, |u| {
+                    for (mi, mt) in s.song.mixer_tracks.iter().enumerate() {
+                        u.selectable_value(&mut mon_ins, mi, mt.name.clone());
+                    }
+                });
+            if mon_ins != s.rt.input_insert {
+                s.set_input_monitor(mon, mon_ins);
+            }
+            let mut rec_only = s.rt.input_rec_only;
+            if u.toggle_value(&mut rec_only, "Rec In Only").changed() {
+                s.set_input_rec_only(rec_only);
+            }
+            u.add(
+                egui::ProgressBar::new(s.rt.input_peak.clamp(0.0, 1.0))
+                    .desired_width(70.0)
+                    .text("In"),
+            );
+            let mut punch = s.song.punch_in_tick.is_some();
+            if u.toggle_value(&mut punch, "Punch").changed() {
+                if punch {
+                    let bar = s.song.time_sig.ticks_per_bar();
+                    s.song.punch_in_tick = Some(0);
+                    s.song.punch_out_tick = Some(bar);
+                } else {
+                    s.song.punch_in_tick = None;
+                    s.song.punch_out_tick = None;
+                }
+            }
+            if let (Some(pi), Some(po)) = (&mut s.song.punch_in_tick, &mut s.song.punch_out_tick) {
+                u.add(egui::DragValue::new(pi).range(0..=4096).prefix("In "));
+                u.add(egui::DragValue::new(po).range(4..=8192).prefix("Out "));
+            }
+        });
+        u.separator();
+        u.horizontal_wrapped(|u| {
+            u.strong("Peak Controllers & LFO");
+            if u.button("+ Peak Ctrl").clicked() {
+                s.song.peak_controllers.push(PeakController::default());
+            }
+        });
+        let n_mix = s.song.mixer_tracks.len();
+        let n_ch = s.song.channels.len();
+        let mut rm_pc = None;
+        for (pi, pc) in s.song.peak_controllers.iter_mut().enumerate() {
+            u.horizontal_wrapped(|u| {
+                u.checkbox(&mut pc.enabled, format!("PC{}", pi + 1));
+                let mut src = pc.source_insert.min(n_mix.saturating_sub(1));
+                u.add(
+                    egui::DragValue::new(&mut src)
+                        .range(0..=n_mix.saturating_sub(1))
+                        .prefix("Src I"),
+                );
+                pc.source_insert = src;
+                let mut tgt_ch = match pc.target {
+                    AutoTarget::ChannelVol(c)
+                    | AutoTarget::ChannelPan(c)
+                    | AutoTarget::ChannelCut(c) => c.min(n_ch.saturating_sub(1)),
+                    _ => 0,
+                };
+                let tgt_kind = match pc.target {
+                    AutoTarget::ChannelCut(_) => 1,
+                    AutoTarget::InsertVol(_) => 2,
+                    AutoTarget::MasterVol => 3,
+                    _ => 0,
+                };
+                let mut kind_sel = tgt_kind;
+                egui::ComboBox::from_id_salt(("pc_tgt_kind", pi))
+                    .width(74.0)
+                    .selected_text(match kind_sel {
+                        1 => "Ch Cut",
+                        2 => "Ins Vol",
+                        3 => "Master",
+                        _ => "Ch Vol",
+                    })
+                    .show_ui(u, |u| {
+                        u.selectable_value(&mut kind_sel, 0, "Ch Vol");
+                        u.selectable_value(&mut kind_sel, 1, "Ch Cut");
+                        u.selectable_value(&mut kind_sel, 2, "Ins Vol");
+                        u.selectable_value(&mut kind_sel, 3, "Master");
+                    });
+                u.add(
+                    egui::DragValue::new(&mut tgt_ch)
+                        .range(0..=n_mix.max(n_ch).saturating_sub(1))
+                        .prefix("#"),
+                );
+                pc.target = match kind_sel {
+                    1 => AutoTarget::ChannelCut(tgt_ch.min(n_ch.saturating_sub(1))),
+                    2 => AutoTarget::InsertVol(tgt_ch.min(n_mix.saturating_sub(1))),
+                    3 => AutoTarget::MasterVol,
+                    _ => AutoTarget::ChannelVol(tgt_ch.min(n_ch.saturating_sub(1))),
+                };
+                let (lo, hi) = pc.target.range();
+                u.add(egui::Slider::new(&mut pc.base, lo..=hi).text("Base"));
+                u.add(egui::Slider::new(&mut pc.amount, -1.5..=1.5).text("Amt"));
+                u.add(egui::Slider::new(&mut pc.decay_ms, 10.0..=500.0).text("Dec"));
+                u.add(egui::Slider::new(&mut pc.lfo_hz, 0.0..=15.0).text("LFO Hz"));
+                u.add(egui::Slider::new(&mut pc.lfo_amt, 0.0..=1.0).text("LFO"));
+                if u.small_button("×").clicked() {
+                    rm_pc = Some(pi);
+                }
+            });
+        }
+        if let Some(pi) = rm_pc {
+            s.song.peak_controllers.remove(pi);
         }
     });
 }
@@ -1288,6 +1708,8 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     let mut need_rebuild = false;
     let mut need_cutoff = None;
     let mut trigger_pad_note: Option<u8> = None;
+    let mut ctx_act: Option<ParamCtxAction> = None;
+    let mut open_edison: Option<usize> = None;
     let mix_names: Vec<String> = s.song.mixer_tracks.iter().map(|m| m.name.clone()).collect();
     let sample_names: Vec<String> = s.song.samples.iter().map(|sm| sm.name.clone()).collect();
     let presets = factory_presets();
@@ -1322,11 +1744,12 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         });
         u.horizontal_wrapped(|u| {
             let old_spec = c.voice_spec();
-            u.add(
+            let cut_r = u.add(
                 egui::Slider::new(&mut c.cutoff, 80.0..=16000.0)
                     .logarithmic(true)
                     .text("Cut"),
             );
+            collect_param_ctx(&cut_r, AutoTarget::ChannelCut(ch), &mut ctx_act);
             need_cutoff = Some(c.cutoff);
             u.add(egui::Slider::new(&mut c.q, 0.2..=6.0).text("Q"));
             u.add(egui::Slider::new(&mut c.attack, 0.001..=1.0).text("A"));
@@ -1346,8 +1769,10 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             let mut cb = c.cut_by.unwrap_or(0);
             u.add(egui::DragValue::new(&mut cb).range(0..=8));
             c.cut_by = (cb > 0).then_some(cb);
-            u.add(egui::Slider::new(&mut c.volume, 0.0..=1.5).text("Vol"));
-            u.add(egui::Slider::new(&mut c.pan, -1.0..=1.0).text("Pan"));
+            let vol_r = u.add(egui::Slider::new(&mut c.volume, 0.0..=1.5).text("Vol"));
+            collect_param_ctx(&vol_r, AutoTarget::ChannelVol(ch), &mut ctx_act);
+            let pan_r = u.add(egui::Slider::new(&mut c.pan, -1.0..=1.0).text("Pan"));
+            collect_param_ctx(&pan_r, AutoTarget::ChannelPan(ch), &mut ctx_act);
             u.add(egui::Slider::new(&mut c.delay_send, 0.0..=1.0).text("Dly"));
             u.add(egui::Slider::new(&mut c.reverb_send, 0.0..=1.0).text("Verb"));
         });
@@ -1453,6 +1878,9 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                         if u.button("Reverse PCM").clicked() {
                             smp.reverse_in_place();
                             ui.status = "reversed PCM data".into();
+                        }
+                        if u.button("Edison...").clicked() {
+                            open_edison = Some(s_idx);
                         }
                     });
                 } else {
@@ -1690,6 +2118,14 @@ fn channel_settings_panel(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     }
     if let Some(note) = trigger_pad_note {
         s.live_note_ch(ch, note);
+    }
+    if let Some(act) = ctx_act {
+        apply_param_ctx(ui, s, act);
+    }
+    if let Some(s_idx) = open_edison {
+        ui.edison_sample = Some(s_idx);
+        ui.edison_sel = (0.0, 1.0);
+        ui.edison_slices.clear();
     }
 }
 
@@ -3807,12 +4243,27 @@ fn auto_clip_editor(ui: &mut AppUi, s: &mut AppState, clip_idx: usize, u: &mut e
     };
     let (lo, hi) = target.range();
     let span = (hi - lo).max(1e-4);
-    u.horizontal(|u| {
+    let sel_idx = ui
+        .playlist_auto_pt
+        .filter(|&i| i < points.len())
+        .or_else(|| (!points.is_empty()).then_some(0));
+    u.horizontal_wrapped(|u| {
         u.label(format!("Automation clip ({})", target.label()));
-        if let Some(last) = points.last_mut() {
-            u.add(egui::Slider::new(&mut last.tension, -1.0..=1.0).text("Last tension"));
+        if let Some(si) = sel_idx
+            && let Some(pt) = points.get_mut(si)
+        {
+            u.label(format!("Pt {}:", si + 1));
+            egui::ComboBox::from_id_salt(("auto_pt_curve", cid))
+                .width(76.0)
+                .selected_text(pt.curve.name())
+                .show_ui(u, |u| {
+                    for cm in CurveMode::ALL {
+                        u.selectable_value(&mut pt.curve, cm, cm.name());
+                    }
+                });
+            u.add(egui::Slider::new(&mut pt.tension, -1.0..=1.0).text("Tension"));
         }
-        u.label("(click add · drag move · right-click remove)");
+        u.label("(click add/select · drag move · right-click remove)");
     });
     let avail_w = u.available_width().max(260.0);
     let h = 64.0;
@@ -3849,12 +4300,16 @@ fn auto_clip_editor(ui: &mut AppUi, s: &mut AppState, clip_idx: usize, u: &mut e
             prev = Some(p);
         }
     }
-    for pt in points.iter() {
-        painter.circle_filled(
-            egui::pos2(x_of(pt.tick), y_of(pt.value)),
-            4.0,
-            egui::Color32::YELLOW,
-        );
+    for (pi, pt) in points.iter().enumerate() {
+        let center = egui::pos2(x_of(pt.tick), y_of(pt.value));
+        if sel_idx == Some(pi) {
+            painter.circle_stroke(
+                center,
+                6.5,
+                egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+            );
+        }
+        painter.circle_filled(center, 4.0, egui::Color32::YELLOW);
     }
 
     let near_idx = |pts: &[AutoClipPoint], pos: egui::Pos2| -> Option<usize> {
@@ -3875,15 +4330,18 @@ fn auto_clip_editor(ui: &mut AppUi, s: &mut AppState, clip_idx: usize, u: &mut e
     {
         if let Some(idx) = near_idx(points, p0) {
             ui.playlist_auto_drag = Some((cid, idx));
+            ui.playlist_auto_pt = Some(idx);
         } else {
             points.push(AutoClipPoint {
                 tick: tick_at(p0.x),
                 value: val_at(p0.y),
                 tension: 0.0,
+                curve: CurveMode::Linear,
             });
             points.sort_by_key(|p| p.tick);
             if let Some(idx) = near_idx(points, p0) {
                 ui.playlist_auto_drag = Some((cid, idx));
+                ui.playlist_auto_pt = Some(idx);
             }
         }
     }
@@ -3898,18 +4356,24 @@ fn auto_clip_editor(ui: &mut AppUi, s: &mut AppState, clip_idx: usize, u: &mut e
         points[idx].tick = tick_at(pos.x);
         points[idx].value = val_at(pos.y);
         points.sort_by_key(|p| p.tick);
+        ui.playlist_auto_pt = near_idx(points, pos);
     }
     if resp.clicked()
         && !resp.drag_stopped()
         && let Some(pos) = resp.hover_pos()
-        && near_idx(points, pos).is_none()
     {
-        points.push(AutoClipPoint {
-            tick: tick_at(pos.x),
-            value: val_at(pos.y),
-            tension: 0.0,
-        });
-        points.sort_by_key(|p| p.tick);
+        if let Some(idx) = near_idx(points, pos) {
+            ui.playlist_auto_pt = Some(idx);
+        } else {
+            points.push(AutoClipPoint {
+                tick: tick_at(pos.x),
+                value: val_at(pos.y),
+                tension: 0.0,
+                curve: CurveMode::Linear,
+            });
+            points.sort_by_key(|p| p.tick);
+            ui.playlist_auto_pt = near_idx(points, pos);
+        }
     }
     if resp.clicked_by(egui::PointerButton::Secondary)
         && let Some(pos) = resp.hover_pos()
@@ -3917,6 +4381,9 @@ fn auto_clip_editor(ui: &mut AppUi, s: &mut AppState, clip_idx: usize, u: &mut e
         && let Some(idx) = near_idx(points, pos)
     {
         points.remove(idx);
+        ui.playlist_auto_pt = ui
+            .playlist_auto_pt
+            .map(|i| i.min(points.len().saturating_sub(1)));
     }
 }
 
@@ -3992,17 +4459,23 @@ struct FxEditorCtx<'a> {
     gr_db: f32,
 }
 
-fn fx_slot_editor(slot: &mut EffectSlot, ctx: &FxEditorCtx<'_>, u: &mut egui::Ui) {
+fn fx_slot_editor(
+    slot: &mut EffectSlot,
+    ctx: &FxEditorCtx<'_>,
+    u: &mut egui::Ui,
+) -> Option<ParamCtxAction> {
     let slot_idx = ctx.slot_idx;
     let ins = ctx.ins;
     let names = ctx.names;
     let sr = ctx.sr;
     let fft_bins = ctx.fft_bins;
     let gr_db = ctx.gr_db;
+    let mut act = None;
     u.horizontal(|u| {
         u.label(format!("Slot {}: {}", slot_idx + 1, slot.name));
         u.toggle_value(&mut slot.bypass, "Bypass");
-        u.add(egui::Slider::new(&mut slot.mix, 0.0..=1.0).text("Mix"));
+        let r = u.add(egui::Slider::new(&mut slot.mix, 0.0..=1.0).text("Mix"));
+        collect_param_ctx(&r, AutoTarget::InsertFxMix(ins, slot_idx), &mut act);
     });
     match &mut slot.kind {
         FxKind::ParametricEq(cfg) => {
@@ -4241,6 +4714,7 @@ fn fx_slot_editor(slot: &mut EffectSlot, ctx: &FxEditorCtx<'_>, u: &mut egui::Ui
             });
         }
     }
+    act
 }
 
 pub fn fx_rack_panel(
@@ -4253,6 +4727,7 @@ pub fn fx_rack_panel(
     let sr = s.rt.sr;
     let fft_bins = s.rt.fft_bins;
     let comp_gr = s.rt.comp_gr_db;
+    let mut ctx_act: Option<ParamCtxAction> = None;
     let Some(track) = s.song.mixer_tracks.get_mut(ins) else {
         return;
     };
@@ -4299,9 +4774,10 @@ pub fn fx_rack_panel(
                             ui.sel_fx_slot = si;
                         }
                         u.toggle_value(&mut track.fx[si].bypass, "Byp");
-                        u.add(
+                        let mix_r = u.add(
                             egui::Slider::new(&mut track.fx[si].mix, 0.0..=1.0).show_value(false),
                         );
+                        collect_param_ctx(&mix_r, AutoTarget::InsertFxMix(ins, si), &mut ctx_act);
                         if si > 0 && u.small_button("^").clicked() {
                             move_op = Some((si, si - 1));
                         }
@@ -4338,11 +4814,16 @@ pub fn fx_rack_panel(
                     gr_db: comp_gr[sel],
                 };
                 cols[1].group(|u| {
-                    fx_slot_editor(slot, &ctx, u);
+                    if let Some(a) = fx_slot_editor(slot, &ctx, u) {
+                        ctx_act = Some(a);
+                    }
                 });
             }
         });
     });
+    if let Some(act) = ctx_act {
+        apply_param_ctx(ui, s, act);
+    }
 }
 
 pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
@@ -4375,6 +4856,7 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         .unwrap_or(0);
 
     let mut clear_clips = false;
+    let mut mix_ctx_act: Option<ParamCtxAction> = None;
     egui::ScrollArea::horizontal()
         .id_salt("mixer_strips_scroll")
         .show(u, |u| {
@@ -4458,16 +4940,18 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                                 u.toggle_value(&mut s.song.mixer_tracks[i].polarity_inv, "Ø")
                                     .on_hover_text("Polarity invert");
                             });
-                            u.add(
+                            let vol_r = u.add(
                                 egui::Slider::new(&mut s.song.mixer_tracks[i].volume, 0.0..=1.5)
                                     .vertical()
                                     .text("vol"),
                             );
+                            collect_param_ctx(&vol_r, AutoTarget::InsertVol(i), &mut mix_ctx_act);
                             u.label(fx::format_db(s.song.mixer_tracks[i].volume));
-                            u.add(
+                            let pan_r = u.add(
                                 egui::Slider::new(&mut s.song.mixer_tracks[i].pan, -1.0..=1.0)
                                     .text("pan"),
                             );
+                            collect_param_ctx(&pan_r, AutoTarget::InsertPan(i), &mut mix_ctx_act);
                             u.add(
                                 egui::Slider::new(
                                     &mut s.song.mixer_tracks[i].stereo_sep,
@@ -4508,6 +4992,9 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         });
     if clear_clips {
         s.clear_mix_clips();
+    }
+    if let Some(act) = mix_ctx_act {
+        apply_param_ctx(ui, s, act);
     }
 
     // Selected insert routing + PDC inspector.
@@ -4672,7 +5159,285 @@ pub fn browser(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
         }
     });
-    u.label(format!("{} samples in project", s.song.samples.len()));
+    u.horizontal(|u| {
+        u.label(format!("{} samples in project", s.song.samples.len()));
+        if !s.song.samples.is_empty() && u.button("Edison Editor").clicked() {
+            let idx = ui.clip_sample.min(s.song.samples.len() - 1);
+            ui.edison_sample = Some(idx);
+            ui.edison_sel = (0.0, 1.0);
+            ui.edison_slices.clear();
+        }
+    });
+}
+
+pub fn edison_editor_ui(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
+    let Some(mut s_idx) = ui.edison_sample else {
+        return;
+    };
+    if s.song.samples.is_empty() {
+        u.label("No samples loaded.");
+        if u.button("Close").clicked() {
+            ui.edison_sample = None;
+        }
+        return;
+    }
+    s_idx = s_idx.min(s.song.samples.len() - 1);
+    ui.edison_sample = Some(s_idx);
+
+    let names: Vec<String> = s.song.samples.iter().map(|sm| sm.name.clone()).collect();
+    u.horizontal_wrapped(|u| {
+        egui::ComboBox::from_id_salt("edison_sample_pick")
+            .selected_text(names.get(s_idx).cloned().unwrap_or_default())
+            .show_ui(u, |u| {
+                for (i, nm) in names.iter().enumerate() {
+                    if u.selectable_label(s_idx == i, nm).clicked() {
+                        ui.edison_sample = Some(i);
+                        ui.edison_sel = (0.0, 1.0);
+                        ui.edison_slices.clear();
+                    }
+                }
+            });
+        u.add(egui::Slider::new(&mut ui.edison_zoom, 1.0..=16.0).text("Zoom"));
+        if u.button("Preview").clicked() {
+            s.live_sample(s_idx);
+        }
+        if u.button("Close").clicked() {
+            ui.edison_sample = None;
+        }
+    });
+    let Some(s_idx) = ui.edison_sample else {
+        return;
+    };
+
+    // Draw zoomed waveform and allow click/drag selection.
+    let smp_len = s.song.samples[s_idx].data.len();
+    let smp_sr = s.song.samples[s_idx].sr.max(1.0);
+    let view_frac = (1.0 / ui.edison_zoom.clamp(1.0, 16.0)).clamp(0.0625, 1.0);
+    let sel_center = ((ui.edison_sel.0 + ui.edison_sel.1) * 0.5).clamp(0.0, 1.0);
+    let v0 = (sel_center - view_frac * 0.5).clamp(0.0, 1.0 - view_frac);
+    let v1 = (v0 + view_frac).min(1.0);
+
+    let avail_w = u.available_width().clamp(260.0, 760.0);
+    let (rect, resp) =
+        u.allocate_exact_size(egui::vec2(avail_w, 96.0), egui::Sense::click_and_drag());
+    let p = u.painter_at(rect);
+    p.rect_filled(rect, 3.0, egui::Color32::from_gray(14));
+    let mid_y = rect.center().y;
+    p.line_segment(
+        [egui::pos2(rect.min.x, mid_y), egui::pos2(rect.max.x, mid_y)],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(42)),
+    );
+
+    let to_x = |frac: f32| rect.min.x + ((frac - v0) / (v1 - v0).max(1e-4)) * rect.width();
+    let from_x = |x: f32| {
+        let u_pos = ((x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0);
+        (v0 + u_pos * (v1 - v0)).clamp(0.0, 1.0)
+    };
+
+    if let Some(smp) = s.song.samples.get(s_idx) {
+        let n_cols = (rect.width() as usize).clamp(64, 512);
+        let len = smp.data.len();
+        if len > 0 {
+            for col in 0..n_cols {
+                let f0 = v0 + (col as f32 / n_cols as f32) * (v1 - v0);
+                let f1 = v0 + ((col + 1) as f32 / n_cols as f32) * (v1 - v0);
+                let i0 = ((f0 * len as f32) as usize).min(len - 1);
+                let i1 = ((f1 * len as f32).ceil() as usize).clamp(i0 + 1, len);
+                let mut pk = 0.0f32;
+                let stride = ((i1 - i0) / 16).max(1);
+                for idx in (i0..i1).step_by(stride) {
+                    let vl = smp.data[idx].abs();
+                    let vr = smp.data_r.get(idx).copied().unwrap_or(0.0).abs();
+                    pk = pk.max(vl.max(vr));
+                }
+                let bx = rect.min.x + (col as f32 / n_cols as f32) * rect.width();
+                let hh = (pk.clamp(0.0, 1.0) * rect.height() * 0.46).max(1.0);
+                p.line_segment(
+                    [egui::pos2(bx, mid_y - hh), egui::pos2(bx, mid_y + hh)],
+                    egui::Stroke::new(1.2, egui::Color32::from_rgb(105, 195, 240)),
+                );
+            }
+        }
+    }
+
+    // Selection overlay.
+    let sx0 = to_x(ui.edison_sel.0).clamp(rect.min.x, rect.max.x);
+    let sx1 = to_x(ui.edison_sel.1).clamp(rect.min.x, rect.max.x);
+    if sx1 > sx0 + 1.0 {
+        p.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(sx0, rect.min.y), egui::pos2(sx1, rect.max.y)),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(80, 175, 240, 48),
+        );
+    }
+    for &mk in &ui.edison_slices {
+        if smp_len > 0 {
+            let mf = mk as f32 / smp_len as f32;
+            if mf >= v0 && mf <= v1 {
+                let mx = to_x(mf);
+                p.line_segment(
+                    [egui::pos2(mx, rect.min.y), egui::pos2(mx, rect.max.y)],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(245, 185, 65)),
+                );
+            }
+        }
+    }
+
+    if resp.drag_started()
+        && let Some(p0) = u.ctx().input(|i| i.pointer.press_origin())
+    {
+        let f0 = from_x(p0.x);
+        ui.edison_sel = (f0, (f0 + 0.01).min(1.0));
+    } else if resp.dragged()
+        && let Some(p0) = u.ctx().input(|i| i.pointer.press_origin())
+        && let Some(pos) = resp.hover_pos()
+    {
+        let a = from_x(p0.x);
+        let b = from_x(pos.x);
+        ui.edison_sel = if a <= b {
+            (a, b.max(a + 0.005).min(1.0))
+        } else {
+            (b, a.max(b + 0.005).min(1.0))
+        };
+    }
+
+    u.horizontal_wrapped(|u| {
+        let mut s0 = ui.edison_sel.0;
+        let mut s1 = ui.edison_sel.1;
+        u.add(egui::Slider::new(&mut s0, 0.0..=0.98).text("Start"));
+        u.add(egui::Slider::new(&mut s1, 0.02..=1.0).text("End"));
+        if s1 <= s0 + 0.01 {
+            s1 = (s0 + 0.01).min(1.0);
+        }
+        ui.edison_sel = (s0, s1);
+    });
+
+    let mut op: Option<&'static str> = None;
+    u.horizontal_wrapped(|u| {
+        if u.button("Detect Transients").clicked() {
+            op = Some("transients");
+        }
+        if u.button("Trim").clicked() {
+            op = Some("trim");
+        }
+        if u.button("Fade In").clicked() {
+            op = Some("fade_in");
+        }
+        if u.button("Fade Out").clicked() {
+            op = Some("fade_out");
+        }
+        if u.button("Normalize").clicked() {
+            op = Some("norm");
+        }
+        if u.button("Remove DC").clicked() {
+            op = Some("dc");
+        }
+        if u.button("Reverse").clicked() {
+            op = Some("rev");
+        }
+        if u.button("Extract Slice").clicked() {
+            op = Some("slice");
+        }
+        if u.button("→ Playlist").clicked() {
+            op = Some("playlist");
+        }
+        if u.button("→ Selected Ch").clicked() {
+            op = Some("channel");
+        }
+    });
+
+    if let Some(cmd) = op {
+        let (f0, f1) = ui.edison_sel;
+        match cmd {
+            "transients" => {
+                let min_gap = (smp_sr as usize / 12).max(512);
+                ui.edison_slices = s.song.samples[s_idx].detect_transients(0.15, min_gap);
+                ui.status = format!("detected {} transients", ui.edison_slices.len());
+            }
+            "trim" => {
+                s.song.samples[s_idx].trim_range_in_place(f0, f1);
+                ui.edison_sel = (0.0, 1.0);
+                ui.edison_slices.clear();
+                ui.status = "trimmed sample".into();
+            }
+            "fade_in" => {
+                s.song.samples[s_idx].fade_in_range_in_place(f0, f1);
+                ui.status = "applied fade in".into();
+            }
+            "fade_out" => {
+                s.song.samples[s_idx].fade_out_range_in_place(f0, f1);
+                ui.status = "applied fade out".into();
+            }
+            "norm" => {
+                s.song.samples[s_idx].normalize_in_place();
+                ui.status = "normalized sample".into();
+            }
+            "dc" => {
+                s.song.samples[s_idx].remove_dc_in_place();
+                ui.status = "removed DC offset".into();
+            }
+            "rev" => {
+                s.song.samples[s_idx].reverse_in_place();
+                ui.status = "reversed sample".into();
+            }
+            "slice" => {
+                let len = s.song.samples[s_idx].data.len();
+                let i0 = (f0 * len as f32) as usize;
+                let i1 = (f1 * len as f32) as usize;
+                let slice_name = format!(
+                    "{}_slice{}",
+                    s.song.samples[s_idx].name,
+                    s.song.samples.len()
+                );
+                let sliced = s.song.samples[s_idx].extract_slice(slice_name, i0, i1);
+                s.song.samples.push(sliced);
+                let new_idx = s.song.samples.len() - 1;
+                ui.edison_sample = Some(new_idx);
+                ui.edison_sel = (0.0, 1.0);
+                ui.status = format!("extracted slice #{}", new_idx + 1);
+            }
+            "playlist" => {
+                let track = ui
+                    .sel_track
+                    .min(s.song.playlist_tracks.len().saturating_sub(1));
+                let cid = s.song.add_audio_clip(track, 0, s_idx, 1.0);
+                let spt = (smp_sr * 60.0 / s.song.bpm.max(30.0) / 16.0).max(1.0);
+                let ticks = ((smp_len as f32) / spt).ceil().max(4.0) as u32;
+                if let Some(c) = s.song.clips.iter_mut().find(|c| c.id == cid) {
+                    c.len_ticks = ticks;
+                }
+                ui.sel_clip = Some(cid);
+                ui.show_playlist = true;
+                ui.status = "placed sample on Playlist".into();
+            }
+            "channel" => {
+                let ch = ui.sel_ch.min(s.song.channels.len().saturating_sub(1));
+                if let Some(c) = s.song.channels.get_mut(ch) {
+                    c.kind = ChannelKind::Sampler {
+                        sample: Some(s_idx),
+                    };
+                    ui.status = format!("loaded {} -> {}", s.song.samples[s_idx].name, c.name);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn edison_window(ui: &mut AppUi, s: &mut AppState, ctx: &egui::Context) {
+    if ui.edison_sample.is_none() {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Edison Sample Editor")
+        .open(&mut open)
+        .default_width(560.0)
+        .show(ctx, |u| {
+            edison_editor_ui(ui, s, u);
+        });
+    if !open {
+        ui.edison_sample = None;
+    }
 }
 
 #[cfg(test)]
@@ -5168,5 +5933,89 @@ mod ui_tests {
             open_piano_modal(&mut st.ui, &mut st.app, 4, 0, PianoModalKind::Flip);
             assert!(st.ui.modal.is_some());
         }
+    }
+
+    #[test]
+    fn phase5_edison_trim_normalize_and_send_to_playlist() {
+        let mut state = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        let pcm: Vec<f32> = (0..400).map(|i| if i < 100 { 0.1 } else { 0.25 }).collect();
+        state
+            .app
+            .song
+            .samples
+            .push(crate::song::SampleRef::from_mono(
+                "vox.wav", "vox.wav", pcm, 44100.0,
+            ));
+        state.ui.edison_sample = Some(0);
+        state.ui.edison_sel = (0.25, 0.75);
+
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                edison_editor_ui(&mut st.ui, &mut st.app, u);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(820.0, 520.0));
+        h.step();
+
+        h.get_by_label("Trim").click();
+        h.step();
+        assert_eq!(h.state().app.song.samples[0].data.len(), 200);
+
+        h.get_by_label("Normalize").click();
+        h.step();
+        let pk = h.state().app.song.samples[0]
+            .data
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max);
+        assert!((pk - 0.98).abs() < 0.01);
+
+        h.get_by_label("→ Playlist").click();
+        h.step();
+        assert_eq!(h.state().app.song.clips.len(), 1);
+        assert!(matches!(
+            h.state().app.song.clips[0].kind,
+            ClipKind::Automation { .. } | ClipKind::Audio { .. }
+        ));
+        assert!(matches!(
+            h.state().app.song.clips[0].kind,
+            ClipKind::Audio { sample: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn phase5_midi_learn_and_automation_clip() {
+        let mut ui = AppUi::default();
+        let mut s = AppState::new();
+        apply_param_ctx(
+            &mut ui,
+            &mut s,
+            ParamCtxAction::CreateAuto(AutoTarget::ChannelVol(0)),
+        );
+        assert_eq!(s.song.clips.len(), 1);
+        assert!(matches!(
+            s.song.clips[0].kind,
+            ClipKind::Automation {
+                target: AutoTarget::ChannelVol(0),
+                ..
+            }
+        ));
+
+        apply_param_ctx(
+            &mut ui,
+            &mut s,
+            ParamCtxAction::MidiLearn(AutoTarget::ChannelCut(0)),
+        );
+        assert_eq!(ui.midi_learn.armed_target, Some(AutoTarget::ChannelCut(0)));
+        assert!(ui.show_io_panel);
+        ui.midi_learn.pending_curve = MapCurve::Log;
+        assert!(ui.midi_learn.process_cc(&mut s.song, 0, 74, 127));
+        assert_eq!(s.song.midi_mappings.len(), 1);
+        assert!((s.song.channels[0].cutoff - 16000.0).abs() < 5.0);
     }
 }

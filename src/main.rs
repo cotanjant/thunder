@@ -8,6 +8,7 @@
 mod engine;
 mod export;
 mod fx;
+mod midi;
 mod song;
 mod synth;
 mod ui;
@@ -44,6 +45,42 @@ impl eframe::App for DawApp {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
         self.state.sync_audio();
+        let target_ch = self
+            .ui
+            .lock_midi_ch
+            .unwrap_or(self.ui.sel_ch)
+            .min(self.state.song.channels.len().saturating_sub(1));
+        if self.state.rt.midi_target_ch != target_ch {
+            self.state.set_midi_target(target_ch);
+        }
+        let snap_ticks = self.ui.rec_snap_ticks();
+        while let Ok(msg) = self.ui.midi.ui_rx.pop() {
+            if self.state.audio.is_none() {
+                self.state.send_midi_msg(msg);
+            }
+            if let midi::MidiMsg::Cc { ch, cc, val } = msg {
+                self.ui
+                    .midi_learn
+                    .process_cc(&mut self.state.song, ch, cc, val);
+            }
+            self.ui.midi_rec.handle_msg(
+                &mut self.state.song,
+                msg,
+                midi::MidiRecCtx {
+                    pat: self.ui.sel_pat,
+                    ch: target_ch,
+                    cur_tick: self.state.rt.cur_tick,
+                    playing: self.state.rt.playing,
+                    snap_grid: snap_ticks,
+                },
+            );
+        }
+        if !self.state.rt.playing
+            && self.ui.midi_rec.mode != midi::MidiRecMode::StepInput
+            && (!self.ui.midi_rec.held.is_empty() || self.ui.midi_rec.replaced_pass)
+        {
+            self.ui.midi_rec.reset_pass();
+        }
         let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
         self.ui.record_song(&self.state.song, pointer_down);
         // Space toggles transport, like FL. Not while typing in a text box.
@@ -184,6 +221,7 @@ impl eframe::App for DawApp {
                 }
             });
         });
+        ui::edison_window(&mut self.ui, &mut self.state, ui.ctx());
         let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
         self.ui.record_song(&self.state.song, pointer_down);
         self.state.sync_audio();
@@ -231,6 +269,12 @@ fn main() {
             None
         }
     };
+    let mut app_ui = AppUi::default();
+    app_ui.midi.refresh();
+    app_ui.audio_in_ports = midi::list_audio_inputs();
+    if let Some(tx) = state.audio.as_mut().and_then(|b| b.take_midi_rt_tx()) {
+        app_ui.midi.set_audio_tx(tx);
+    }
     let options = eframe::NativeOptions::default();
     if let Err(e) = eframe::run_native(
         "Thunder",
@@ -239,7 +283,7 @@ fn main() {
             cc.egui_ctx.set_visuals(fl_visuals());
             Ok(Box::new(DawApp {
                 state,
-                ui: AppUi::default(),
+                ui: app_ui,
                 _stream: stream,
             }) as Box<dyn eframe::App>)
         }),

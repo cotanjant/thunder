@@ -98,6 +98,8 @@ pub struct AdvVoiceRt {
     pub slide_pan_target: f32,
     pub cutoff_mul: f32,
     pub rel_mul: f32,
+    pub live_midi: Option<u8>,
+    pub bend_semi: f32,
     osc_phases: [[f32; 3]; MAX_UNISON],
     sub_phase: f32,
     lfo_phases: [f32; 2],
@@ -132,6 +134,8 @@ impl Default for AdvVoiceRt {
             slide_pan_target: 0.0,
             cutoff_mul: 1.0,
             rel_mul: 1.0,
+            live_midi: None,
+            bend_semi: 0.0,
             osc_phases: [[0.0; 3]; MAX_UNISON],
             sub_phase: 0.0,
             lfo_phases: [0.0; 2],
@@ -205,7 +209,14 @@ impl AdvVoiceRt {
         self.active = false;
         self.off = 0;
         self.slide_rem = 0;
+        self.live_midi = None;
         self.env.kill();
+    }
+
+    pub fn release_note(&mut self) {
+        self.off = 0;
+        self.live_midi = None;
+        self.env.release();
     }
 
     pub fn tick_gate(&mut self) {
@@ -271,7 +282,8 @@ impl AdvVoiceRt {
             }
         }
 
-        let hz = (self.cur_hz * 2.0_f32.powf(pitch_mod_semi / 12.0)).clamp(20.0, sr * 0.45);
+        let hz = (self.cur_hz * 2.0_f32.powf((pitch_mod_semi + self.bend_semi) / 12.0))
+            .clamp(20.0, sr * 0.45);
         let uni = (cfg.unison as usize).clamp(1, MAX_UNISON);
         let detune_max_cents = cfg.detune.clamp(0.0, 1.0) * 35.0;
         let spread = cfg.spread.clamp(0.0, 1.0);
@@ -395,7 +407,7 @@ impl AdvVoiceRt {
             return (0.0, 0.0);
         }
         self.note_time += 1.0 / sr.max(1.0);
-        let hz = self.cur_hz.clamp(20.0, sr * 0.45);
+        let hz = (self.cur_hz * 2.0_f32.powf(self.bend_semi / 12.0)).clamp(20.0, sr * 0.45);
         for (oi, op) in cfg.ops.iter().enumerate() {
             let inc = (hz * op.ratio.clamp(0.125, 16.0) / sr.max(1.0)).clamp(0.0, 0.48);
             self.fm_phases[oi] = (self.fm_phases[oi] + inc) % 1.0;

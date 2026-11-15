@@ -788,41 +788,47 @@ impl FxSlotRt {
     pub fn process_sample(
         &mut self,
         slot: &crate::song::EffectSlot,
-        sr: f32,
-        bpm: f32,
+        ctx: &FxProcCtx<'_>,
         in_l: f32,
         in_r: f32,
-        sc_bus: &[(f32, f32)],
     ) -> (f32, f32) {
-        if slot.bypass || slot.mix <= 0.001 {
+        let mix = ctx.mix_override.unwrap_or(slot.mix).clamp(0.0, 1.0);
+        if slot.bypass || mix <= 0.001 {
             self.last_gr_db = 0.0;
             return (in_l, in_r);
         }
         let (wet_l, wet_r) = match &slot.kind {
-            FxKind::ParametricEq(cfg) => self.eq.process(cfg, sr, in_l, in_r),
+            FxKind::ParametricEq(cfg) => self.eq.process(cfg, ctx.sr, in_l, in_r),
             FxKind::Compressor(cfg) => {
                 let (sc_l, sc_r) = cfg
                     .sidechain_from
-                    .and_then(|idx| sc_bus.get(idx).copied())
+                    .and_then(|idx| ctx.sc_bus.get(idx).copied())
                     .unwrap_or((in_l, in_r));
-                let out = self.comp.process(cfg, sr, in_l, in_r, sc_l, sc_r);
+                let out = self.comp.process(cfg, ctx.sr, in_l, in_r, sc_l, sc_r);
                 self.last_gr_db = self.comp.last_gr_db;
                 out
             }
-            FxKind::StereoDelay(cfg) => self.delay.process(cfg, sr, bpm, in_l, in_r),
-            FxKind::Reverb(cfg) => self.reverb.process(cfg, sr, in_l, in_r),
-            FxKind::Modulator(cfg) => self.mod_fx.process(cfg, sr, in_l, in_r),
-            FxKind::Saturator(cfg) => self.sat.process(cfg, sr, in_l, in_r),
-            FxKind::StereoShaper(cfg) => self.shaper.process(cfg, sr, in_l, in_r),
+            FxKind::StereoDelay(cfg) => self.delay.process(cfg, ctx.sr, ctx.bpm, in_l, in_r),
+            FxKind::Reverb(cfg) => self.reverb.process(cfg, ctx.sr, in_l, in_r),
+            FxKind::Modulator(cfg) => self.mod_fx.process(cfg, ctx.sr, in_l, in_r),
+            FxKind::Saturator(cfg) => self.sat.process(cfg, ctx.sr, in_l, in_r),
+            FxKind::StereoShaper(cfg) => self.shaper.process(cfg, ctx.sr, in_l, in_r),
         };
-        let mix = slot.mix.clamp(0.0, 1.0);
         (in_l + (wet_l - in_l) * mix, in_r + (wet_r - in_r) * mix)
     }
+}
+
+pub struct FxProcCtx<'a> {
+    pub sr: f32,
+    pub bpm: f32,
+    pub mix_override: Option<f32>,
+    pub sc_bus: &'a [(f32, f32)],
 }
 
 #[derive(Clone)]
 pub struct MixerInsertRt {
     pub slots: Vec<FxSlotRt>,
+    pub mix_override: [Option<f32>; MAX_FX_SLOTS],
     pub rms_sq: f32,
     pub clip_hold: usize,
     pub spec_ring: [f32; FFT_N],
@@ -833,6 +839,7 @@ impl MixerInsertRt {
     pub fn new(sr: f32) -> Self {
         Self {
             slots: (0..MAX_FX_SLOTS).map(|_| FxSlotRt::new(sr)).collect(),
+            mix_override: [None; MAX_FX_SLOTS],
             rms_sq: 0.0,
             clip_hold: 0,
             spec_ring: [0.0; FFT_N],
@@ -844,6 +851,7 @@ impl MixerInsertRt {
         for s in &mut self.slots {
             s.reset();
         }
+        self.mix_override = [None; MAX_FX_SLOTS];
         self.rms_sq = 0.0;
         self.clip_hold = 0;
         self.spec_ring.fill(0.0);
@@ -859,8 +867,14 @@ impl MixerInsertRt {
         mut r: f32,
         sc_bus: &[(f32, f32)],
     ) -> (f32, f32) {
-        for (slot, rt) in track.fx.iter().zip(self.slots.iter_mut()) {
-            (l, r) = rt.process_sample(slot, sr, bpm, l, r, sc_bus);
+        for (si, (slot, rt)) in track.fx.iter().zip(self.slots.iter_mut()).enumerate() {
+            let ctx = FxProcCtx {
+                sr,
+                bpm,
+                mix_override: self.mix_override.get(si).copied().flatten(),
+                sc_bus,
+            };
+            (l, r) = rt.process_sample(slot, &ctx, l, r);
         }
         if track.polarity_inv {
             l = -l;
@@ -1066,7 +1080,13 @@ mod tests {
             let mut energy = 0.0f32;
             for i in 0..22050 {
                 let x = if i < 64 { 0.5 } else { 0.0 };
-                let (l, r) = rt.process_sample(slot, sr, 128.0, x, x, &[]);
+                let ctx = FxProcCtx {
+                    sr,
+                    bpm: 128.0,
+                    mix_override: None,
+                    sc_bus: &[],
+                };
+                let (l, r) = rt.process_sample(slot, &ctx, x, x);
                 assert!(l.is_finite() && r.is_finite());
                 energy += l * l + r * r;
             }
