@@ -1,106 +1,252 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="en" data-type="software" data-radius="soft" data-ground="sand" data-buttons="arrow" data-motion>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Thunder: how to use it</title>
+<meta name="description" content="A plain guide to making beats, recording audio, using synths and CLAP plugins, mixing and exporting in Thunder.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Thunder: how to use it">
+<meta property="og:description" content="A plain guide to making beats, recording audio, mixing and exporting in Thunder.">
+<meta name="theme-color" content="#c3d7e5">
+<meta name="site-kind" content="software">
+<meta name="page-type" content="software">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<link href="https://fonts.googleapis.com/css2?family=Reddit+Sans:wght@400..700&family=JetBrains+Mono:wght@400..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/system.css">
+<link rel="stylesheet" href="assets/ui/cards.css">
+<link rel="stylesheet" href="assets/motion/motion.css">
+<link rel="stylesheet" href="assets/layout/layout.css">
+<style>
+:root {
+  --p-bg: #c3d7e5; --p-surface: #d0e0eb; --p-ink: #141414; --p-muted: #4a5068;
+  --p-accent: #0f5257; --p-accent-ink: #ffffff; --p-action: #0f5257; --p-action-ink: #ffffff;
+  --p-inv-bg: #141414; --p-inv-surface: #1e1f20; --p-inv-ink: #c3d7e5; --p-inv-muted: #808b94;
+  --p-inv-accent: #c3d7e5; --p-inv-accent-ink: #141414; --p-inv-action: #c3d7e5; --p-inv-action-ink: #141414;
+  --font-display: "Reddit Sans", system-ui, sans-serif;
+  --font-text: "Reddit Sans", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --display-weight: 500;
+  --display-tracking: -0.03em;
+  --display-tracking-xl: -0.04em;
+}
+main > section { height: auto; min-height: 0; padding-top: var(--s-7); padding-bottom: var(--s-7); }
+main > section:first-child { padding-top: calc(var(--nav) + var(--s-8)); }
+.doc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--s-5); margin-top: var(--s-5); }
+.doc-card { background: var(--p-surface); border: 1px solid rgba(20, 20, 20, 0.12); border-radius: var(--r-lg); padding: var(--s-6); }
+.doc-card h3 { margin: 0 0 var(--s-2); font-size: var(--t-card); }
+.doc-card p, .doc-card li { color: var(--p-ink); font-size: var(--t-body); line-height: 1.6; }
+.doc-card ul { margin: var(--s-3) 0 0; padding-left: 1.25rem; }
+.doc-card li { margin: var(--s-2) 0; }
+.doc-note { margin-top: var(--s-4); padding: var(--s-4) var(--s-5); background: var(--p-surface); border-left: 3px solid var(--p-accent); border-radius: var(--r-sm); max-width: 68ch; }
+</style>
+<script>document.documentElement.classList.add('m-enter');setTimeout(()=>document.documentElement.classList.add('m-enter-done'),700)</script>
 </head>
 <body>
-<header>
-  <h1>How to use Thunder</h1>
-  <p>Everything below happens inside the app. Nothing to sign up for.</p>
-  <nav>
-    <a href="index.html">Home</a> ·
-    <a href="docs.html" aria-current="page">How to use it</a> ·
-    <a href="releases.html">Download</a>
-  </nav>
+<header class="nav nav--centre">
+  <div class="wrap nav__bar">
+    <a class="skip-link" href="#top">Skip to content</a>
+    <a class="nav__logo" href="index.html"><span class="mark" data-mark="ring" aria-hidden="true"></span>Thunder</a>
+    <nav class="nav__links" aria-label="Main">
+      <div class="nav__item"><a class="nav__link" href="index.html#features">Features</a></div>
+      <div class="nav__item"><a class="nav__link" href="index.html#workflow">Workflow</a></div>
+      <div class="nav__item"><a class="nav__link" href="docs.html" aria-current="page">Guide</a></div>
+      <div class="nav__item"><a class="nav__link" href="releases.html">Downloads</a></div>
+    </nav>
+    <div class="nav__actions">
+      <a class="btn btn--primary" href="releases.html">Download Thunder<svg class="m-arrow" viewBox="0 0 12 12" aria-hidden="true"><path class="m-arrow__stem" d="M1 6h8"/><path class="m-arrow__head" d="M4.5 2.5 8 6l-3.5 3.5"/></svg></a>
+    </div>
+    <button class="nav__toggle" type="button" aria-expanded="false" aria-label="Menu">
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M2 5h14M2 13h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
 </header>
-<main>
-  <section>
-    <h2>Start and stop</h2>
-    <p>The top bar runs the show. <strong>Play</strong> starts, <strong>Stop</strong>
-    halts, <strong>Reset</strong> jumps back to the start. The numbers on the
-    right read bar, beat and tick so you always know where you are.</p>
-    <p><strong>Song</strong> plays your whole playlist. <strong>Pat</strong> loops
-    one pattern while you edit it. <strong>BPM</strong> sets the tempo, or tap
-    <strong>Tap</strong> in time with music.
-    <strong>Swing</strong> loosens the timing for a hip-hop feel.
-    <strong>Click</strong> turns the metronome on.</p>
+
+<main id="top">
+  <section class="section" aria-labelledby="guide-h">
+    <div class="wrap">
+      <div class="section-head">
+        <h1 id="guide-h">How to use Thunder</h1>
+        <p class="t-lead">Everything happens inside the app on your disk. No account, no cloud sync and no internet connection required.</p>
+      </div>
+    </div>
   </section>
 
-  <section>
-    <h2>Drums and steps</h2>
-    <p>Each row in the channel rack is one instrument. The sixteen boxes are
-    sixteenth notes in one bar. Click a box to switch that hit on or off.
-    <strong>M</strong> mutes the row, <strong>S</strong> solos it so you hear
-    it alone. The music note button plays the sound once so you can check it.</p>
+  <section class="section" id="workspace" aria-labelledby="workspace-h">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="workspace-h">Transport and dockable workspace</h2>
+        <p>The top transport bar controls playback, tempo, swing and recording. Panels dock and rearrange to fit your screen.</p>
+      </div>
+      <div class="doc-grid">
+        <article class="doc-card">
+          <h3>Playback and timing</h3>
+          <p><strong>Play</strong> starts, <strong>Stop</strong> halts and <strong>Reset</strong> jumps back to bar 1. Switch between <strong>Pat</strong> to loop one pattern and <strong>Song</strong> to play the full playlist. Set <strong>BPM</strong> directly or click <strong>Tap</strong> in time with music, add <strong>Swing</strong> for a loose groove, and turn on <strong>Click</strong> for the metronome.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Dockable panels</h3>
+          <p>Drag panel tabs to dock them side by side or stack them. Use <strong>F5</strong> through <strong>F9</strong> to jump to the Playlist, Channel Rack, Piano Roll, Browser and Mixer, and save or reset your workspace layout at any time.</p>
+        </article>
+      </div>
+    </div>
   </section>
 
-  <section>
-    <h2>Melodies in the piano roll</h2>
-    <p>Click a channel name, and the piano roll below shows its notes.
-    Pitch runs up the left side, time runs left to right across one bar.</p>
-    <ul>
-      <li>Click empty space to place a note.</li>
-      <li>Drag a note to move it. Drag its right edge to change its length.</li>
-      <li>Right-click a note, or select it and press Delete, to remove it.</li>
-      <li>The strip underneath sets how hard each note hits. Drag the bars up or down.</li>
-      <li>The lane below that draws volume or filter curves across the bar.
-      Click to add a point, drag to move it, right-click to delete it.</li>
-    </ul>
-    <p>The toolbar above the roll holds the helpers: snap to grid, quantize
-    shaky timing, humanize for a played feel, strum chords, build an arpeggio
-    from your notes, stamp a major or minor chord, and shift everything an
-    octave. Keys outside your chosen scale are shaded darker.</p>
+  <section class="section" id="instruments" aria-labelledby="instruments-h">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="instruments-h">Channel rack, synths and CLAP plugins</h2>
+        <p>Add as many channels as your song needs, reorder them, set choke groups and route each one to a mixer insert.</p>
+      </div>
+      <div class="doc-grid">
+        <article class="doc-card">
+          <h3>Steps and Drum Rack</h3>
+          <p>Click steps in the channel rack to place beats, or open the 16-pad <strong>Drum Rack</strong> to layer one-shots with individual pitch, pan and choke groups. <strong>M</strong> mutes a channel and <strong>S</strong> solos it.</p>
+        </article>
+        <article class="doc-card">
+          <h3>SuperSynth and FM synth</h3>
+          <p><strong>SuperSynth</strong> gives you three oscillators, unison detune, a multimode filter and an LFO matrix. The <strong>4-operator FM synth</strong> covers electric pianos, metallic percussion and deep basses.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Stereo sampler</h3>
+          <p>Load WAV, MP3, OGG or FLAC files from the browser by dragging them onto a channel. Adjust start and end points, loop regions, reverse playback and granular time-stretch.</p>
+        </article>
+        <article class="doc-card">
+          <h3>CLAP plugins</h3>
+          <p>Scan your system plugin folders to load third-party CLAP instruments and insert effects. Plugin parameters, native windows and preset states save right inside your project file.</p>
+        </article>
+      </div>
+    </div>
   </section>
 
-  <section>
-    <h2>Arranging the song</h2>
-    <p>The playlist is a list of bars. Each bar plays one of your eight
-    patterns, or stays silent. Add bars with the button, pick a pattern per
-    bar, and press play in Song mode to hear it all in order. The loop switch
-    repeats the whole thing.</p>
+  <section class="section" id="piano-roll" aria-labelledby="piano-h">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="piano-h">Melodies in the piano roll</h2>
+        <p>Click a channel name to open its notes in the piano roll. Keys outside your selected scale shade darker so melodies stay in key.</p>
+      </div>
+      <div class="doc-grid">
+        <article class="doc-card">
+          <h3>Drawing and editing</h3>
+          <ul>
+            <li>Click empty grid space to place a note, drag to move it, or pull its right edge to resize.</li>
+            <li>Use marquee select, paint and slice tools to edit whole phrases at once.</li>
+            <li>Enable <strong>Slide</strong> on a note for smooth pitch glides into the next note.</li>
+            <li>Ghost notes show other channels in the same pattern behind your active melody.</li>
+          </ul>
+        </article>
+        <article class="doc-card">
+          <h3>Helpers and lanes</h3>
+          <ul>
+            <li>Snap notes to the grid, quantize timing, humanize velocity or strum chords.</li>
+            <li>Stamp major, minor and seventh chords or generate arpeggios from held notes.</li>
+            <li>Drag velocity bars underneath or draw filter and volume curves in the property lane.</li>
+          </ul>
+        </article>
+      </div>
+    </div>
   </section>
 
-  <section>
-    <h2>Mixing</h2>
-    <p>Every instrument has volume and pan. <strong>Cut</strong> trims the
-    brightness, <strong>dly</strong> and <strong>verb</strong> send it to the
-    echo and the room sound. The master column sets echo time and how much of
-    each effect lands in the final mix. The green scope shows the output,
-    and the bar next to the transport shows how loud it is getting.</p>
+  <section class="section" id="playlist" aria-labelledby="playlist-h">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="playlist-h">Playlist, recording and sample editor</h2>
+        <p>Arrange patterns, audio recordings and automation curves across multi-track lanes.</p>
+      </div>
+      <div class="doc-grid">
+        <article class="doc-card">
+          <h3>Multi-track arrangement</h3>
+          <p>Place <strong>Pattern</strong>, <strong>Audio</strong> and <strong>Automation</strong> clips anywhere on the timeline. Set loop and punch-in/out regions, and bend automation curves with tension handles.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Hardware MIDI and audio recording</h3>
+          <p>Play instruments from a USB MIDI controller or your computer keyboard, and map hardware knobs with MIDI learn. Arm an audio input to monitor and record live takes directly to disk, then trim, fade, normalize or slice transients in the built-in sample editor.</p>
+        </article>
+      </div>
+    </div>
   </section>
 
-  <section>
-    <h2>Your own sounds</h2>
-    <p>The browser lists sample files from your music folder. The play button
-    previews one, the arrow loads it into the selected channel, which then
-    behaves like any other instrument. You can also paste a file path and hit
-    load. WAV, MP3, OGG and FLAC all work.</p>
-  </section>
-
-  <section>
-    <h2>Saving and sharing</h2>
-    <p>Type a file name and press <strong>Save</strong> to keep the project,
-    <strong>Load</strong> to reopen it. The WAV export writes your full
-    arrangement to a mixdown file. The MIDI export writes the notes so you can
-    open them in any other music software.</p>
-  </section>
-
-  <section>
-    <h2>No sound?</h2>
-    <ul>
-      <li>Check your speakers and the system volume first.</li>
-      <li>On Linux, make sure an output device is selected in your sound settings.</li>
-      <li>No audio from a copy you built yourself is usually missing ALSA
-      headers. Install them and rebuild.</li>
-    </ul>
+  <section class="section" id="mixer" aria-labelledby="mixer-h">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="mixer-h">Mixer, effects and export</h2>
+        <p>Route channels to mixer inserts with automatic delay compensation and LUFS/RMS loudness metering.</p>
+      </div>
+      <div class="doc-grid">
+        <article class="doc-card">
+          <h3>10 FX slots per insert</h3>
+          <p>Stack built-in effects or CLAP plugins on every insert: 7-band EQ with spectrum view, compressor/limiter with sidechain input, tempo delay, reverb, modulation FX, saturator and mid/side shaper.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Saving and exporting</h3>
+          <p>Save sessions as <code>.thdr</code> files or export a self-contained zipped loop package (<code>.zip</code>) with all samples included. Export mixes to <strong>WAV</strong> (16/24-bit dithered or 32-bit float), <strong>FLAC</strong>, <strong>OGG</strong>, <strong>MP3</strong>, individual mixer <strong>stems</strong> or <strong>Type-1 MIDI</strong>.</p>
+        </article>
+      </div>
+      <div class="doc-note">
+        <strong>No sound?</strong> Check your system output device and volume first. On Linux, make sure an output device is selected in your audio settings. If you built Thunder from source on Linux, ensure ALSA development headers were installed before compiling.
+      </div>
+    </div>
   </section>
 </main>
-<footer>MIT · thunder contributors · <a href="https://github.com/cotanjant/thunder">GitHub</a></footer>
+
+<footer class="footer closing" id="contact" aria-labelledby="close-h">
+  <div class="wrap">
+    <div class="closing__cta close--word">
+      <div class="section-head--split">
+        <div>
+          <h2 id="close-h">Download Thunder</h2>
+          <p class="t-lead">Free for Windows, Mac and Linux. Open source under the MIT license.</p>
+        </div>
+        <a class="btn btn--primary" href="releases.html">Download Thunder<svg class="m-arrow" viewBox="0 0 12 12" aria-hidden="true"><path class="m-arrow__stem" d="M1 6h8"/><path class="m-arrow__head" d="M4.5 2.5 8 6l-3.5 3.5"/></svg></a>
+      </div>
+      <p class="close__word" aria-hidden="true">Thunder</p>
+    </div>
+    <div class="closing__links">
+      <div class="grid">
+        <div class="span-4 stack-4">
+          <a class="nav__logo" href="index.html"><span class="mark" data-mark="ring" aria-hidden="true"></span>Thunder</a>
+          <p class="footer__lede">Free desktop DAW for making beats, recording audio and mixing songs.</p>
+        </div>
+        <div class="span-2 footer__col">
+          <h3>Product</h3>
+          <ul>
+            <li><a href="index.html#features">Features</a></li>
+            <li><a href="index.html#workflow">Workflow</a></li>
+            <li><a href="index.html#faq">Questions</a></li>
+          </ul>
+        </div>
+        <div class="span-2 footer__col">
+          <h3>Guide</h3>
+          <ul>
+            <li><a href="docs.html#workspace">Workspace</a></li>
+            <li><a href="docs.html#instruments">Instruments</a></li>
+            <li><a href="docs.html#mixer">Mixer and FX</a></li>
+          </ul>
+        </div>
+        <div class="span-2 footer__col">
+          <h3>Download</h3>
+          <ul>
+            <li><a href="releases.html">v1.0.0 release</a></li>
+            <li><a href="releases.html">All versions</a></li>
+          </ul>
+        </div>
+        <div class="span-2 footer__col">
+          <h3>Project</h3>
+          <ul>
+            <li><a href="https://github.com/cotanjant/thunder">GitHub repo</a></li>
+            <li><a href="https://github.com/cotanjant/thunder/releases">All releases</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer__legal">
+        <span>&copy; 2026 Thunder contributors · MIT License</span>
+        <div class="socials"></div>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script type="module" src="assets/system.js"></script>
+<script type="module" src="assets/motion/motion.js"></script>
 </body>
 </html>
