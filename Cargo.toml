@@ -88,3 +88,6 @@ libwayland-dev = "*"
 libegl-dev = "*"
 libgl-dev = "*"
 libdbus-1-dev = "*"
+
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
