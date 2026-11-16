@@ -210,3 +210,53 @@ fn main() {
         eprintln!("eframe error: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn windows_installer_places_shortcuts_and_icons() {
+        let wxs = include_str!("../wix/main.wxs");
+
+        let start_menu_idx = wxs
+            .find("Id='StartMenuThunder'")
+            .expect("StartMenuThunder shortcut missing");
+        let start_menu_tag =
+            &wxs[start_menu_idx..wxs[start_menu_idx..].find("/>").unwrap() + start_menu_idx];
+        assert!(
+            start_menu_tag.contains("Directory='ApplicationProgramsFolder'"),
+            "StartMenuThunder must specify Directory='ApplicationProgramsFolder'"
+        );
+        assert!(
+            start_menu_tag.contains("Icon='Thunder.exe'"),
+            "StartMenuThunder must specify Icon='Thunder.exe'"
+        );
+
+        let desktop_idx = wxs
+            .find("Id='DesktopThunder'")
+            .expect("DesktopThunder shortcut missing");
+        let desktop_tag = &wxs[desktop_idx..wxs[desktop_idx..].find("/>").unwrap() + desktop_idx];
+        assert!(
+            desktop_tag.contains("Directory='DesktopFolder'"),
+            "DesktopThunder must specify Directory='DesktopFolder'"
+        );
+        assert!(
+            desktop_tag.contains("Icon='Thunder.exe'"),
+            "DesktopThunder must specify Icon='Thunder.exe'"
+        );
+
+        assert!(
+            wxs.contains("<Icon Id='Thunder.exe' SourceFile='assets\\icon.ico'/>"),
+            "wix/main.wxs must define Thunder.exe Icon from assets\\icon.ico"
+        );
+        assert!(
+            wxs.contains("<Property Id='ARPPRODUCTICON' Value='Thunder.exe'/>"),
+            "wix/main.wxs must set ARPPRODUCTICON to Thunder.exe"
+        );
+
+        let ico = include_bytes!("../assets/icon.ico");
+        assert!(
+            ico.len() >= 4 && ico[..4] == [0, 0, 1, 0],
+            "assets/icon.ico must have a valid Windows ICO header"
+        );
+    }
+}

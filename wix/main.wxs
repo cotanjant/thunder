@@ -87,9 +87,46 @@
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='ProgramMenuFolder'>
-                <Directory Id='ApplicationProgramsFolder' Name='Thunder'/>
+                <Directory Id='ApplicationProgramsFolder' Name='Thunder'>
+                    <Component Id='StartMenuShortcutComp' Guid='*'>
+                        <Shortcut
+                            Id='StartMenuThunder'
+                            Directory='ApplicationProgramsFolder'
+                            Name='Thunder'
+                            Description='Small FL-style DAW'
+                            Target='[Bin]thunder.exe'
+                            WorkingDirectory='APPLICATIONFOLDER'
+                            Icon='Thunder.exe'/>
+                        <RemoveFolder Id='RemoveAppProgramsFolder' Directory='ApplicationProgramsFolder' On='uninstall'/>
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\Thunder'
+                            Name='startmenu'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                    </Component>
+                </Directory>
             </Directory>
-            <Directory Id='DesktopFolder'/>
+            <Directory Id='DesktopFolder'>
+                <Component Id='DesktopShortcutComp' Guid='*'>
+                    <Shortcut
+                        Id='DesktopThunder'
+                        Directory='DesktopFolder'
+                        Name='Thunder'
+                        Description='Small FL-style DAW'
+                        Target='[Bin]thunder.exe'
+                        WorkingDirectory='APPLICATIONFOLDER'
+                        Icon='Thunder.exe'/>
+                    <RegistryValue
+                        Root='HKCU'
+                        Key='Software\Thunder'
+                        Name='desktop'
+                        Type='integer'
+                        Value='1'
+                        KeyPath='yes'/>
+                </Component>
+            </Directory>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
                 <Directory Id='APPLICATIONFOLDER' Name='Thunder'>
                     
@@ -130,37 +167,6 @@
                                 Name='thunder.exe'
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\thunder.exe'
-                                KeyPath='yes'/>
-                        </Component>
-                        <Component Id='StartMenuShortcutComp' Guid='*'>
-                            <Shortcut
-                                Id='StartMenuThunder'
-                                Name='Thunder'
-                                Description='Small FL-style DAW'
-                                Target='[Bin]thunder.exe'
-                                WorkingDirectory='APPLICATIONFOLDER'/>
-                            <RemoveFolder Id='RemoveAppProgramsFolder' Directory='ApplicationProgramsFolder' On='uninstall'/>
-                            <RegistryValue
-                                Root='HKCU'
-                                Key='Software\Thunder'
-                                Name='startmenu'
-                                Type='integer'
-                                Value='1'
-                                KeyPath='yes'/>
-                        </Component>
-                        <Component Id='DesktopShortcutComp' Guid='*'>
-                            <Shortcut
-                                Id='DesktopThunder'
-                                Name='Thunder'
-                                Description='Small FL-style DAW'
-                                Target='[Bin]thunder.exe'
-                                WorkingDirectory='APPLICATIONFOLDER'/>
-                            <RegistryValue
-                                Root='HKCU'
-                                Key='Software\Thunder'
-                                Name='desktop'
-                                Type='integer'
-                                Value='1'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
@@ -223,8 +229,8 @@
           The product icon is the graphic that appears in the Add/Remove
           Programs control panel for the application.
         -->
-        <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
-        <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
+        <Icon Id='Thunder.exe' SourceFile='assets\icon.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='Thunder.exe'/>
 
         <Property Id='ARPHELPLINK' Value='https://cotanjant.github.io/thunder/'/>
         
