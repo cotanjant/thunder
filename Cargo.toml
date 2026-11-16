@@ -1,6 +1,6 @@
 [package]
 name = "thunder"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "A small FL Studio-style DAW in Rust"
 authors = ["Thunder contributors"]

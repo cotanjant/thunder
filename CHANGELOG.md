@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v1.0.1] - 2026-11-16
+
+### Fixed
+
+- Windows MSI installer now places the Desktop and Start Menu shortcuts in `DesktopFolder` and `ApplicationProgramsFolder` instead of the `bin` folder.
+- Windows shortcuts, Add/Remove Programs entry, and `thunder.exe` now embed the Thunder app icon (`assets/icon.ico`).
+
 ## [v1.0.0] - 2026-11-15
 
 ### Added
@@ -138,6 +145,7 @@ Initial release.
 - Audio thread drops to silence on lock contention (`Mutex::try_lock`)
 - Linux build needs ALSA/X11/Wayland dev packages (see README)
 
+[v1.0.1]: https://github.com/cotanjant/thunder/releases/tag/v1.0.1
 [v1.0.0]: https://github.com/cotanjant/thunder/releases/tag/v1.0.0
 [v0.3.0]: https://github.com/cotanjant/thunder/releases/tag/v0.3.0
 [v0.2.6]: https://github.com/cotanjant/thunder/releases/tag/v0.2.6
