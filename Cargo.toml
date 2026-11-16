@@ -37,7 +37,7 @@ clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "
 raw-window-handle = "0.6"
 
 [dev-dependencies]
-egui_kittest = "0.36"
+egui_kittest = "0.37"
 clap-sys = "0.5"
 
 [target.'cfg(windows)'.build-dependencies]
