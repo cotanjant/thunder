@@ -78,10 +78,13 @@ impl DockTab {
 }
 
 pub fn default_dock_state() -> DockState<DockTab> {
-    let mut dock = DockState::new(vec![DockTab::Playlist, DockTab::PianoRoll]);
+    let mut dock = DockState::new(vec![
+        DockTab::ChannelRack,
+        DockTab::PianoRoll,
+        DockTab::Playlist,
+    ]);
     let tree = dock.main_surface_mut();
-    let [_left, _right] = tree.split_right(NodeIndex::root(), 0.56, vec![DockTab::ChannelRack]);
-    let _ = tree.split_below(NodeIndex::root(), 0.62, vec![DockTab::Mixer]);
+    let _ = tree.split_below(NodeIndex::root(), 0.64, vec![DockTab::Mixer]);
     dock
 }
 
@@ -827,6 +830,13 @@ fn sync_one_tab(dock: &mut DockState<DockTab>, tab: DockTab, show: bool) {
     }
 }
 
+pub fn focus_dock_tab(dock: &mut DockState<DockTab>, tab: DockTab) {
+    if let Some(loc) = dock.find_tab(&tab) {
+        dock.set_focused_node_and_surface(loc.node_path());
+        let _ = dock.set_active_tab(loc);
+    }
+}
+
 pub fn sync_dock_tabs(ui: &mut AppUi) {
     sync_one_tab(&mut ui.dock_state, DockTab::Playlist, ui.show_playlist);
     sync_one_tab(&mut ui.dock_state, DockTab::ChannelRack, ui.show_rack);
@@ -837,7 +847,10 @@ pub fn sync_dock_tabs(ui: &mut AppUi) {
 
 pub fn show_dock_area(ui: &mut AppUi, state: &mut AppState, u: &mut egui::Ui) {
     let mut dock = std::mem::replace(&mut ui.dock_state, DockState::new(vec![]));
-    egui_dock::DockArea::new(&mut dock).show_inside(u, &mut ThunderTabViewer { ui, state });
+    let style = crate::ui_widgets::dock_style(u.style());
+    egui_dock::DockArea::new(&mut dock)
+        .style(style)
+        .show_inside(u, &mut ThunderTabViewer { ui, state });
     ui.dock_state = dock;
     sync_dock_tabs(ui);
 }
@@ -868,15 +881,19 @@ impl TabViewer for ThunderTabViewer<'_> {
         {
             self.ui.focus = tab.focus_panel();
         }
-        egui::ScrollArea::vertical()
-            .id_salt(("dock_tab_scroll", *tab))
-            .show(u, |u| match tab {
-                DockTab::Playlist => playlist(self.ui, self.state, u),
-                DockTab::ChannelRack => channel_rack(self.ui, self.state, u),
-                DockTab::PianoRoll => piano_roll(self.ui, self.state, u),
-                DockTab::Mixer => mixer(self.ui, self.state, u),
-                DockTab::MidiAudio => io_and_controllers_panel(self.ui, self.state, u),
-            });
+        if *tab == DockTab::PianoRoll {
+            piano_roll(self.ui, self.state, u);
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt(("dock_tab_scroll", *tab))
+                .show(u, |u| match tab {
+                    DockTab::Playlist => playlist(self.ui, self.state, u),
+                    DockTab::ChannelRack => channel_rack(self.ui, self.state, u),
+                    DockTab::PianoRoll => {}
+                    DockTab::Mixer => mixer(self.ui, self.state, u),
+                    DockTab::MidiAudio => io_and_controllers_panel(self.ui, self.state, u),
+                });
+        }
     }
 
     fn on_close(&mut self, tab: &mut Self::Tab) -> egui_dock::tab_viewer::OnCloseResponse {
@@ -1299,7 +1316,7 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
         ui.sel_insert = ui.sel_insert.min(s.song.mixer_tracks.len() - 1);
     }
 
-    u.horizontal(|u| {
+    u.horizontal_wrapped(|u| {
         u.menu_button("File", |u| {
             if u.button("New Empty").clicked() {
                 apply_loaded_song_to_ui(ui, s, crate::song::new_empty(), None);
@@ -1516,7 +1533,23 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             .on_hover_text("Spacebar works too")
             .clicked()
         {
-            s.set_playing(!playing);
+            let next = !playing;
+            s.set_playing(next);
+            if next {
+                if s.rt.song_mode && s.song.clips.is_empty() {
+                    ui.status =
+                        "Song mode has no Playlist clips: add clips or switch to Pat".into();
+                } else if !s.rt.song_mode
+                    && s.song
+                        .patterns
+                        .get(ui.sel_pat)
+                        .is_none_or(|p| p.notes.iter().all(|ns| ns.is_empty()))
+                {
+                    ui.status =
+                        "Pattern is empty: click steps in Channel Rack or Load Demo in Tutorial"
+                            .into();
+                }
+            }
         }
         if u.button("Tutorial")
             .on_hover_text("First-time walkthrough")
@@ -1561,13 +1594,20 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.midi_rec.reset_pass();
         }
         let take_secs = s.take_duration_secs();
-        u.label(format!(
-            "{}take {}:{:02}{}",
-            if s.rt.recording { "● " } else { "" },
-            take_secs / 60,
-            take_secs % 60,
-            if s.rt.take_full { " (full)" } else { "" }
-        ));
+        u.colored_label(
+            if s.rt.recording {
+                crate::ui_widgets::ACCENT_RED
+            } else {
+                crate::ui_widgets::TEXT_MUTED
+            },
+            format!(
+                "{}take {}:{:02}{}",
+                if s.rt.recording { "● " } else { "" },
+                take_secs / 60,
+                take_secs % 60,
+                if s.rt.take_full { " (full)" } else { "" }
+            ),
+        );
         // Song / pattern mode.
         let mut song_mode = s.rt.song_mode;
         if u.selectable_label(song_mode, "Song")
@@ -1632,7 +1672,12 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.status = "pattern deleted".into();
         }
         let mut bpm = s.song.bpm;
-        u.add(egui::Slider::new(&mut bpm, 60.0..=200.0).text("BPM"));
+        u.add(
+            egui::DragValue::new(&mut bpm)
+                .range(60.0..=200.0)
+                .speed(0.4)
+                .suffix(" BPM"),
+        );
         if (bpm - s.song.bpm).abs() > f32::EPSILON {
             s.song.bpm = bpm;
         }
@@ -1654,42 +1699,78 @@ pub fn transport(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             }
         }
         let mut swing = s.song.swing;
-        u.add(egui::Slider::new(&mut swing, 0.0..=0.6).text("Swing"));
-        if (swing - s.song.swing).abs() > f32::EPSILON {
+        if crate::ui_widgets::daw_knob(
+            u,
+            &mut swing,
+            0.0..=0.6,
+            0.0,
+            "Swg",
+            crate::ui_widgets::ACCENT_AMBER,
+        )
+        .on_hover_text(format!(
+            "Swing: {:.0}% (double-click to reset)",
+            swing * 100.0
+        ))
+        .changed()
+        {
             s.song.swing = swing;
         }
-        let mut metro = s.song.metronome;
-        u.toggle_value(&mut metro, "Click");
-        s.song.metronome = metro;
-        let mut lp = s.song.loop_song;
-        u.toggle_value(&mut lp, "Loop");
-        s.song.loop_song = lp;
+        if crate::ui_widgets::led_toggle(
+            u,
+            s.song.metronome,
+            "Click",
+            crate::ui_widgets::ACCENT_AMBER,
+            egui::vec2(42.0, 22.0),
+        )
+        .on_hover_text("Toggle metronome click")
+        .clicked()
+        {
+            s.song.metronome = !s.song.metronome;
+        }
+        if crate::ui_widgets::led_toggle(
+            u,
+            s.song.loop_song,
+            "Loop",
+            crate::ui_widgets::ACCENT_GREEN,
+            egui::vec2(40.0, 22.0),
+        )
+        .on_hover_text("Toggle song loop")
+        .clicked()
+        {
+            s.song.loop_song = !s.song.loop_song;
+        }
         let mut master = s.song.master_vol;
-        let m_resp = u.add(egui::Slider::new(&mut master, 0.0..=1.5).text("Master"));
+        let m_resp = u.add(
+            egui::Slider::new(&mut master, 0.0..=1.5)
+                .text("Master")
+                .fixed_decimals(2),
+        );
         s.song.master_vol = master;
         param_context_menu(&m_resp, ui, s, AutoTarget::MasterVol);
         // Position readout.
         let tick = s.rt.tick_pos.max(0.0) as u64;
         let bar_ticks = s.song.time_sig.ticks_per_bar().max(1) as u64;
         let beat_ticks = s.song.time_sig.ticks_per_beat().max(1) as u64;
-        u.label(format!(
-            "{:02}:{:01}:{:02}",
-            tick / bar_ticks + 1,
-            (tick % bar_ticks) / beat_ticks + 1,
-            tick % beat_ticks
-        ));
-        u.add(
-            egui::ProgressBar::new(s.rt.peak.clamp(0.0, 1.0))
-                .text(format!("{:.0}%", s.rt.peak * 100.0)),
+        u.label(
+            egui::RichText::new(format!(
+                "{:02}:{:01}:{:02}",
+                tick / bar_ticks + 1,
+                (tick % bar_ticks) / beat_ticks + 1,
+                tick % beat_ticks
+            ))
+            .monospace()
+            .strong()
+            .color(crate::ui_widgets::ACCENT_GREEN),
         );
+        crate::ui_widgets::draw_peak_meter_h(u, s.rt.peak, 74.0, 16.0);
         if s.rt.xruns > 0 {
             u.colored_label(
-                egui::Color32::from_rgb(230, 160, 60),
+                crate::ui_widgets::ACCENT_AMBER,
                 format!("xruns:{}", s.rt.xruns),
             );
         }
     });
-    u.horizontal(|u| {
+    u.horizontal_wrapped(|u| {
         // Active pattern & project time signature bar.
         if let Some(pdata) = s.song.patterns.get_mut(ui.sel_pat) {
             u.label("Pat name:");
@@ -2385,27 +2466,70 @@ pub fn channel_rack(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             };
             egui::ScrollArea::horizontal()
                 .id_salt(format!("steps_scroll_{i}"))
-                .max_height(28.0)
+                .max_height(30.0)
                 .show(u, |u| {
-                    u.horizontal(|u| {
-                        for step in 0..pat_steps {
-                            let active = s.song.step_active(pat, i, step);
-                            let mut btn = egui::Button::new(format!("{}", step + 1))
-                                .min_size(egui::vec2(24.0, 22.0));
-                            if active && playing_step == Some(step) {
-                                btn = btn.fill(egui::Color32::LIGHT_GREEN);
-                            } else if active {
-                                btn = btn.fill(egui::Color32::DARK_GREEN);
-                            } else if playing_step == Some(step) {
-                                btn = btn.fill(egui::Color32::from_rgb(90, 70, 20));
-                            } else if (step / beat_steps).is_multiple_of(2) {
-                                btn = btn.fill(egui::Color32::from_rgb(55, 55, 60));
-                            }
-                            if u.add(btn).clicked() {
-                                s.song.toggle_step(pat, i, step);
-                            }
-                        }
-                    });
+                    let step_w = 24.0;
+                    let step_gap = 2.0;
+                    let pad_h = 22.0;
+                    let total_w = pat_steps as f32 * (step_w + step_gap);
+                    let (grid_rect, grid_resp) = u.allocate_exact_size(
+                        egui::vec2(total_w, pad_h),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let painter = u.painter_at(grid_rect);
+                    let hover_pos = grid_resp.hover_pos();
+                    for step in 0..pat_steps {
+                        let x = grid_rect.min.x + step as f32 * (step_w + step_gap);
+                        let pad = egui::Rect::from_min_size(
+                            egui::pos2(x, grid_rect.min.y),
+                            egui::vec2(step_w, pad_h),
+                        );
+                        let active = s.song.step_active(pat, i, step);
+                        let playhead = playing_step == Some(step);
+                        let beat_alt = (step / beat_steps).is_multiple_of(2);
+                        let hov = hover_pos.is_some_and(|p| pad.contains(p));
+                        crate::ui_widgets::draw_step_pad(
+                            &painter, pad, active, playhead, beat_alt, hov, ch_color,
+                        );
+                    }
+                    let step_at = |x: f32| {
+                        (((x - grid_rect.min.x) / (step_w + step_gap)).floor() as usize)
+                            .min(pat_steps.saturating_sub(1))
+                    };
+                    let paint_id = u.make_persistent_id(("step_drag_mode", i));
+                    if grid_resp.drag_started_by(egui::PointerButton::Primary)
+                        && let Some(pos) = u.ctx().input(|inp| inp.pointer.press_origin())
+                    {
+                        let st = step_at(pos.x);
+                        let mode = !s.song.step_active(pat, i, st);
+                        u.ctx().data_mut(|d| d.insert_temp(paint_id, mode));
+                        s.song.set_step(pat, i, st, mode);
+                    } else if grid_resp.dragged_by(egui::PointerButton::Primary)
+                        && let Some(pos) = hover_pos
+                    {
+                        let st = step_at(pos.x);
+                        let mode = u
+                            .ctx()
+                            .data(|d| d.get_temp::<bool>(paint_id))
+                            .unwrap_or(true);
+                        s.song.set_step(pat, i, st, mode);
+                    } else if grid_resp.dragged_by(egui::PointerButton::Secondary)
+                        && let Some(pos) = hover_pos
+                    {
+                        let st = step_at(pos.x);
+                        s.song.set_step(pat, i, st, false);
+                    } else if grid_resp.clicked_by(egui::PointerButton::Secondary)
+                        && let Some(pos) = hover_pos
+                    {
+                        let st = step_at(pos.x);
+                        s.song.set_step(pat, i, st, false);
+                    } else if grid_resp.clicked()
+                        && !grid_resp.drag_stopped()
+                        && let Some(pos) = hover_pos
+                    {
+                        let st = step_at(pos.x);
+                        s.song.toggle_step(pat, i, st);
+                    }
                 });
         });
         if let Some(payload) = row_resp
@@ -3358,6 +3482,8 @@ fn preview_channel(s: &mut AppState, i: usize) {
 
 const PIANO_ROWS: u8 = 37;
 const KEY_W: f32 = 52.0;
+const PIANO_CELL_H: f32 = 15.0;
+const PIANO_RULER_H: f32 = 20.0;
 
 fn piano_midi_range(bot: u8) -> (u8, u8) {
     let top = (bot + PIANO_ROWS - 1).min(108);
@@ -3705,19 +3831,84 @@ fn piano_canvas(
     pat: usize,
     u: &mut egui::Ui,
 ) -> egui::Rect {
-    let zoomed = (ui.piano_zoom_x - 1.0).abs() > 0.01 || (ui.piano_zoom_y - 1.0).abs() > 0.01;
     let avail_w = u.available_width().max(300.0);
-    if !zoomed {
-        piano_canvas_inner(ui, s, ch, pat, avail_w, u)
-    } else {
-        let mut out_rect = egui::Rect::NOTHING;
-        egui::ScrollArea::both()
-            .id_salt("piano_scroll")
-            .max_height(420.0)
-            .show(u, |u| {
+    let scroll_h = (u.available_height() - 145.0).max(240.0);
+    let mut out_rect = egui::Rect::NOTHING;
+    egui::ScrollArea::both()
+        .id_salt("piano_scroll")
+        .max_height(scroll_h)
+        .show(u, |u| {
+            u.vertical(|u| {
+                u.spacing_mut().item_spacing.y = 0.0;
+                piano_ruler(ui, s, pat, avail_w, u);
                 out_rect = piano_canvas_inner(ui, s, ch, pat, avail_w, u);
             });
-        out_rect
+        });
+    out_rect
+}
+
+fn piano_ruler(ui: &mut AppUi, s: &mut AppState, pat: usize, base_avail_w: f32, u: &mut egui::Ui) {
+    let pdata = &s.song.patterns[pat];
+    let pat_ticks = pdata.len_ticks().max(1);
+    let bar_ticks = pdata.time_sig.ticks_per_bar().max(1);
+    let beat_ticks = pdata.time_sig.ticks_per_beat().max(1);
+    let base_cell_w = (base_avail_w - KEY_W) / pat_ticks as f32;
+    let cell_w = base_cell_w * ui.piano_zoom_x;
+    let total_w = KEY_W + pat_ticks as f32 * cell_w;
+    let (rect, resp) = u.allocate_exact_size(
+        egui::vec2(total_w, PIANO_RULER_H),
+        egui::Sense::click_and_drag(),
+    );
+    let p = u.painter_at(rect);
+    p.rect_filled(rect, 0.0, crate::ui_widgets::BG_DEEP);
+    p.rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(KEY_W, PIANO_RULER_H)),
+        0.0,
+        crate::ui_widgets::BG_PANEL,
+    );
+    p.text(
+        egui::pos2(rect.min.x + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("P{}", pat + 1),
+        egui::FontId::proportional(10.0),
+        crate::ui_widgets::TEXT_MUTED,
+    );
+    for t in 0..pat_ticks {
+        let x = rect.min.x + KEY_W + t as f32 * cell_w;
+        if t.is_multiple_of(bar_ticks) {
+            p.line_segment(
+                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                egui::Stroke::new(1.0, crate::ui_widgets::BORDER_STRONG),
+            );
+            p.text(
+                egui::pos2(x + 4.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("{}", t / bar_ticks + 1),
+                egui::FontId::monospace(10.0),
+                crate::ui_widgets::TEXT_PRIMARY,
+            );
+        } else if t.is_multiple_of(beat_ticks) {
+            p.line_segment(
+                [egui::pos2(x, rect.max.y - 6.0), egui::pos2(x, rect.max.y)],
+                egui::Stroke::new(1.0, crate::ui_widgets::BORDER_SUBTLE),
+            );
+        }
+    }
+    if s.rt.playing && s.rt.cur_pat == pat {
+        let px = rect.min.x + KEY_W + s.rt.cur_tick.min(pat_ticks - 1) as f32 * cell_w;
+        p.line_segment(
+            [egui::pos2(px, rect.min.y), egui::pos2(px, rect.max.y)],
+            egui::Stroke::new(2.0, crate::ui_widgets::ACCENT_GREEN),
+        );
+    }
+    if (resp.clicked() || resp.dragged())
+        && let Some(pos) = resp.interact_pointer_pos()
+        && pos.x >= rect.min.x + KEY_W
+    {
+        let raw = ((pos.x - rect.min.x - KEY_W) / cell_w)
+            .floor()
+            .clamp(0.0, (pat_ticks - 1) as f32) as u32;
+        s.seek_tick(raw);
     }
 }
 
@@ -3738,7 +3929,7 @@ fn piano_canvas_inner(
     let max_tick = (pat_ticks - 1) as i32;
     let base_cell_w = (base_avail_w - KEY_W) / pat_ticks as f32;
     let cell_w = base_cell_w * ui.piano_zoom_x;
-    let cell_h = 9.0 * ui.piano_zoom_y;
+    let cell_h = PIANO_CELL_H * ui.piano_zoom_y;
     let total_w = KEY_W + pat_ticks as f32 * cell_w;
     let total_h = rows as f32 * cell_h;
     let (rect, resp) =
@@ -3764,16 +3955,23 @@ fn piano_canvas_inner(
     let y_of = |midi: u8| rect.min.y + (midi_hi - midi) as f32 * cell_h;
 
     // Scale shading + key strip.
+    let hovered_midi = resp
+        .hover_pos()
+        .map(|p| midi_at(p.y))
+        .filter(|&m| m >= midi_lo as i32 && m <= midi_hi as i32);
     for r in 0..rows {
         let midi = midi_hi - r as u8;
         let y = rect.min.y + r as f32 * cell_h;
+        let is_hovered_row = hovered_midi == Some(midi as i32);
         let in_scale = ui.scale.contains(midi % 12, ui.root);
-        let row_col = if !in_scale {
-            egui::Color32::from_gray(22)
+        let row_col = if is_hovered_row {
+            egui::Color32::from_rgb(42, 47, 58)
+        } else if !in_scale {
+            egui::Color32::from_gray(20)
         } else if midi.is_multiple_of(12) {
-            egui::Color32::from_rgb(34, 34, 40)
+            egui::Color32::from_rgb(33, 36, 46)
         } else {
-            egui::Color32::from_gray(28)
+            egui::Color32::from_rgb(26, 29, 36)
         };
         painter.rect_filled(
             egui::Rect::from_min_size(
@@ -3783,14 +3981,34 @@ fn piano_canvas_inner(
             0.0,
             row_col,
         );
+        painter.line_segment(
+            [
+                egui::pos2(rect.min.x + KEY_W, y + cell_h),
+                egui::pos2(rect.max.x, y + cell_h),
+            ],
+            egui::Stroke::new(
+                1.0,
+                if midi.is_multiple_of(12) {
+                    crate::ui_widgets::BORDER_STRONG
+                } else {
+                    egui::Color32::from_gray(32)
+                },
+            ),
+        );
         let black = matches!(midi % 12, 1 | 3 | 6 | 8 | 10);
         painter.rect_filled(
             egui::Rect::from_min_size(egui::pos2(rect.min.x, y), egui::vec2(KEY_W, cell_h)),
             0.0,
-            if black {
-                egui::Color32::BLACK
+            if is_hovered_row {
+                if black {
+                    egui::Color32::from_rgb(65, 76, 94)
+                } else {
+                    egui::Color32::from_rgb(232, 240, 250)
+                }
+            } else if black {
+                egui::Color32::from_rgb(26, 29, 36)
             } else {
-                egui::Color32::from_gray(200)
+                egui::Color32::from_rgb(208, 212, 222)
             },
         );
         if midi.is_multiple_of(12) {
@@ -3983,7 +4201,21 @@ fn piano_canvas_inner(
         }
     }
 
-    if resp.drag_started()
+    if resp.drag_started_by(egui::PointerButton::Secondary)
+        && let Some(p0) = origin
+    {
+        ui.focus = FocusPanel::PianoRoll;
+        let t0 = tick_at(p0.x);
+        let m0 = midi_at(p0.y);
+        if in_grid(t0, m0)
+            && let Some(idx) = hit_note(t0, m0)
+            && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+            && idx < notes.len()
+        {
+            notes.remove(idx);
+            ui.sel_notes.clear();
+        }
+    } else if resp.drag_started()
         && let Some(p0) = origin
     {
         ui.focus = FocusPanel::PianoRoll;
@@ -4046,7 +4278,9 @@ fn piano_canvas_inner(
                             && let Some(anchor) = notes.get(anchor_idx)
                         {
                             let right_edge = x_of(anchor.tick + anchor.len);
-                            let kind = if p0.x > right_edge - 7.0 {
+                            let note_px_w = (right_edge - x_of(anchor.tick)).max(1.0);
+                            let resize_margin = (note_px_w * 0.35).clamp(3.0, 7.0);
+                            let kind = if p0.x >= right_edge - resize_margin {
                                 DragKind::Resize
                             } else {
                                 DragKind::Move
@@ -4166,19 +4400,19 @@ fn piano_canvas_inner(
                     tool_slice_at(notes, cut, Some(m as u8));
                 }
             }
-        }
-    } else if ui.tool == PianoTool::Erase
-        && let Some(pos) = resp.hover_pos()
-    {
-        let t = tick_at(pos.x);
-        let m = midi_at(pos.y);
-        if in_grid(t, m)
-            && let Some(idx) = hit_note(t, m)
-            && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
-            && idx < notes.len()
+        } else if (ui.tool == PianoTool::Erase || resp.dragged_by(egui::PointerButton::Secondary))
+            && let Some(pos) = resp.hover_pos()
         {
-            notes.remove(idx);
-            ui.sel_notes.clear();
+            let t = tick_at(pos.x);
+            let m = midi_at(pos.y);
+            if in_grid(t, m)
+                && let Some(idx) = hit_note(t, m)
+                && let Some(notes) = s.song.patterns[pat].notes.get_mut(ch)
+                && idx < notes.len()
+            {
+                notes.remove(idx);
+                ui.sel_notes.clear();
+            }
         }
     }
 
@@ -4815,7 +5049,9 @@ pub fn tutorial(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
     }
     let mut close = false;
     egui::Window::new("Welcome to Thunder")
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)
+        .resizable(false)
         .show(u.ctx(), |w| {
             w.label("Make your first beat in two minutes:");
             w.label("1. Channel rack: click the numbered boxes to place kick, snare, hat hits.");
@@ -5289,6 +5525,8 @@ pub fn playlist(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
             ui.sel_pat = pattern.min(s.song.patterns.len().saturating_sub(1));
             s.select_pattern(ui.sel_pat);
             ui.show_piano = true;
+            sync_dock_tabs(ui);
+            focus_dock_tab(&mut ui.dock_state, DockTab::PianoRoll);
             ui.status = format!("editing P{}", ui.sel_pat + 1);
         }
 
@@ -6093,16 +6331,13 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                     let is_sel = ui.sel_insert == i;
                     let is_linked = linked_ins == i;
                     u.group(|u| {
-                        u.vertical(|u| {
+                        u.set_width(82.0);
+                        u.vertical_centered(|u| {
                             let label = if is_linked {
                                 format!("* {}", s.song.mixer_tracks[i].name)
                             } else {
                                 s.song.mixer_tracks[i].name.clone()
                             };
-                            if u.selectable_label(is_sel, label).clicked() {
-                                ui.sel_insert = i;
-                                s.set_inspect_insert(i);
-                            }
                             let peak =
                                 s.rt.mix_peaks
                                     .get(i)
@@ -6112,43 +6347,14 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                             let rms = s.rt.mix_rms.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                             let clipped = s.rt.mix_clips.get(i).copied().unwrap_or(false);
                             u.horizontal(|u| {
-                                let (mrect, _) = u.allocate_exact_size(
-                                    egui::vec2(52.0, 9.0),
-                                    egui::Sense::hover(),
-                                );
-                                let mp = u.painter_at(mrect);
-                                mp.rect_filled(mrect, 1.0, egui::Color32::from_gray(28));
-                                if peak > 0.003 {
-                                    let col = if peak > 0.9 {
-                                        egui::Color32::from_rgb(220, 70, 60)
-                                    } else if peak > 0.65 {
-                                        egui::Color32::from_rgb(220, 180, 60)
-                                    } else {
-                                        egui::Color32::from_rgb(90, 200, 100)
-                                    };
-                                    mp.rect_filled(
-                                        egui::Rect::from_min_size(
-                                            mrect.min,
-                                            egui::vec2(mrect.width() * peak, 5.0),
-                                        ),
-                                        1.0,
-                                        col,
-                                    );
-                                }
-                                if rms > 0.003 {
-                                    mp.rect_filled(
-                                        egui::Rect::from_min_size(
-                                            egui::pos2(mrect.min.x, mrect.min.y + 5.0),
-                                            egui::vec2(mrect.width() * rms, 4.0),
-                                        ),
-                                        1.0,
-                                        egui::Color32::from_rgb(80, 165, 225),
-                                    );
+                                if u.selectable_label(is_sel, label).clicked() {
+                                    ui.sel_insert = i;
+                                    s.set_inspect_insert(i);
                                 }
                                 let clip_col = if clipped {
-                                    egui::Color32::from_rgb(225, 60, 60)
+                                    crate::ui_widgets::ACCENT_RED
                                 } else {
-                                    egui::Color32::from_gray(55)
+                                    crate::ui_widgets::TEXT_MUTED
                                 };
                                 if u.add(
                                     egui::Button::new(
@@ -6163,46 +6369,123 @@ pub fn mixer(ui: &mut AppUi, s: &mut AppState, u: &mut egui::Ui) {
                                 }
                             });
                             u.horizontal(|u| {
-                                u.toggle_value(&mut s.song.mixer_tracks[i].mute, "M");
-                                u.toggle_value(&mut s.song.mixer_tracks[i].solo, "S");
-                                u.toggle_value(&mut s.song.mixer_tracks[i].polarity_inv, "Ø")
-                                    .on_hover_text("Polarity invert");
+                                if crate::ui_widgets::led_toggle(
+                                    u,
+                                    s.song.mixer_tracks[i].mute,
+                                    "M",
+                                    crate::ui_widgets::ACCENT_RED,
+                                    egui::vec2(21.0, 18.0),
+                                )
+                                .on_hover_text("Mute insert")
+                                .clicked()
+                                {
+                                    s.song.mixer_tracks[i].mute = !s.song.mixer_tracks[i].mute;
+                                }
+                                if crate::ui_widgets::led_toggle(
+                                    u,
+                                    s.song.mixer_tracks[i].solo,
+                                    "S",
+                                    crate::ui_widgets::ACCENT_AMBER,
+                                    egui::vec2(21.0, 18.0),
+                                )
+                                .on_hover_text("Solo insert")
+                                .clicked()
+                                {
+                                    s.song.mixer_tracks[i].solo = !s.song.mixer_tracks[i].solo;
+                                }
+                                if crate::ui_widgets::led_toggle(
+                                    u,
+                                    s.song.mixer_tracks[i].polarity_inv,
+                                    "Ø",
+                                    crate::ui_widgets::ACCENT_BLUE,
+                                    egui::vec2(21.0, 18.0),
+                                )
+                                .on_hover_text("Polarity invert")
+                                .clicked()
+                                {
+                                    s.song.mixer_tracks[i].polarity_inv =
+                                        !s.song.mixer_tracks[i].polarity_inv;
+                                }
                             });
-                            let vol_r = u.add(
-                                egui::Slider::new(&mut s.song.mixer_tracks[i].volume, 0.0..=1.5)
-                                    .vertical()
-                                    .text("vol"),
-                            );
+                            let vol_r = crate::ui_widgets::daw_fader_meter(
+                                u,
+                                &mut s.song.mixer_tracks[i].volume,
+                                crate::ui_widgets::FaderSpec {
+                                    range: 0.0..=1.5,
+                                    default: 1.0,
+                                    peak,
+                                    rms,
+                                    accent: crate::ui_widgets::ACCENT_GREEN,
+                                    height: 110.0,
+                                },
+                            )
+                            .on_hover_text("Insert gain (double-click to reset)");
                             collect_param_ctx(&vol_r, AutoTarget::InsertVol(i), &mut mix_ctx_act);
-                            u.label(fx::format_db(s.song.mixer_tracks[i].volume));
-                            let pan_r = u.add(
-                                egui::Slider::new(&mut s.song.mixer_tracks[i].pan, -1.0..=1.0)
-                                    .text("pan"),
+                            u.label(
+                                egui::RichText::new(fx::format_db(s.song.mixer_tracks[i].volume))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(crate::ui_widgets::TEXT_MUTED),
                             );
-                            collect_param_ctx(&pan_r, AutoTarget::InsertPan(i), &mut mix_ctx_act);
-                            u.add(
-                                egui::Slider::new(
+                            u.horizontal(|u| {
+                                let pan_r = crate::ui_widgets::daw_knob(
+                                    u,
+                                    &mut s.song.mixer_tracks[i].pan,
+                                    -1.0..=1.0,
+                                    0.0,
+                                    "Pan",
+                                    crate::ui_widgets::ACCENT_BLUE,
+                                )
+                                .on_hover_text(format!(
+                                    "Pan: {:+.0}%",
+                                    s.song.mixer_tracks[i].pan * 100.0
+                                ));
+                                collect_param_ctx(
+                                    &pan_r,
+                                    AutoTarget::InsertPan(i),
+                                    &mut mix_ctx_act,
+                                );
+                                crate::ui_widgets::daw_knob(
+                                    u,
                                     &mut s.song.mixer_tracks[i].stereo_sep,
                                     -1.0..=1.0,
+                                    0.0,
+                                    "Sep",
+                                    crate::ui_widgets::ACCENT_AMBER,
                                 )
-                                .text("sep"),
-                            );
-                            u.add(
-                                egui::Slider::new(
+                                .on_hover_text(format!(
+                                    "Stereo separation: {:+.0}%",
+                                    s.song.mixer_tracks[i].stereo_sep * 100.0
+                                ));
+                            });
+                            u.horizontal(|u| {
+                                crate::ui_widgets::daw_knob(
+                                    u,
                                     &mut s.song.mixer_tracks[i].delay_send,
                                     0.0..=1.0,
+                                    0.0,
+                                    "Dly",
+                                    crate::ui_widgets::ACCENT_GREEN,
                                 )
-                                .text("dly"),
-                            );
-                            u.add(
-                                egui::Slider::new(
+                                .on_hover_text(format!(
+                                    "Delay send: {:.0}%",
+                                    s.song.mixer_tracks[i].delay_send * 100.0
+                                ));
+                                crate::ui_widgets::daw_knob(
+                                    u,
                                     &mut s.song.mixer_tracks[i].reverb_send,
                                     0.0..=1.0,
+                                    0.0,
+                                    "Vrb",
+                                    crate::ui_widgets::ACCENT_GREEN,
                                 )
-                                .text("vrb"),
-                            );
+                                .on_hover_text(format!(
+                                    "Reverb send: {:.0}%",
+                                    s.song.mixer_tracks[i].reverb_send * 100.0
+                                ));
+                            });
                             let total_lat = pdc.total_out.get(i).copied().unwrap_or(0);
-                            u.label(format!(
+                            u.small(format!(
                                 "pdc:{total_lat} ({} fx)",
                                 s.song.mixer_tracks[i].fx.len()
                             ));
@@ -7399,7 +7682,7 @@ mod ui_tests {
         let (_, midi_hi) = piano_midi_range(40);
         egui::pos2(
             rect.min.x + KEY_W + (tick as f32 + 0.5) * cell_w,
-            rect.min.y + (midi_hi - midi) as f32 * 9.0 + 4.5,
+            rect.min.y + (midi_hi - midi) as f32 * PIANO_CELL_H + PIANO_CELL_H * 0.5,
         )
     }
 
@@ -7486,7 +7769,7 @@ mod ui_tests {
         let rect = h.state().rect.expect("canvas rect recorded");
         let cell_w = (rect.width() - KEY_W) / 64.0;
         let (_, midi_hi) = piano_midi_range(40);
-        let y = rect.min.y + (midi_hi - 60) as f32 * 9.0 + 4.5;
+        let y = rect.min.y + (midi_hi - 60) as f32 * PIANO_CELL_H + PIANO_CELL_H * 0.5;
         let from = egui::pos2(rect.min.x + KEY_W + 12.0 * cell_w - 3.0, y);
         let to = egui::pos2(rect.min.x + KEY_W + 16.5 * cell_w, y);
         h.hover_at(from);
@@ -8210,6 +8493,56 @@ mod ui_tests {
                 .get(&fx_rt_id)
                 .and_then(|s| s.load_error.as_ref())
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn piano_erase_tool_hover_does_not_delete_note() {
+        let mut state = TestState {
+            ui: AppUi::default(),
+            app: AppState::new(),
+            rect: None,
+        };
+        state.ui.tool = PianoTool::Erase;
+        state.app.song.patterns[0].notes[4].push(Note::new(8, 4, 60, 0.9));
+        let mut h = Harness::new_ui_state(
+            |u: &mut egui::Ui, st: &mut TestState| {
+                let r = piano_canvas(&mut st.ui, &mut st.app, 4, 0, u);
+                st.rect = Some(r);
+            },
+            state,
+        );
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.step();
+
+        let pos = cell_center(&h, 8, 60);
+        h.hover_at(pos);
+        h.step();
+        assert_eq!(
+            h.state().app.song.patterns[0].notes[4].len(),
+            1,
+            "hovering with Erase tool must not delete notes"
+        );
+
+        click_at(&mut h, pos);
+        assert!(
+            h.state().app.song.patterns[0].notes[4].is_empty(),
+            "clicking with Erase tool must delete the note"
+        );
+    }
+
+    #[test]
+    fn focus_dock_tab_selects_active_tab() {
+        let mut dock = default_dock_state();
+        focus_dock_tab(&mut dock, DockTab::Playlist);
+        assert_eq!(
+            dock.find_active_focused().map(|(_, t)| *t),
+            Some(DockTab::Playlist)
+        );
+        focus_dock_tab(&mut dock, DockTab::PianoRoll);
+        assert_eq!(
+            dock.find_active_focused().map(|(_, t)| *t),
+            Some(DockTab::PianoRoll)
         );
     }
 }

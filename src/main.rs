@@ -14,6 +14,7 @@ mod project;
 mod song;
 mod synth;
 mod ui;
+mod ui_widgets;
 
 use engine::{AppState, start_audio};
 use raw_window_handle::HasWindowHandle;
@@ -25,28 +26,17 @@ struct DawApp {
     ui: AppUi,
 }
 
-/// FL Studio look: near-black blue-gray, green LEDs and selections.
-fn fl_visuals() -> eframe::egui::Visuals {
-    let mut v = eframe::egui::Visuals::dark();
-    let bg = eframe::egui::Color32::from_rgb(24, 27, 33);
-    let panel = eframe::egui::Color32::from_rgb(18, 20, 25);
-    v.override_text_color = Some(eframe::egui::Color32::from_rgb(225, 228, 232));
-    v.window_fill = panel;
-    v.panel_fill = panel;
-    v.faint_bg_color = bg;
-    v.extreme_bg_color = eframe::egui::Color32::from_rgb(12, 13, 16);
-    v.selection.bg_fill = eframe::egui::Color32::from_rgb(46, 120, 52);
-    v.widgets.noninteractive.bg_fill = bg;
-    v.widgets.inactive.bg_fill = eframe::egui::Color32::from_rgb(44, 49, 58);
-    v.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(58, 64, 76);
-    v.widgets.active.bg_fill = eframe::egui::Color32::from_rgb(52, 110, 58);
-    v
-}
-
 impl eframe::App for DawApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(33));
+        let active_repaint = self.state.rt.playing
+            || self.state.rt.recording
+            || ui.ctx().input(|i| i.pointer.any_down());
+        if active_repaint {
+            ui.ctx().request_repaint();
+        } else {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
+        }
         self.ui.parent_window = frame.window_handle().ok().map(|h| h.as_raw());
         self.state.sync_audio();
         ui::sync_clap_plugins(&mut self.ui, &mut self.state);
@@ -91,31 +81,90 @@ impl eframe::App for DawApp {
         ui::process_typing_piano(&mut self.ui, &mut self.state, ui.ctx());
         ui::handle_workspace_shortcuts(&mut self.ui, &mut self.state, ui.ctx());
         ui::sync_dock_tabs(&mut self.ui);
-        eframe::egui::Panel::top("transport").show(ui, |u| {
-            ui::transport(&mut self.ui, &mut self.state, u);
-        });
+
+        let top_frame = eframe::egui::Frame::new()
+            .fill(ui_widgets::BG_PANEL)
+            .inner_margin(eframe::egui::Margin::symmetric(8, 4))
+            .stroke(eframe::egui::Stroke::new(1.0, ui_widgets::BORDER_SUBTLE));
+        eframe::egui::Panel::top("transport")
+            .frame(top_frame)
+            .show(ui, |u| {
+                ui::transport(&mut self.ui, &mut self.state, u);
+            });
         if self.ui.show_browser {
+            let side_frame = eframe::egui::Frame::new()
+                .fill(ui_widgets::BG_PANEL)
+                .inner_margin(eframe::egui::Margin::same(6))
+                .stroke(eframe::egui::Stroke::new(1.0, ui_widgets::BORDER_SUBTLE));
             eframe::egui::Panel::left("browser")
-                .default_size(240.0)
+                .frame(side_frame)
+                .default_size(230.0)
+                .min_size(180.0)
+                .max_size(340.0)
                 .show(ui, |u| {
                     eframe::egui::ScrollArea::vertical().show(u, |u| {
                         ui::browser(&mut self.ui, &mut self.state, u);
                     });
                 });
         }
-        eframe::egui::Panel::bottom("hint").show(ui, |u| {
-            u.horizontal(|u| {
-                if self.ui.typing_piano {
-                    u.strong(format!("[Keys C{}]", self.ui.typing_octave));
+        let bot_frame = eframe::egui::Frame::new()
+            .fill(ui_widgets::BG_DEEP)
+            .inner_margin(eframe::egui::Margin::symmetric(8, 3))
+            .stroke(eframe::egui::Stroke::new(1.0, ui_widgets::BORDER_SUBTLE));
+        eframe::egui::Panel::bottom("hint")
+            .frame(bot_frame)
+            .show(ui, |u| {
+                u.horizontal(|u| {
+                    let audio_ok = self.state.audio.is_some();
+                    u.colored_label(
+                        if audio_ok {
+                            ui_widgets::ACCENT_GREEN
+                        } else {
+                            ui_widgets::ACCENT_AMBER
+                        },
+                        if audio_ok {
+                            "● Audio"
+                        } else {
+                            "○ No Audio"
+                        },
+                    );
                     u.separator();
-                }
-                u.label(format!("status: {}", self.ui.status));
+                    if self.ui.typing_piano {
+                        u.colored_label(
+                            ui_widgets::ACCENT_BLUE,
+                            format!("[Keys C{}]", self.ui.typing_octave),
+                        );
+                        u.separator();
+                    }
+                    let ch_name = self
+                        .state
+                        .song
+                        .channels
+                        .get(self.ui.sel_ch)
+                        .map(|c| c.name.as_str())
+                        .unwrap_or("-");
+                    u.label(
+                        eframe::egui::RichText::new(format!(
+                            "Ch: {ch_name}  |  P{}  |  {:.0} BPM",
+                            self.ui.sel_pat + 1,
+                            self.state.song.bpm
+                        ))
+                        .color(ui_widgets::TEXT_MUTED)
+                        .small(),
+                    );
+                    u.separator();
+                    u.label(
+                        eframe::egui::RichText::new(&self.ui.status)
+                            .color(ui_widgets::TEXT_PRIMARY),
+                    );
+                });
             });
-        });
-        eframe::egui::CentralPanel::default().show(ui, |u| {
-            ui::tutorial(&mut self.ui, &mut self.state, u);
-            ui::show_dock_area(&mut self.ui, &mut self.state, u);
-        });
+        eframe::egui::CentralPanel::default()
+            .frame(eframe::egui::Frame::new().fill(ui_widgets::BG_DEEP))
+            .show(ui, |u| {
+                ui::tutorial(&mut self.ui, &mut self.state, u);
+                ui::show_dock_area(&mut self.ui, &mut self.state, u);
+            });
         ui::edison_window(&mut self.ui, &mut self.state, ui.ctx());
         ui::export_window(&mut self.ui, &mut self.state, ui.ctx());
         ui::recovery_window(&mut self.ui, &mut self.state, ui.ctx());
@@ -194,12 +243,18 @@ fn main() {
             project::mark_session_active(&d);
         }
     }
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1360.0, 840.0])
+            .with_min_inner_size([980.0, 640.0])
+            .with_icon(std::sync::Arc::new(ui_widgets::build_app_icon())),
+        ..Default::default()
+    };
     if let Err(e) = eframe::run_native(
         "Thunder",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(fl_visuals());
+            ui_widgets::apply_studio_theme(&cc.egui_ctx);
             Ok(Box::new(DawApp {
                 state,
                 ui: app_ui,

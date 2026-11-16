@@ -2629,9 +2629,20 @@ impl EngineRt {
     }
 
     pub fn reset_transport(&mut self) {
-        self.sample_pos = 0;
-        self.tick_pos = 0.0;
-        self.cur_tick = 0;
+        self.seek_tick_raw(0, 0);
+        self.recording = false;
+    }
+
+    pub fn seek_tick(&mut self, tick: u32, song: &Song) {
+        let spt = (self.sr * 60.0 / song.bpm.max(30.0) / 16.0).max(1.0) as f64;
+        let sample_pos = ((tick as f64) * spt).round().max(0.0) as u64;
+        self.seek_tick_raw(tick, sample_pos);
+    }
+
+    fn seek_tick_raw(&mut self, tick: u32, sample_pos: u64) {
+        self.sample_pos = sample_pos;
+        self.tick_pos = tick as f64;
+        self.cur_tick = tick;
         self.count_in_rem_samples = 0;
         for pool in self.voices.iter_mut() {
             for v in pool.iter_mut() {
@@ -2704,6 +2715,7 @@ enum AudioCmd {
     SetSongMode(bool),
     SetPattern(usize),
     ResetTransport,
+    SeekTick(u32),
     SetRecording(bool),
     ArmCountIn,
     ClearTake,
@@ -2918,6 +2930,7 @@ impl AudioWorker {
                 AudioCmd::SetSongMode(m) => self.rt.song_mode = m,
                 AudioCmd::SetPattern(pat) => self.rt.pattern = pat,
                 AudioCmd::ResetTransport => self.rt.reset_transport(),
+                AudioCmd::SeekTick(tick) => self.rt.seek_tick(tick, &self.song),
                 AudioCmd::SetRecording(r) => self.rt.recording = r,
                 AudioCmd::ArmCountIn => self.rt.arm_count_in(&self.song),
                 AudioCmd::ClearTake => {
@@ -3213,6 +3226,13 @@ impl AppState {
         self.rt.reset_transport();
         if let Some(b) = &mut self.audio {
             b.send(AudioCmd::ResetTransport);
+        }
+    }
+
+    pub fn seek_tick(&mut self, tick: u32) {
+        self.rt.seek_tick(tick, &self.song);
+        if let Some(b) = &mut self.audio {
+            b.send(AudioCmd::SeekTick(tick));
         }
     }
 
@@ -4166,5 +4186,22 @@ mod tests {
         drop(rt);
         drop(inst_main);
         drop(fx_main);
+    }
+
+    #[test]
+    fn seek_tick_updates_transport_position_and_clears_count_in() {
+        let song = crate::song::new_empty();
+        let mut rt = EngineRt::new(44100.0);
+        rt.playing = true;
+        rt.count_in_rem_samples = 1024;
+        rt.seek_tick(16, &song);
+        assert_eq!(rt.cur_tick, 16);
+        assert!((rt.tick_pos - 16.0).abs() < 1e-6);
+        assert!(rt.sample_pos > 0);
+        assert_eq!(rt.count_in_rem_samples, 0);
+
+        rt.seek_tick(0, &song);
+        assert_eq!(rt.cur_tick, 0);
+        assert_eq!(rt.sample_pos, 0);
     }
 }

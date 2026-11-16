@@ -1754,6 +1754,36 @@ impl Song {
         }
     }
 
+    /// Set a step explicitly (used for drag-painting or right-drag erasing).
+    pub fn set_step(&mut self, pat: usize, ch: usize, step: usize, active: bool) -> bool {
+        let t0 = step as u32 * TICKS_PER_STEP;
+        let max_ticks = self
+            .patterns
+            .get(pat)
+            .map(|p| p.len_ticks())
+            .unwrap_or(TICKS_PATTERN);
+        if t0 >= max_ticks {
+            return false;
+        }
+        let base = self.channels.get(ch).map(|c| c.midi_base).unwrap_or(60);
+        let Some(notes) = self.patterns.get_mut(pat).and_then(|p| p.notes.get_mut(ch)) else {
+            return false;
+        };
+        let has = notes
+            .iter()
+            .any(|n| n.tick >= t0 && n.tick < t0 + TICKS_PER_STEP);
+        if active && !has {
+            notes.push(Note::new_in(t0, TICKS_PER_STEP, base, 0.9, max_ticks));
+            notes.sort_by_key(|n| n.tick);
+            true
+        } else if !active && has {
+            notes.retain(|n| n.tick < t0 || n.tick >= t0 + TICKS_PER_STEP);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn alloc_clip_id(&mut self) -> u64 {
         let id = self.next_clip_id.max(1);
         self.next_clip_id = id + 1;
@@ -3857,5 +3887,19 @@ mod tests {
         let pdc = back.compute_pdc();
         assert_eq!(pdc.ch_delay[clap_ch], 0);
         assert_eq!(pdc.ch_delay[zero_ch], 32);
+    }
+
+    #[test]
+    fn set_step_sets_and_clears_steps_without_duplicates() {
+        let mut song = new_empty();
+        assert!(song.set_step(0, 0, 2, true));
+        assert!(!song.set_step(0, 0, 2, true));
+        assert_eq!(song.patterns[0].notes[0].len(), 1);
+        assert_eq!(song.patterns[0].notes[0][0].tick, 2 * TICKS_PER_STEP);
+
+        assert!(song.set_step(0, 0, 2, false));
+        assert!(!song.set_step(0, 0, 2, false));
+        assert!(song.patterns[0].notes[0].is_empty());
+        assert!(!song.set_step(99, 0, 0, true));
     }
 }
